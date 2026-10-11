@@ -354,7 +354,7 @@ export function createTelegramAssistantOutputBindingRuntime(deps) {
 }
 /** Compose public activity fanout, verbosity, and assistant output ordering. */
 export function createTelegramActivityBindingRuntime(deps) {
-    const publication = Activity.createTelegramActivityPublicationRuntime();
+    const publication = Activity.createTelegramActivityPublicationRuntime({ captureDrain: deps.captureDrain });
     const assistantOutputBinding = createTelegramAssistantOutputBindingRuntime({
         ...deps.assistantOutput,
         enqueue: publication.enqueue,
@@ -374,6 +374,7 @@ export function createTelegramActivityBindingRuntime(deps) {
     });
     const activityRuntime = Activity.createTelegramActivityBridgeRuntime({
         generation: deps.generation,
+        captureDrain: deps.captureDrain,
         observeEvent(event) {
             assistantOutputBinding.observeEvent(event);
             activityVerbosityRuntime.accept(event);
@@ -626,7 +627,7 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
         },
     });
 }
-export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onPromptHandedOff, answerGuestQuery, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive = () => true, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }) {
+export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onPromptHandedOff, answerGuestQuery, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive = () => true, getSessionGeneration, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }) {
     const agentEndResetter = Runtime.createTelegramAgentEndResetter({
         abort,
         typing,
@@ -864,6 +865,8 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
     });
     const messageActivityTypingHooks = Lifecycle.createTelegramMessageActivityTypingHooks({
         hasActiveTurn: activeTurnRuntime.has,
+        isContextActive: isSessionContextActive,
+        getSessionGeneration,
         startTypingLoop: startActiveTurnTypingLoop,
         onMessageStart: previewRuntime.onMessageStart,
         onMessageUpdate: previewRuntime.onMessageUpdate,
@@ -955,9 +958,12 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         async onAgentStart(event, ctx) {
             if (!isSessionContextActive(ctx))
                 return;
+            const generation = getSessionGeneration?.();
             agentWorkActive = true;
             cancelPendingFinalPublication();
             await agentStartWithDedupReset(event, ctx);
+            if (!isSessionContextActive(ctx) || (getSessionGeneration && !Object.is(getSessionGeneration(), generation)))
+                return;
             const turn = activeTurnRuntime.get();
             activityRuntime.onAgentStart(turn?.target, turn?.replyToMessageId);
             startAgentActivityTypingLoop(ctx);

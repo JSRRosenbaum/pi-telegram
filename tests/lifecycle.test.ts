@@ -10,10 +10,14 @@ import {
   appendTelegramLifecycleHooks,
   createTelegramBridgeSessionLifecycleAssembly,
   createTelegramCompactionObserverRuntime,
+  createTelegramCompactionObserverState,
+  transitionTelegramCompactionObserver,
+  type TelegramCompactionObserverEvent,
   createTelegramConnectionIntentRuntime,
   createTelegramConnectionLifecycle,
   type TelegramConnectionHandoffStore,
   createTelegramSessionContextStore,
+  createTelegramSessionDrainObserver,
   createTelegramSessionGenerationFence,
   createTelegramMessageActivityTypingHooks,
   registerTelegramLifecycleHooks,
@@ -23,6 +27,73 @@ import {
   createTelegramBridgeRuntime,
   createTelegramTypingLoopStarter,
 } from "../lib/runtime.ts";
+
+for (const change of ["none", "clear", "reused-context", "authority", "queued-clear", "sink-fails"] as const)
+test(`Session drain observer cannot borrow replacement authority (${change})`, async () => {
+  const context = createTelegramSessionContextStore<object>(), ctx = {};
+  let authority = 1, notifications = 0;
+  context.set(ctx);
+  const capture = createTelegramSessionDrainObserver({
+    context, captureAuthority: () => authority, isAuthorityActive: value => value === authority,
+    onDrained(value) { assert.equal(value, ctx); if (change === "sink-fails") throw new Error("observer"); notifications++; },
+  });
+  const notify = capture()!;
+  if (change === "clear") context.clear();
+  if (change === "reused-context") context.set(ctx);
+  if (change === "authority") authority++;
+  notify();
+  if (change === "queued-clear") context.clear();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(notifications, change === "none" ? 1 : 0);
+});
+
+for (const change of ["distinct-context", "reused-context", "clear"] as const) {
+  test(`Message activity typing preserves exact session lifetime with unchanged transport (${change})`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const context = createTelegramSessionContextStore<ExtensionContext>(), old = createLifecycleContext(), next = change === "reused-context" ? old : createLifecycleContext();
+    const runtime = createTelegramBridgeRuntime(), calls: number[] = [];
+    context.set(old);
+    const start = createTelegramTypingLoopStarter({ typing: runtime.typing, getDefaultChatId: () => 7,
+      isContextActive: context.isCurrent, getSessionGeneration: context.getGeneration, getTransportAuthority: () => "same-epoch", isThreadedMode: () => true,
+      sendTypingAction: async (_chat, options) => { calls.push(options?.message_thread_id ?? 0); }, updateStatus() {} });
+    const hooks = createTelegramMessageActivityTypingHooks({ hasActiveTurn: () => true,
+      startTypingLoop: value => { start(value, 7, { target: { chatId: 7, threadId: 42 } }); },
+      async onMessageStart() {}, async onMessageUpdate() {} });
+    try {
+      await hooks.onMessageStart({ message: { role: "user", content: "message", timestamp: 0 } }, old); await new Promise<void>(resolve => setImmediate(resolve)); assert.deepEqual(calls, [42]);
+      if (change === "clear") context.clear(old); else context.set(next);
+      t.mock.timers.tick(3000); await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(calls, [42]); assert.equal(runtime.typing.stop(), false);
+      if (change === "distinct-context") {
+        await hooks.onMessageUpdate({ message: { role: "user", content: "message", timestamp: 0 } }, old); await new Promise<void>(resolve => setImmediate(resolve)); assert.deepEqual(calls, [42]);
+      }
+      if (change !== "clear") {
+        await hooks.onMessageUpdate({ message: { role: "user", content: "message", timestamp: 0 } }, next); await new Promise<void>(resolve => setImmediate(resolve)); assert.deepEqual(calls, [42, 42]);
+      }
+    } finally { runtime.typing.stop(); }
+  });
+}
+
+test("Held message activity cannot re-arm typing after the same context object enters a new generation", async () => {
+  const context = createTelegramSessionContextStore<ExtensionContext>(), ctx = createLifecycleContext(), runtime = createTelegramBridgeRuntime();
+  context.set(ctx); const calls: number[] = [];
+  let finish!: () => void;
+  const held = new Promise<void>(resolve => { finish = resolve; });
+  const start = createTelegramTypingLoopStarter({ typing: runtime.typing, getDefaultChatId: () => 7,
+    isContextActive: context.isCurrent, getSessionGeneration: context.getGeneration, getTransportAuthority: () => "same-epoch",
+    sendTypingAction: async (_chat, options) => { calls.push(options?.message_thread_id ?? 0); }, updateStatus() {} });
+  const hooks = createTelegramMessageActivityTypingHooks({ hasActiveTurn: () => true,
+    isContextActive: context.isCurrent, getSessionGeneration: context.getGeneration,
+    startTypingLoop: value => { start(value, 7, { target: { chatId: 7, threadId: 41 } }); },
+    async onMessageStart() { await held; }, async onMessageUpdate() {} });
+  try {
+    const activity = hooks.onMessageStart({ message: { role: "user", content: "old message", timestamp: 0 } }, ctx);
+    await new Promise<void>(resolve => setImmediate(resolve)); assert.deepEqual(calls, [41]);
+    context.set(ctx); runtime.typing.stop(); finish(); await activity;
+    await new Promise<void>(resolve => setImmediate(resolve)); assert.deepEqual(calls, [41]);
+    assert.equal(runtime.typing.stop(), false, "An old hook's finally cannot claim the successor's generation");
+  } finally { finish(); runtime.typing.stop(); }
+});
 
 const resume = { reason: "resume", cwd: "/repo", sessionFile: "/sessions/destination.jsonl" };
 const shutdown = { reason: "resume", cwd: "/repo", targetSessionFile: resume.sessionFile, connected: false };
@@ -613,6 +684,76 @@ test("Compaction observer preserves an existing agent typing loop", async () => 
   assert.equal(runtime.typing.stop(), true);
   await runtime.typing.waitForIdle();
   assert.equal(runtime.lifecycle.isCompactionInProgress(), false);
+});
+
+test("Compaction observer keeps ownership of its own typing loop across a repeated start", async () => {
+  const runtime = createTelegramBridgeRuntime();
+  const startTyping = createTelegramTypingLoopStarter({
+    typing: runtime.typing,
+    getDefaultChatId: () => 77,
+    sendTypingAction: async () => {},
+    updateStatus: () => {},
+    intervalMs: 60_000,
+  });
+  const target = { chatId: 77, threadId: 12 };
+  const observer = createTelegramCompactionObserverRuntime({
+    setCompactionInProgress: runtime.lifecycle.setCompactionInProgress,
+    updateStatus: () => {},
+    startTypingLoop: (ctx) => startTyping(ctx, 77, { target }),
+    stopTypingLoop: runtime.typing.stop,
+    requestDeferredDispatchNextQueuedTelegramTurn: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+    setTimer: () => 1,
+    clearTimer: () => {},
+  });
+
+  observer.onSessionBeforeCompact({} as never, createLifecycleContext());
+  // The shared loop answers false for the observer's own running loop; that is not an agent's loop.
+  observer.onSessionBeforeCompact({} as never, createLifecycleContext());
+  observer.onSessionCompact({} as never, createLifecycleContext());
+
+  assert.equal(runtime.typing.stop(), false, "Completion stopped the loop the observer started");
+  await runtime.typing.waitForIdle();
+});
+
+function runCompactionObserver(events: TelegramCompactionObserverEvent[]) {
+  let state = createTelegramCompactionObserverState();
+  const effects: string[] = [];
+  for (const event of events) {
+    const next = transitionTelegramCompactionObserver(state, event);
+    state = next.state;
+    effects.push(...next.effects.map((effect) => effect.type === "setInProgress" ? `inProgress:${effect.inProgress}` : effect.type));
+  }
+  return { state, effects };
+}
+
+test("Compaction observer machine stops only a loop it owns and releases on every terminal path", () => {
+  const owned = runCompactionObserver([{ type: "beforeCompact" }, { type: "typingStarted", started: true }, { type: "compacted" }]);
+  assert.deepEqual(owned.effects, [
+    "inProgress:true", "startTyping", "updateStatus", "armTimer",
+    "cancelTimer", "inProgress:false", "stopTyping", "updateStatus", "requestDispatch",
+  ]);
+  const agentLoop = runCompactionObserver([{ type: "beforeCompact" }, { type: "typingStarted", started: false }, { type: "compactFailed" }]);
+  assert.equal(agentLoop.effects.includes("stopTyping"), false, "An agent's loop survives compaction");
+  assert.deepEqual(agentLoop.effects.slice(-2), ["abandoned", "requestDispatch"]);
+  const sticky = runCompactionObserver([
+    { type: "beforeCompact" }, { type: "typingStarted", started: true },
+    { type: "beforeCompact" }, { type: "typingStarted", started: false },
+  ]);
+  assert.equal(sticky.state.typingOwned, true);
+});
+
+test("Compaction observer machine fences timers by observation and by context", () => {
+  const stale = runCompactionObserver([
+    { type: "beforeCompact" }, { type: "beforeCompact" },
+    { type: "timerFired", observation: 1, contextActive: true },
+  ]);
+  assert.equal(stale.state.observation, 2, "A superseded timer cannot release the current observation");
+  const replaced = runCompactionObserver([{ type: "beforeCompact" }, { type: "timerFired", observation: 1, contextActive: false }]);
+  assert.equal(replaced.state.observation, null);
+  assert.equal(replaced.effects.includes("inProgress:false"), false, "A replaced context's timer releases nothing");
+  const timedOut = runCompactionObserver([{ type: "beforeCompact" }, { type: "timerFired", observation: 1, contextActive: true }]);
+  assert.deepEqual(timedOut.effects.slice(-3), ["updateStatus", "recordTimeout", "requestDispatch"]);
 });
 
 test("Compaction observer unrefs fallback timers when supported", () => {

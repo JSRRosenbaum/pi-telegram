@@ -248,6 +248,10 @@ export interface TelegramWorkspaceRestoreIntent {
 /** Live same-session metadata, never a legacy scoped ACK or permission to dispatch/delete. */
 export type TelegramWorkspaceLiveRebindIntent = Pick<TelegramWorkspaceRestoreIntent, "request" | "operatorUserId" | "executor" | "revision" | "createdAtMs" | "updatedAtMs"> & {
     kind: "live-rebind";
+    /** Versioned native input gate: terminal cleanup does not itself authorize or settle input. */
+    inputRelease?: "held" | "issued" | "accepted";
+    /** A session-replacing producer must not drop earlier old-target protection or carry its delete grant forward. */
+    oldTargetProtected?: true;
     recipient: TelegramWorkspaceRestoreRecipient;
 } & ({
     phase: "rebound";
@@ -324,9 +328,11 @@ export interface TelegramWorkspaceRestore {
     list(): TelegramWorkspaceRestoreIntent[];
     listLiveRebindings(): TelegramWorkspaceLiveRebindIntent[];
     /** Caller has saved and held the selected input; this publishes the binding, not dispatch readiness. */
-    commitLiveRebind(request: TelegramWorkspaceRestoreRequest, recipient: TelegramWorkspaceRestoreRecipient, authority: TelegramWorkspaceRestoreAuthority): Promise<TelegramWorkspaceLiveRebindIntent | undefined>;
+    commitLiveRebind(request: TelegramWorkspaceRestoreRequest, recipient: TelegramWorkspaceRestoreRecipient, authority: TelegramWorkspaceRestoreAuthority, options?: {
+        holdInput: true;
+    }): Promise<TelegramWorkspaceLiveRebindIntent | undefined>;
     /** Caller proves local apply for release or current live clearance for cleanup; unknown issuance never repeats. */
-    advanceLiveRebind(expected: TelegramWorkspaceLiveRebindIntent, step: "release" | "issue-cleanup" | Extract<TelegramWorkspaceLiveRebindIntent, {
+    advanceLiveRebind(expected: TelegramWorkspaceLiveRebindIntent, step: "release" | "issue-cleanup" | "issue-input" | "accept-input" | "protect-old-target" | Extract<TelegramWorkspaceLiveRebindIntent, {
         phase: "finished";
     }>["cleanup"], authority: TelegramWorkspaceRestoreAuthority): TelegramWorkspaceLiveRebindIntent | undefined;
     commit(request: TelegramWorkspaceRestoreRequest, authority: TelegramWorkspaceRestoreAuthority): Promise<TelegramWorkspaceRestoreIntent | undefined>;
@@ -359,8 +365,11 @@ export interface TelegramWorkspaceRestore {
     inspectTemporaryThreadTarget(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority): TelegramTemporaryThreadTargetObservation | undefined;
     /** Read-only veto for an already-granted in-flight attempt; never another grant, disposable classification or deletion ACK. */
     isTemporaryThreadCleanupCurrent(expected: TelegramTemporaryThreadEntry, authority: TelegramWorkspaceRestoreAuthority): boolean;
-    /** Publishes `creating` before the caller's single creation request; an existing source entry is returned, never recreated. */
-    reserveTemporaryThread(source: TelegramTemporaryThreadEntry["source"], token: string, authority: TelegramWorkspaceRestoreAuthority): {
+    /**
+     * Publishes `creating` before the caller's single creation request; an existing source entry is returned, never
+     * recreated. `group` records an album as the tab's one creating input; it must start at the source update.
+     */
+    reserveTemporaryThread(source: TelegramTemporaryThreadEntry["source"], token: string, authority: TelegramWorkspaceRestoreAuthority, group?: TelegramTemporaryThreadInput): {
         reserved: boolean;
         entry: TelegramTemporaryThreadEntry;
     } | undefined;
@@ -467,6 +476,8 @@ export interface TelegramTopicTargetStore {
     /** Exact synchronous live-operation snapshot, including a current publication frame; no mutation, lock or authority grant. */
     withWorkspaceLiveRebindSnapshot: (expected: TelegramWorkspaceLiveRebindIntent, observe: (snapshot: Readonly<Pick<TelegramTopicTargetFile, "threads" | "workspaceBindings">>) => undefined) => void;
     /** Current live-origin ownership veto; effect callers still require Workspace admission. False is not work/recipient/deletion authority. */
+    hasPreDispatchRebindEvidence: () => boolean;
+    listProtectedLiveRebindTargets: () => TelegramTarget[];
     isWorkspaceLiveRebindCleanupTargetProtected: (expected: TelegramWorkspaceLiveRebindIntent) => boolean;
     /** Read-only captured identity with an optional exact manual-name result fence; no transport/session/admission grant or lock. */
     captureWorkspaceThreadRenameObservation: (binding: TelegramWorkspaceThreadBinding, owner: TelegramTopicTargetRecord) => (expectedManualThreadName?: string) => boolean;
@@ -572,7 +583,7 @@ export interface TelegramTopicTargetStore {
     /** Claim the first reusable inactive thread for an instance, linking it to instanceId. */
     claimReusableTarget: (instanceId: string, threadName?: string) => TelegramTopicTargetRecord | undefined;
 }
-export declare function createTelegramCleanupTargetProtection(store: Pick<TelegramTopicTargetStore, "list"> & Partial<Pick<TelegramTopicTargetStore, "listReservations" | "listPendingProvisions" | "listPendingCleanups" | "listTemporaryThreadTargets">>, departingRecord?: TelegramTopicTargetRecord): NonNullable<ThreadReconciler.ThreadReconciliationApplyPorts["isCleanupTargetProtected"]>;
+export declare function createTelegramCleanupTargetProtection(store: Pick<TelegramTopicTargetStore, "list"> & Partial<Pick<TelegramTopicTargetStore, "listReservations" | "listPendingProvisions" | "listPendingCleanups" | "listTemporaryThreadTargets" | "listProtectedLiveRebindTargets">>, departingRecord?: TelegramTopicTargetRecord): NonNullable<ThreadReconciler.ThreadReconciliationApplyPorts["isCleanupTargetProtected"]>;
 export interface TelegramTopicTargetStoreOptions {
     path: string | (() => string);
     telegramProfile?: string | (() => string | undefined);
@@ -661,6 +672,8 @@ export declare function getTelegramWorkspaceRestoreSourceCompletionSha256(operat
 export declare function getTelegramTemporaryThreadInputs(entry: TelegramTemporaryThreadEntry): TelegramTemporaryThreadInput[];
 /** Every known group is durably cancelled or Forward-completed; still not deletion authority by itself. */
 export declare function isTelegramTemporaryThreadFullyResolved(entry: TelegramTemporaryThreadEntry): boolean;
+/** Canonical issuance is distinct from cleanup completion, source disposition and peer dispatch readiness. */
+export declare function isTelegramLiveRebindInputAuthorized(value: TelegramWorkspaceLiveRebindIntent): boolean;
 /** The unified section accepts only lossless current-format Workspace evidence, never tolerant legacy repair. */
 export declare function parseTelegramWorkspaceStateSection(value: unknown, profile: string): TelegramTopicTargetFile | undefined;
 export declare function resolveTelegramWorkspaceProvisionRecoveryPath(statePath: string, profileName?: string, layout?: "consolidated"): string;

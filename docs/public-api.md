@@ -154,7 +154,7 @@ High-level stable APIs:
   - Purpose: compact companion status rows in the `/start` menu status text.
 - `sendTelegramView()` / `editTelegramView()` / `deleteTelegramView()` / `sendTelegramChatAction()`
   - Identity: current process-local delivery generation and returned logical message handles.
-  - Purpose: ownership-gated operational delivery to active-turn, current-instance, aggregate, or explicitly authorized targets.
+  - Purpose: ownership-gated operational delivery to active-turn, current-instance, Classic-only aggregate, or explicitly authorized targets; Threaded Mode never writes to All.
 - `registerTelegramActivityHandler()`
   - Identity: required stable `id`.
   - Purpose: normalized non-blocking Pi lifecycle activity with source identity and fresh delivery contexts.
@@ -194,7 +194,7 @@ This inventory maps the complete bridge capability plane to its supported extens
 - **Extension loading:** The root export loads the bridge as a Pi extension; companion code uses the domain subpaths below rather than importing root runtime state.
 - **Telegram commands:** `/commands` registers explicit Telegram-native slash commands with scoped reply and prompt-enqueue ports.
 - **Managed menu and Settings UI:** `/sections` registers main-menu views, Settings rows, namespaced callbacks, standalone callback-scoped messages, and diagnostics.
-- **Programmatic target-aware delivery:** `/delivery` sends, edits, deletes, and signals operational views against active-turn, current-instance, aggregate, or explicitly authorized targets through generation-bound logical handles.
+- **Programmatic target-aware delivery:** `/delivery` sends, edits, deletes, and signals operational views against active-turn, current-instance, Classic-only aggregate, or explicitly authorized targets through generation-bound logical handles. All is input-only in Threaded Mode.
 - **Normalized lifecycle activity:** `/activity` registers non-blocking extension handlers for evidence-based run/source identity, assistant prose/reasoning segments, executed tools, compaction, and settlement with fresh delivery contexts.
 - **Compact status projection:** `/status` contributes synchronous status rows to the `/start` menu.
 - **Raw inbound update interception:** `/updates` observes or consumes Telegram updates before default routing and remains the low-level callback escape hatch.

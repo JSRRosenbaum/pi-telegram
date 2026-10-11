@@ -3354,7 +3354,7 @@ export interface TelegramDispatchRuntimeDeps<TContext = unknown> {
       { kind: "control" }
     >["item"],
   ) => void;
-  onPromptDispatchStart: (chatId: number) => void;
+  onPromptDispatchStart: (chatId: number, target?: TelegramQueueTarget) => void;
   commitPromptDispatch?: (
     item: Extract<
       TelegramQueueDispatchAction<TContext>,
@@ -3383,7 +3383,7 @@ export interface TelegramQueueDispatchControllerDeps<
   isDispatchGenerationActive?: (generation: number) => boolean;
   updateStatus: (ctx: TContext, error?: string) => void;
   sendTextReply: TelegramControlRuntimeDeps<TContext>["sendTextReply"];
-  onPromptDispatchStart: (ctx: TContext, chatId: number) => void;
+  onPromptDispatchStart: (ctx: TContext, chatId: number, target?: TelegramQueueTarget) => void;
   commitPromptDispatch?: (
     item: Extract<
       TelegramQueueDispatchAction<TContext>,
@@ -3426,7 +3426,7 @@ export function executeTelegramQueueDispatchPlan<TContext = unknown>(
     deps.executeControlItem(plan.item);
     return;
   }
-  deps.onPromptDispatchStart(plan.item.chatId);
+  deps.onPromptDispatchStart(plan.item.chatId, plan.item.target);
   try {
     if (deps.commitPromptDispatch && !deps.commitPromptDispatch(plan.item)) {
       throw new Error(
@@ -3702,8 +3702,8 @@ export function createTelegramQueueDispatchController<TContext = unknown>(
               },
             });
           },
-          onPromptDispatchStart: (chatId) => {
-            deps.onPromptDispatchStart(ctx, chatId);
+          onPromptDispatchStart: (chatId, target) => {
+            deps.onPromptDispatchStart(ctx, chatId, target);
           },
           commitPromptDispatch: deps.commitPromptDispatch
             ? (item) => deps.commitPromptDispatch!(item, ctx)

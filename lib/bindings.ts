@@ -654,6 +654,7 @@ export interface TelegramActivityBindingRuntime {
 /** Compose public activity fanout, verbosity, and assistant output ordering. */
 export function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
   generation: string;
+  captureDrain?: () => (() => void) | undefined;
   assistantOutput: Omit<
     Parameters<
       typeof createTelegramAssistantOutputBindingRuntime<TTransportStamp>
@@ -669,7 +670,7 @@ export function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
     "captureAuthority" | "isAuthorityActive" | "recordFailure" | "enqueue"
   >;
 }): TelegramActivityBindingRuntime {
-  const publication = Activity.createTelegramActivityPublicationRuntime();
+  const publication = Activity.createTelegramActivityPublicationRuntime({ captureDrain: deps.captureDrain });
   const assistantOutputBinding = createTelegramAssistantOutputBindingRuntime({
     ...deps.assistantOutput,
     enqueue: publication.enqueue,
@@ -690,6 +691,7 @@ export function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
     });
   const activityRuntime = Activity.createTelegramActivityBridgeRuntime({
     generation: deps.generation,
+    captureDrain: deps.captureDrain,
     observeEvent(event) {
       assistantOutputBinding.observeEvent(event);
       activityVerbosityRuntime.accept(event);
@@ -1196,6 +1198,7 @@ interface TelegramLifecycleBindingDeps {
   }) => void;
   canSendAgentActivity: (ctx: Pi.ExtensionContext) => boolean;
   isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
+  getSessionGeneration?: () => number;
   isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
   recordRuntimeEvent: TelegramRuntimeEventRecorder;
@@ -1246,6 +1249,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   recordMessageOwnership,
   canSendAgentActivity,
   isSessionContextActive = () => true,
+  getSessionGeneration,
   isTurnTransportActive,
   updateStatus,
   recordRuntimeEvent,
@@ -1550,6 +1554,8 @@ export function registerTelegramLifecycleRuntimeHooks({
   const messageActivityTypingHooks =
     Lifecycle.createTelegramMessageActivityTypingHooks({
       hasActiveTurn: activeTurnRuntime.has,
+      isContextActive: isSessionContextActive,
+      getSessionGeneration,
       startTypingLoop: startActiveTurnTypingLoop,
       onMessageStart: previewRuntime.onMessageStart,
       onMessageUpdate: previewRuntime.onMessageUpdate,
@@ -1638,9 +1644,11 @@ export function registerTelegramLifecycleRuntimeHooks({
     },
     async onAgentStart(event, ctx) {
       if (!isSessionContextActive(ctx)) return;
+      const generation = getSessionGeneration?.();
       agentWorkActive = true;
       cancelPendingFinalPublication();
       await agentStartWithDedupReset(event, ctx);
+      if (!isSessionContextActive(ctx) || (getSessionGeneration && !Object.is(getSessionGeneration(), generation))) return;
       const turn = activeTurnRuntime.get();
       activityRuntime.onAgentStart(turn?.target, turn?.replyToMessageId);
       startAgentActivityTypingLoop(ctx);

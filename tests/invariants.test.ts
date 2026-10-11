@@ -535,15 +535,16 @@ test("Automatic Workspace retirement stays disconnected from production composit
   assert.match(busLeaderSource, /!restoringWorkspace && deps\.runWithWorkspaceCapacity/u);
 });
 
-test("Runtime state domain stays free of local domain imports", () => {
+test("Runtime state domain imports only the leaf machine runner", () => {
   const localImportSpecifiers = getImportSpecifiers(
     join("lib", "runtime.ts"),
   ).filter((specifier) => specifier.startsWith("."));
-  assert.deepEqual(localImportSpecifiers, []);
+  // The runner imports nothing local (see the leaf test), so runtime stays free of domain logic transitively.
+  assert.deepEqual(localImportSpecifiers, ["./machine.ts"]);
 });
 
 test("Structural leaf domains stay free of local nominal imports", () => {
-  const leafFiles = ["polling.ts", "setup.ts", "status.ts"];
+  const leafFiles = ["machine.ts", "polling.ts", "setup.ts", "status.ts"];
   const localImportsByFile = Object.fromEntries(
     leafFiles.map((file) => [
       join("lib", file),
@@ -554,6 +555,7 @@ test("Structural leaf domains stay free of local nominal imports", () => {
   );
 
   assert.deepEqual(localImportsByFile, {
+    [join("lib", "machine.ts")]: [],
     [join("lib", "polling.ts")]: [],
     [join("lib", "setup.ts")]: [],
     [join("lib", "status.ts")]: [],

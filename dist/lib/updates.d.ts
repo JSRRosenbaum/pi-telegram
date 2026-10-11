@@ -229,7 +229,9 @@ interface TelegramUpdateAdmissionBinding {
     inspectSourceSnapshot?: () => TelegramDeferredSourceSnapshot | undefined;
     inspectCompletion?: () => TelegramDeferredSourceEvidence | undefined;
     isSourceUnsettled?: () => boolean;
-    prepareLiveInput?: (sourceUpdateIds: readonly number[], isCurrent: () => boolean) => TelegramLiveDeferredInputPreparation | undefined;
+    prepareLiveInput?: (sourceUpdateIds: readonly number[], isCurrent: () => boolean, onTransferred?: () => void) => TelegramLiveDeferredInputPreparation | undefined;
+    /** Internal notification after the worker's exact donor-removal ACK; never issues completion itself. */
+    acknowledgeTransferred?: () => void;
     prepareQueueAdmission?: () => TelegramDeferredQueueAdmissionPreparation | undefined;
     prepareSourceCompletion?: () => Pick<TelegramDeferredSourceCompletionPreparation, "source" | "isCurrent"> | undefined;
     supportsAbandonment?: (journalBindingKey: string) => boolean;
@@ -241,7 +243,7 @@ interface TelegramUpdateAdmissionBinding {
 export type TelegramQueueAdmissionReceiptLike = TelegramQueueAdmissionReceipt;
 export declare function bindTelegramUpdateAdmissionSource<TUpdate extends TelegramUpdateFlow & {
     update_id: number;
-}>(update: TUpdate, report: TelegramUpdateAdmissionBinding["report"], controls?: Pick<TelegramUpdateAdmissionBinding, "abandon" | "armRoutingInput" | "getRoutingInput" | "acquireRouting" | "inspectSource" | "inspectSourceSnapshot" | "inspectCompletion" | "isSourceUnsettled" | "prepareLiveInput" | "prepareQueueAdmission" | "prepareSourceCompletion" | "supportsAbandonment" | "inspectAbandoning" | "inspectHistorical" | "isHistorical" | "isHistoricalReviewHeld">): TUpdate;
+}>(update: TUpdate, report: TelegramUpdateAdmissionBinding["report"], controls?: Pick<TelegramUpdateAdmissionBinding, "abandon" | "armRoutingInput" | "getRoutingInput" | "acquireRouting" | "inspectSource" | "inspectSourceSnapshot" | "inspectCompletion" | "isSourceUnsettled" | "acknowledgeTransferred" | "prepareLiveInput" | "prepareQueueAdmission" | "prepareSourceCompletion" | "supportsAbandonment" | "inspectAbandoning" | "inspectHistorical" | "isHistorical" | "isHistoricalReviewHeld">): TUpdate;
 /**
  * Conservative read-only census: any retained entry naming this Thread, in any nested Telegram object or state,
  * is unresolved custody, except a lone button tap, which carries no input (the in-flight Cancel itself).
@@ -596,7 +598,9 @@ export interface TelegramUpdateExecutionFailureClassification {
 }
 export interface TelegramUpdateWorkerRuntimeDeps<TContext> {
     journal: TelegramUpdateWorkerJournalPort;
-    executeUpdate: (update: TelegramJournaledUpdate, ctx: TContext, signal: AbortSignal) => Promise<TelegramUpdateAdmissionOutcome> | TelegramUpdateAdmissionOutcome;
+    executeUpdate: (update: TelegramJournaledUpdate, ctx: TContext, signal: AbortSignal, target?: TelegramTarget & {
+        threadId: number;
+    }) => Promise<TelegramUpdateAdmissionOutcome> | TelegramUpdateAdmissionOutcome;
     /** Native source-only binding, installed by the admission-worker assembly rather than ordinary dispatch. */
     admitPreparedLiveInput?: (update: TelegramJournaledUpdate, ctx: TContext, signal: AbortSignal) => Promise<{
         outcome: TelegramUpdateAdmissionOutcome;
@@ -660,7 +664,9 @@ export interface TelegramLiveInputPreparation {
     prepareStatusConsumption?(input: TelegramLiveStatusConsumption): boolean;
     /** Native owner availability before recipient append; not admission or future target activation. */
     canPrepareStatusConsumption?(): boolean;
-    release(canRelease: () => boolean): boolean;
+    release(canRelease: () => boolean, target?: TelegramTarget & {
+        threadId: number;
+    }): boolean;
     /** Ends a failed pre-append attempt only when no selected input was saved. */
     cancelEmpty(): boolean;
     /** One fenced removal of this never-dispatched recipient copy; unknown issuance cannot be retried. */
@@ -704,6 +710,7 @@ export interface TelegramUpdateWorkerRuntime<TContext> {
         sourceUpdateIds: readonly number[];
         signal: AbortSignal;
         isCurrent(): boolean;
+        onTransferred?(): void;
     }) => TelegramLiveDeferredInputPreparation | undefined;
     prepareDeferredQueueAdmission?: (input: {
         updateId: number;

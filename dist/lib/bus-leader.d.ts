@@ -63,6 +63,8 @@ export interface TelegramBusLeaderTargetProvisionerDeps<TContext> {
 }
 export interface TelegramBusFollowerTargetProvisionerDeps {
     getAllowedUserId: () => number | undefined;
+    getLiveFollowers?: () => readonly TelegramBusFollowerView[];
+    isFollowerProcessAlive?: (pid: number) => boolean;
     topicTargetStore: Threads.TelegramTopicTargetStore;
     callApi: <TResponse>(method: string, body: Record<string, unknown>) => Promise<TResponse>;
     getCurrentLeaderEpoch?: () => number | string | undefined;
@@ -276,6 +278,7 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
     applyThreadDisplayMode?: (mode: TelegramThreadDisplayMode, isCurrent: () => boolean) => Promise<void>;
     getThreadDisplayMode?: () => TelegramThreadDisplayMode;
+    requiresPreDispatchRebindReader?: () => boolean;
     getCurrentLeaderEpoch?: () => number | string | undefined;
     getTelegramProfile?: () => string | undefined;
     getAllowedUserId?: () => number | undefined;

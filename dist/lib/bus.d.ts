@@ -43,6 +43,9 @@ export declare const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT: "director
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT: "workspace-follower-auto-connect-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT: "session-replacement-intent-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE: "workspace-restore-v1";
+/** Shared Workspace readers understand independent pre-dispatch input/cleanup state. */
+export declare const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND: "live-rebind-pre-dispatch-reader-v2";
+export declare const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION: "live-rebind-pre-dispatch-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE: "live-thread-rebind-save-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY: "live-thread-rebind-apply-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE: "live-thread-rebind-settle-v1";
@@ -239,7 +242,6 @@ export declare function getTelegramFollowerTargetOwnership(input: {
     recipientBindingKey: string;
     protocolIdentity: TelegramBusProtocolIdentity;
 } | undefined;
-export declare function markTelegramBusAggregateDelivery<T extends Record<string, unknown>>(body: T): T;
 export declare function markTelegramBusCrossTargetDelivery<T extends Record<string, unknown>>(body: T): T;
 export declare function stripTelegramBusApiMetadata<T extends Record<string, unknown>>(body: T): T;
 export declare function isTelegramFollowerApiCallAllowed(input: {
@@ -460,7 +462,7 @@ export type TelegramBusEnvelope = ({
     recipientBindingKey: string;
     operationId: string;
     sourceUpdateIds: number[];
-    mode: "release" | "discard" | "observe" | "observe-command";
+    mode: "release" | "discard" | "observe" | "observe-held" | "observe-command";
     oldTarget?: TelegramTarget & {
         threadId: number;
     };
@@ -720,7 +722,7 @@ export declare function createTelegramBusLiveRebindController(deps: {
         update_id: number;
     } & Record<string, unknown>)[];
 } | {
-    mode: "apply" | "inspect" | "release" | "discard" | "observe" | "observe-command";
+    mode: "apply" | "inspect" | "release" | "discard" | "observe" | "observe-held" | "observe-command";
     sourceUpdateIds: number[];
     slot: string;
     target: TelegramTarget & {

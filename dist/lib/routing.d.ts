@@ -72,7 +72,7 @@ type TelegramLiveRebindSelectedCommandReference = {
     preparedSource: Bus.TelegramBusPreparedCommandSource;
     selectedCommand: Bus.TelegramBusSelectedCommandInput;
 };
-/** One warm live attempt with exact post-release peer donor settlement; no startup recovery, Restore ACK or cleanup. */
+/** One warm live attempt with independent leader input/cleanup grants and exact peer donor settlement; no startup recovery or legacy Restore ACK. */
 export declare function createTelegramLiveRebindCoordinator(input: {
     request: Threads.TelegramWorkspaceRestoreRequest;
     /** Captures caller source/reference, admission, profile, transport and Pi lifetime. */
@@ -103,6 +103,8 @@ export declare function createTelegramLiveRebindCoordinator(input: {
         /** Explicit staged singleton command branch; absence preserves ordinary live input behavior. */
         selectedCommand?: Bus.TelegramBusSelectedCommandInput;
     };
+    /** Existing profile admission spans the applied recipient, fresh cleanup decision and one native input grant. */
+    cleanupBeforeRelease?(intent: Threads.TelegramWorkspaceLiveRebindIntent, isCurrent: () => boolean): Promise<boolean>;
     /** Restore moves the tab to its new owner: once applied, show that owner's title (best-effort, never blocking). */
     retitle?: (isCurrent: () => boolean) => Promise<void>;
     recordRuntimeEvent?: (category: string, error: unknown, details: Record<string, unknown>) => void;
@@ -204,6 +206,7 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     hasWorkspaceRestoreAuthority?: () => boolean;
     /** Exact live root authority; capability advertisement alone cannot replace owned profile/session/recipient fences. */
     hasWorkspaceLiveRebindAuthority?: () => boolean;
+    canUsePreDispatchRebind?: (recipient?: Threads.TelegramWorkspaceRestoreRecipient) => boolean;
     /** Strict complete namespace plus exact current/historical references; only an empty result clears journal protection. */
     inspectTemporaryThreadSources?: (target: Queue.TelegramQueueTarget, requiredJournalBindingKeys: readonly string[], ownInputs?: readonly Threads.TelegramTemporaryThreadInput[]) => readonly number[] | undefined;
     /** Quiet period after the last cancelled input before one cleanup attempt; defaults to 1000 ms. */
@@ -353,6 +356,8 @@ export declare function createTelegramInboundRouteRuntime<TUpdate extends Update
     canPrepareHeldCommand: ReturnType<typeof Commands.createTelegramCommandHandlerTargetRuntime<TMessage, TContext>>["canPrepareHeldCommand"];
     /** Agent-settled hint: wakes waiting leader cleanup retries early; every readiness gate is still sampled fresh. */
     onSessionSettled(ctx: TContext): void;
+    /** Lifetime-fenced hint from drained publication/activity/delivery/API owners; never a cleanup grant. */
+    onDeliverySettled(ctx: TContext): void;
     /** Fresh body-free recipient observation only; never reconstructs an attempt or grants cleanup. */
     observeLiveRebindLeaderWork(intent: Threads.TelegramWorkspaceLiveRebindIntent, ctx: TContext): Promise<Bus.TelegramBusLiveRebindWorkObservation | undefined>;
     /** Fresh non-destructive candidate only; no retained idle, cleanup action or deletion grant. */

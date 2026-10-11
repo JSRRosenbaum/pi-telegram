@@ -19,6 +19,7 @@ import {
   resolveTelegramBusSocketPath,
   sendTelegramBusLocalEnvelope,
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+  TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
@@ -46,9 +47,11 @@ import {
   type TelegramBusLeaderRuntimeDeps,
 } from "../lib/bus-leader.ts";
 import type { TelegramThreadDisplayMode } from "../lib/config.ts";
+import { createTelegramUpdateJournalStore, createTelegramUpdateJournalBotIdentity, createTelegramUpdateJournalBindingKey } from "../lib/journal.ts";
 import { createTelegramThreadDisplayNameRenameBinding, createTelegramThreadDisplayNameResetBinding } from "../lib/commands.ts";
 import {
   createTelegramTopicTargetStore,
+  createTelegramConsolidatedWorkspaceStorage,
   createTelegramTopicTargetProvisioner,
   createTelegramWorkspaceBindingIdentity,
 } from "../lib/threads.ts";
@@ -666,6 +669,49 @@ test("Follower recovery shortcuts preserve pending evidence under exact cleanup 
     }
   }
 });
+
+for (const state of ["dead", "alive", "unknown", "registered", "other-session", "ambiguous", "unknown-runtime", "missing-liveness", "missing-registry"] as const) {
+  test(`Cold restore-only follower reclaims its exact retained Thread only after predecessor death (${state})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-telegram-cold-follower-"));
+    const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+    await store.load();
+    const identity = createTelegramWorkspaceBindingIdentity("/repo", 1, "session")!;
+    const target = { chatId: 7, threadId: 42 }, oldRuntime = state === "unknown-runtime" ? "opaque-runtime" : "424242:1000";
+    store.upsertWorkspaceBinding({ ...identity, target, slot: "S", threadName: "Signal", displayTitle: "Home", updatedAtMs: 1,
+      journalBindingKeys: ["retained-journal"], journalSources: [{ sessionId: "session", recipientBindingKey: "manual:stable" }], journalBindingsComplete: true });
+    store.upsert({ profileKey: "manual:stable", owner: { kind: "manual-follower", instanceId: "stable" }, instanceId: oldRuntime,
+      target, slot: "S", threadName: "Signal", status: "active", createdAtMs: 1, updatedAtMs: 1 });
+    if (state === "ambiguous") {
+      store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", 2, "session")!, target: { chatId: 7, threadId: 43 },
+        slot: "T", threadName: "Topaz", updatedAtMs: 1 });
+      store.upsert({ profileKey: "manual:other", owner: { kind: "manual-follower", instanceId: "other" }, instanceId: "424243:1000",
+        target: { chatId: 7, threadId: 43 }, slot: "T", threadName: "Topaz", status: "active", createdAtMs: 1, updatedAtMs: 1 });
+    }
+    await store.persist();
+    const before = readFileSync(join(dir, "state.json"), "utf8"), registry = createTelegramBusFollowerRegistry();
+    if (state === "registered") registry.register({ instanceId: oldRuntime, cwd: "/repo", sessionId: "session", target, connectedAtMs: 1 });
+    const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+    const provision = createTelegramBusFollowerTargetProvisioner({ topicTargetStore: store, getAllowedUserId: () => 7,
+      getLiveFollowers: state === "missing-registry" ? undefined : registry.list,
+      isFollowerProcessAlive: state === "missing-liveness" ? undefined : (pid) => { assert.ok(pid === 424242 || pid === 424243); if (state === "unknown") throw new Error("PID metadata unavailable"); return state === "alive"; },
+      async callApi<TResponse>(method: string, body: Record<string, unknown>) { calls.push({ method, body }); return true as TResponse; },
+      getSyncState: () => ({}), setSyncState() {}, recordRuntimeEvent() {}, getNowMs: () => 1000 });
+    try {
+      const result = await provision({ instanceId: "successor", profileKey: "manual:successor", cwd: "/repo", sessionId: state === "other-session" ? "foreign" : "session",
+        connectedAtMs: 1000 }, { existingWorkspaceBindingOnly: true });
+      if (state !== "dead") {
+        assert.equal(result, undefined); assert.deepEqual(calls, []); assert.equal(readFileSync(join(dir, "state.json"), "utf8"), before);
+      } else {
+        assert.deepEqual(result, { ...target, slot: "S", threadName: "Signal" });
+        assert.deepEqual(calls.map(call => call.method), ["sendMessage"]);
+        assert.match(String(calls[0]!.body.text), /Instance <i>Home<\/i> connected/);
+        assert.deepEqual(store.getWorkspaceBindingByTarget(target, "session")?.journalBindingKeys, ["retained-journal"]);
+        assert.equal(store.getWorkspaceBindingByTarget(target, "session")?.instanceSlot, "b");
+        assert.equal(store.listWorkspaceBindings().length, 1);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
 
 test("Bus leader restore-only provisioning does not allocate a missing Workspace", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-restore-only-"));
@@ -1797,6 +1843,132 @@ test("Bus leader reconciles a stale follower record slot to its Workspace claim"
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const recordSlot of ["S", "T"] as const) {
+for (const boundary of ["current", "binding-drift", "epoch-loss"] as const) {
+for (const mode of ["manual", "cold-restore"] as const) {
+  test(`Follower registration ACK uses the committed retained slot and preserves source history (${recordSlot}, ${boundary}, ${mode})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-telegram-committed-follower-slot-"));
+    const path = join(dir, "state.json"), socketPath = join(dir, "bus.sock");
+    const owner = createTelegramLockRuntime({ statePath: path, key: () => "default", instanceId: "leader",
+      runtimeGeneration: 1, isProcessAlive: () => true });
+    assert.equal(owner.acquire({ cwd: "/leader" }).ok, true);
+    const consolidated = {
+      captureAuthority() {
+        const epoch = owner.getOwnedLeaderEpoch();
+        return epoch === undefined ? undefined : () => owner.owns() && owner.getOwnedLeaderEpoch() === epoch;
+      },
+      publishIfOwned: owner.publishStateSectionIfOwned!,
+    };
+    const storage = createTelegramConsolidatedWorkspaceStorage({ getPath: () => path, getProfile: () => "default", ...consolidated });
+    const store = createTelegramTopicTargetStore({ path, consolidated,
+      getNowMs: () => 1000, canPersist: () => owner.owns() });
+    await store.load();
+    const sourcePath = join(dir, "retained-source.json"), botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "fixture-slot-history" });
+    const source = createTelegramUpdateJournalStore({ path: sourcePath, profileName: "default", botIdentity });
+    source.appendBatch([{ update_id: 41 }]);
+    const sourceKey = createTelegramUpdateJournalBindingKey({ path: sourcePath, profileName: "default", botIdentity });
+    const sourceBytes = readFileSync(sourcePath, "utf8");
+    const target = { chatId: 7, threadId: 42 }, neighborTarget = { chatId: 7, threadId: 77 };
+    store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", mode === "cold-restore" ? 1 : 0, "session")!, target,
+      slot: "S", threadName: "Signal", manualThreadName: "Home", displayTitle: "Home", updatedAtMs: 1,
+      journalBindingKeys: [sourceKey], journalSources: [{ sessionId: "session", recipientBindingKey: "manual:old-source" }],
+      journalBindingsComplete: true });
+    store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/repo", 0, "other-session")!, target: neighborTarget,
+      slot: "T", threadName: "Topaz", updatedAtMs: 1, journalBindingKeys: ["unrelated-source"], journalBindingsComplete: true });
+    store.upsert({ profileKey: "manual:neighbor", owner: { kind: "manual-follower", instanceId: "neighbor" },
+      instanceId: "neighbor-runtime", target: neighborTarget, slot: "T", threadName: "Topaz", status: "active", createdAtMs: 1, updatedAtMs: 1 });
+    store.upsert({ profileKey: "manual:stable", owner: { kind: "manual-follower", instanceId: "stable" },
+      instanceId: mode === "cold-restore" ? "424242:1000" : "old-runtime", target, slot: recordSlot, threadName: "Signal", status: "active", createdAtMs: 1, updatedAtMs: 1 });
+    await store.persist();
+    const neighborBinding = store.getWorkspaceBindingByTarget(neighborTarget, "other-session");
+    const neighborRecord = store.getByProfileKey("manual:neighbor");
+    const registry = createTelegramBusFollowerRegistry();
+    const admission = createTelegramWorkspaceAdmissionLedger({ path: join(dir, "admission.json"), profileKey: "default",
+      owner: { processId: process.pid, processBirthId: `${process.pid}:committed-slot` }, getProcessLiveness: () => "alive" });
+    const commitRegistration = store.commitWorkspaceRestoreRegistration;
+    store.commitWorkspaceRestoreRegistration = (candidate, publish) => {
+      assert.ok(admission.read().leases.some(lease => lease.operationKind === "workspace.publish-follower-registration"));
+      if (boundary === "binding-drift") storage.capturePublication()!(current => {
+        const changed = structuredClone(current) as { workspaceBindings: Array<{ target: typeof target; slot: string }> };
+        changed.workspaceBindings.find(binding => binding.target.threadId === target.threadId)!.slot = "Z";
+        return { value: changed, result: true };
+      });
+      if (boundary === "epoch-loss") owner.release();
+      commitRegistration(candidate, publish);
+    };
+    let allowedUserId: number | undefined;
+    const calls: string[] = [], notices: string[] = [], events: Array<{ message: string; phase?: string }> = [];
+    const runtime = createTelegramBusLeaderRuntimeAssembly({
+      runtime: { socketPath, followerRegistry: registry, authSecret: "fixture", protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY,
+        startPolling() {}, stopPolling() {}, isFollowerProcessAlive: pid => mode !== "cold-restore" || pid !== 424242 },
+      instanceId: "leader", getTelegramProfile: () => undefined, getAllowedUserId: () => allowedUserId,
+      getCurrentLeaderEpoch: owner.getOwnedLeaderEpoch, topicTargetStore: store, getWorkspaceAdmission: () => admission,
+      async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+        calls.push(method);
+        if (method === "sendMessage") notices.push(String(body.text));
+        assert.ok(["sendMessage", "sendChatAction", "editForumTopic"].includes(method), `Reusing a retained target cannot create or delete a tab (${method})`);
+        return true as TResponse;
+      },
+      callMultipart: async () => true, downloadFile: async () => undefined,
+      getSyncState: () => ({}), setSyncState() {}, setLeaderTarget() {},
+      recordRuntimeEvent(_category, message, details) { events.push({ message: String(message), phase: details?.phase as string | undefined }); },
+    });
+    try {
+      await runtime.startPolling("ctx"); allowedUserId = 7;
+      assert.equal(store.getByProfileKey("manual:stable")?.instanceId, mode === "cold-restore" ? "424242:1000" : "old-runtime", "Startup must retain the source owner record");
+      const response = await sendTelegramBusLocalEnvelope({ socketPath, timeoutMs: 2000, envelope: {
+        kind: mode === "cold-restore" ? "follower.restoreWorkspace" : "follower.register", requestId: "register-new", auth: "fixture", registration: {
+          instanceId: "new-runtime", profileKey: "manual:stable", cwd: "/repo", sessionId: "session", target,
+          registrationGeneration: "new-runtime:1", protocol: TEST_BUS_PROTOCOL_IDENTITY, connectedAtMs: 1000,
+        },
+      } });
+      assert.equal(response?.kind, "bus.ack");
+      if (!response || response.kind !== "bus.ack") assert.fail("Missing registration ACK");
+      if (boundary === "current") {
+        assert.equal(response.ok, true, `${response.message}; ${events.map(event => event.message).join("; ")}`);
+        assert.deepEqual(notices, ["<b>📡 Instance <i>Home</i> connected.</b>"]);
+        assert.equal(response.requestId, "register-new");
+        const acknowledged = response.result as { chatId: number; threadId: number; slot: string };
+        assert.equal(acknowledged.slot, "S"); assert.equal(acknowledged.chatId, target.chatId);
+        assert.equal(acknowledged.threadId, target.threadId);
+        const registered = registry.get("new-runtime")!; assert.ok(registered);
+        assert.equal(registered.slot, "S"); assert.equal(registered.target?.chatId, target.chatId);
+        assert.equal(registered.target?.threadId, target.threadId);
+        assert.equal(registered.profileKey, "manual:stable"); assert.equal(registered.sessionId, "session");
+        assert.equal(registered.cwd, "/repo"); assert.equal(registered.registrationGeneration, "new-runtime:1");
+        assert.equal(events.filter(event => event.phase === "follower-register-slot-reconcile").length,
+          mode === "cold-restore" && recordSlot === "S" ? 0 : 1,
+          "Cold restore adopts the retained claim; a mismatched owner record still requires exact reconciliation");
+      } else {
+        assert.equal(response.ok, false); assert.equal(registry.get("new-runtime"), undefined);
+        if (boundary === "binding-drift") assert.match(response.message ?? "", /binding changed before publication/);
+      }
+      const canonical = createTelegramTopicTargetStore({ path, consolidated, canPersist: () => false });
+      await canonical.load();
+      const binding = canonical.getWorkspaceBindingByTarget(target, "session")!; assert.ok(binding);
+      assert.equal(binding.instanceSlot, "b");
+      assert.equal(binding.cwd, "/repo"); assert.equal(binding.sessionId, "session");
+      assert.deepEqual(binding.target, target); assert.equal(binding.slot, boundary === "binding-drift" ? "Z" : "S");
+      assert.equal(canonical.getByProfileKey("manual:stable")?.slot, "S");
+      assert.equal(canonical.getByProfileKey("manual:stable")?.instanceId, "new-runtime");
+      assert.equal(binding.manualThreadName, "Home");
+      assert.deepEqual(binding.journalBindingKeys, [sourceKey], "Rekeying the same target cannot erase retained legacy journal references");
+      assert.deepEqual(binding.journalSources, [{ sessionId: "session", recipientBindingKey: "manual:old-source" },
+        { sessionId: "session", recipientBindingKey: "manual:stable" }]);
+      assert.equal(binding.journalBindingsComplete, true);
+      assert.deepEqual(canonical.getWorkspaceBindingByTarget(neighborTarget, "other-session"), neighborBinding);
+      assert.deepEqual(canonical.getByProfileKey("manual:neighbor"), neighborRecord);
+      assert.equal(readFileSync(sourcePath, "utf8"), sourceBytes, "Registration cannot execute or settle retained input");
+      assert.deepEqual(source.read().entries.map(entry => entry.updateId), [41]);
+      assert.deepEqual(admission.read().leases, []);
+    } finally {
+      await runtime.stopPolling(); owner.release(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+}
+}
 
 test("Bus leader replaces only the stale session-qualified follower target", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-session-target-replace-"));
@@ -3075,6 +3247,30 @@ test("Bus leader generation-fences and commits follower Workspace Thread rename"
   );
   assert.deepEqual(renames, ["Navigator"]);
 });
+
+for (const mode of ["before", "during-provision", "supported", "leader-only-reader"] as const) {
+  test(`Shared pre-dispatch evidence fences incompatible follower readers (${mode})`, async () => {
+    const registry = createTelegramBusFollowerRegistry();
+    let needed = mode !== "during-provision", provisions = 0;
+    const protocolIdentity = createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: [
+      TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND,
+    ] });
+    const handle = createTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry, protocolIdentity,
+      requiresPreDispatchRebindReader: () => needed,
+      async provisionFollowerTarget() { provisions++; needed = true; return undefined; },
+    });
+    const reply = await handle({ kind: "follower.register", requestId: "reader", registration: {
+      instanceId: "reader", registrationGeneration: "reader:1", connectedAtMs: 1000,
+      protocol: createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: [
+        TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
+        ...(mode === "supported" ? [TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND] : mode === "leader-only-reader" ? ["live-rebind-pre-dispatch-reader-v1"] : []),
+      ] }),
+    } });
+    assert.equal(reply.kind === "bus.ack" && reply.ok, mode === "supported");
+    assert.equal(registry.list().length, mode === "supported" ? 1 : 0);
+    assert.equal(provisions, mode === "before" || mode === "leader-only-reader" ? 0 : 1);
+  });
+}
 
 test("Bus leader rejects incompatible protocol before follower provisioning", async () => {
   const registry = createTelegramBusFollowerRegistry();
@@ -5421,10 +5617,11 @@ test("Rename and reset reject target replacement during Bot API mutation", async
 });
 
 test("Leader startup defers display contraction until the follower roster settles", async (t) => {
-  for (const scenario of ["returns", "absent", "stopped"] as const) {
+  for (const scenario of ["returns", "absent", "stopped", "stopped-during-start"] as const) {
     await t.test(scenario === "returns" ? "same-cwd follower returns" :
       scenario === "absent" ? "same-cwd follower stays absent" :
-      "leader stops before roster settlement", async (t) => {
+      scenario === "stopped" ? "leader stops before roster settlement" :
+      "leader stops while its startup is still awaiting", async (t) => {
       t.mock.timers.enable({ apis: ["setTimeout"] });
       const dir = mkdtempSync(join(tmpdir(), "pi-telegram-display-startup-roster-"));
       const socketPath = join(dir, "bus.sock");
@@ -5460,10 +5657,14 @@ test("Leader startup defers display contraction until the follower roster settle
         threadName: "Anchor", status: "active", createdAtMs: 1, updatedAtMs: 1 });
       const registry = createTelegramBusFollowerRegistry();
       const titles: string[] = [];
+      let releaseStart!: () => void;
+      const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
       const runtime = createTelegramBusLeaderRuntimeAssembly({
         runtime: { socketPath, followerRegistry: registry,
           protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY, followerStaleAfterMs: 25,
-          followerPruneIntervalMs: 1000, startPolling() {}, stopPolling() {} },
+          followerPruneIntervalMs: 1000,
+          async startPolling() { if (scenario === "stopped-during-start") await startGate; },
+          stopPolling() {} },
         instanceId: "leader", getAllowedUserId: () => undefined,
         getCurrentLeaderEpoch: () => 1, getThreadDisplayMode: () => "directory-title",
         topicTargetStore: store,
@@ -5481,7 +5682,16 @@ test("Leader startup defers display contraction until the follower roster settle
           (binding) => binding.bindingKey === leaderIdentity.bindingKey)?.displayTitle,
         `Extensions ${leaderIdentity.slot}`);
         await store.persist();
-        await runtime.startPolling("ctx");
+        if (scenario === "stopped-during-start") {
+          const starting = runtime.startPolling("ctx");
+          await new Promise((resolve) => setImmediate(resolve));
+          // The stop is issued while the start still awaits; the inner stop then waits for that start to finish.
+          const stopping = runtime.stopPolling();
+          stopped = true;
+          releaseStart();
+          await starting;
+          await stopping;
+        } else await runtime.startPolling("ctx");
         assert.deepEqual(titles, [], "Startup must not contract an acknowledged suffix immediately");
         if (scenario === "returns") registry.register({
           instanceId: "follower", target: { chatId: 7, threadId: 42 },
@@ -5497,6 +5707,7 @@ test("Leader startup defers display contraction until the follower roster settle
         for (let index = 0; index < 3; index++) {
           await new Promise((resolve) => setImmediate(resolve));
         }
+        // A startup the leader stopped mid-await must not arm a stabilization timer that later renames tabs.
         assert.deepEqual(titles, scenario === "absent" ? ["Extensions"] : [], JSON.stringify({
           bindings: store.listWorkspaceBindings().map((binding) => ({
             bindingKey: binding.bindingKey, target: binding.target,
@@ -5826,6 +6037,50 @@ test("Bus leader runtime provisions leader target before polling", async () => {
     assert.deepEqual(events, ["leader:ctx", "poll:start", "poll:stop"]);
   } finally {
     await runtime.stopPolling().catch(() => undefined);
+  }
+});
+
+test("Bus leader runtime stopped during startup never publishes its follower endpoint", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-stop-during-start-"));
+  const socketPath = join(dir, "bus.sock");
+  let finishProvisioning!: () => void;
+  let provisioningStarted!: () => void;
+  const provisioningGate = new Promise<void>((resolve) => { finishProvisioning = resolve; });
+  const started = new Promise<void>((resolve) => { provisioningStarted = resolve; });
+  let polling = 0;
+  const runtime = createTelegramBusLeaderRuntime({
+    socketPath,
+    followerRegistry: createTelegramBusFollowerRegistry(),
+    provisionLeaderTarget: async () => {
+      provisioningStarted();
+      await provisioningGate;
+    },
+    startPolling: () => { polling += 1; },
+    stopPolling: () => undefined,
+  });
+  try {
+    const startup = runtime.startPolling("ctx");
+    await started;
+    // Session shutdown arrives while the leader is still replaying cleanup.
+    await runtime.stopPolling();
+    finishProvisioning();
+    await startup;
+    await assert.rejects(() =>
+      sendTelegramBusLocalEnvelope({
+        socketPath,
+        timeoutMs: 50,
+        envelope: {
+          kind: "follower.register",
+          requestId: "stop-during-start:1",
+          registration: { instanceId: "late", registrationGeneration: "late:1", connectedAtMs: 1000 },
+        },
+      }),
+    "A stopped leader's endpoint never starts listening for followers");
+    assert.equal(polling, 0, "A stopped startup never begins polling");
+  } finally {
+    finishProvisioning();
+    await runtime.stopPolling().catch(() => undefined);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

@@ -57,6 +57,9 @@ export const TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT = "directory-displ
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT = "workspace-follower-auto-connect-v1";
 export const TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT = "session-replacement-intent-v1";
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE = "workspace-restore-v1";
+/** Shared Workspace readers understand independent pre-dispatch input/cleanup state. */
+export const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND = "live-rebind-pre-dispatch-reader-v2";
+export const TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION = "live-rebind-pre-dispatch-v1";
 export const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE = "live-thread-rebind-save-v1";
 export const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY = "live-thread-rebind-apply-v1";
 export const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE = "live-thread-rebind-settle-v1";
@@ -270,9 +273,6 @@ function hasTelegramBusDeliveryMarker(body, marker) {
         !Array.isArray(body) &&
         body[marker] === true);
 }
-export function markTelegramBusAggregateDelivery(body) {
-    return { ...body, [TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD]: true };
-}
 export function markTelegramBusCrossTargetDelivery(body) {
     return { ...body, [TELEGRAM_BUS_CROSS_TARGET_DELIVERY_FIELD]: true };
 }
@@ -375,11 +375,10 @@ export function isTelegramFollowerApiCallAllowed(input) {
         if (apiMethod === "setMyCommands")
             return isBotCommandRegistration(input.args[1]);
         if (apiMethod === "sendChatAction")
-            return isTargetChatScoped(input.args[1]);
+            return isTargetScoped(input.args[1]);
         if (apiMethod === "sendMessage" &&
             hasTelegramBusDeliveryMarker(input.args[1], TELEGRAM_BUS_AGGREGATE_DELIVERY_FIELD)) {
-            const body = input.args[1];
-            return body.message_thread_id === undefined && isTargetChatScoped(body);
+            return false;
         }
         if ((apiMethod === "sendMessage" || apiMethod === "sendRichMessage") &&
             hasTelegramBusDeliveryMarker(input.args[1], TELEGRAM_BUS_CROSS_TARGET_DELIVERY_FIELD)) {
@@ -643,7 +642,8 @@ export function parseTelegramBusEnvelope(line) {
             ]) ||
                 (Object.hasOwn(value, "preparedSource") && !selectedCommand) ||
                 (value.mode === "observe-command" &&
-                    (!selectedCommand || Object.hasOwn(value, "oldTarget"))))
+                    (!selectedCommand || Object.hasOwn(value, "oldTarget"))) ||
+                (value.mode === "observe-held" && (parseThreadTarget(value.oldTarget)?.threadId ?? 0) <= 0))
                 break;
             if (Object.hasOwn(value, "selectedCommand") &&
                 (!selectedCommand ||
@@ -660,7 +660,7 @@ export function parseTelegramBusEnvelope(line) {
                     : value.mode === "release" ||
                         value.mode === "discard" ||
                         value.mode === "observe-command" ||
-                        (value.mode === "observe" &&
+                        ((value.mode === "observe" || value.mode === "observe-held") &&
                             !!parseThreadTarget(value.oldTarget))) &&
                 isUniqueSourceUpdateIds(value.sourceUpdateIds) &&
                 typeof value.sentAtMs === "number" &&
@@ -672,7 +672,7 @@ export function parseTelegramBusEnvelope(line) {
                     sourceUpdateIds: value.sourceUpdateIds,
                     mode: value.mode,
                     sentAtMs: value.sentAtMs,
-                    ...(value.mode === "observe"
+                    ...((value.mode === "observe" || value.mode === "observe-held")
                         ? { oldTarget: parseThreadTarget(value.oldTarget) }
                         : {}),
                     ...(selectedCommand ? { selectedCommand, preparedSource } : {}),
@@ -1249,6 +1249,7 @@ export function createTelegramBusLiveRebindController(deps) {
                     "release",
                     "discard",
                     "observe",
+                    "observe-held",
                     "observe-command",
                 ].includes(input.mode) ||
                     (input.mode === "observe-command" && !selectedCommand))))
@@ -1289,7 +1290,8 @@ export function createTelegramBusLiveRebindController(deps) {
                 }
                 : { updates: input.updates }),
         });
-        const observing = "mode" in expected && expected.mode === "observe";
+        const observing = "mode" in expected && (expected.mode === "observe" || expected.mode === "observe-held");
+        const observingHeld = "mode" in expected && expected.mode === "observe-held";
         const commandObserving = "mode" in expected && expected.mode === "observe-command";
         const settling = "mode" in expected &&
             (expected.mode === "release" ||
@@ -1302,6 +1304,7 @@ export function createTelegramBusLiveRebindController(deps) {
                 ? [TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY]
                 : []),
             ...(settling || held ? [TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE] : []),
+            ...(observingHeld ? [TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION] : []),
             ...(held
                 ? [
                     TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,

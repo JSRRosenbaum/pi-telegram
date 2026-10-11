@@ -44,6 +44,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
   TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE,
   TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE,
+  TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION,
   TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
@@ -82,6 +83,7 @@ import {
   type TelegramLockEntry,
   type TelegramLockState,
 } from "./locks.ts";
+import * as Machine from "./machine.ts";
 import { isPiStaleContextError } from "./pi.ts";
 import type { TelegramQueueHandoffStageResult } from "./queue.ts";
 import {
@@ -90,9 +92,11 @@ import {
 } from "./target.ts";
 import {
   isTelegramApiMethodRetrySafe,
+  assertTelegramApiCallAuthority,
   TelegramApiAuthorityError,
   TelegramApiCommitUnknownError,
   TelegramApiStaleTargetError,
+  type TelegramApiCallOptions,
 } from "./telegram-api.ts";
 import * as Threads from "./threads.ts";
 import { isWireRecord as isRecord } from "./wire.ts";
@@ -709,10 +713,10 @@ export function createTelegramBusFollowerRuntimeAssembly<
         sessionId: string | undefined;
       }
     | undefined;
-  const isReadyContext = (ctx?: TContext): boolean =>
+  const isReadyContext = (): boolean =>
     Boolean(
       readyContext &&
-      (ctx === undefined || readyContext.ctx === ctx) &&
+      ports.receiver.getContext() === readyContext.ctx &&
       ports.registrationState.getGeneration() === readyContext.generation &&
       ports.registration.getSessionGeneration?.() ===
         readyContext.sessionGeneration &&
@@ -724,24 +728,42 @@ export function createTelegramBusFollowerRuntimeAssembly<
     const generation = ports.registrationState.getGeneration();
     const sessionGeneration = ports.registration.getSessionGeneration?.();
     const sessionId = ports.registration.getSessionId?.(ctx);
+    const executionContext = ports.receiver.getContext();
     readyContext = undefined;
     if (
       !generation ||
+      executionContext === undefined ||
+      ports.registration.isContextActive?.(ctx) === false ||
+      ports.registration.isContextActive?.(executionContext) === false ||
+      ports.registration.getSessionId?.(executionContext) !== sessionId ||
+      (executionContext !== ctx &&
+        (sessionId === undefined ||
+          !ports.registration.isContextActive ||
+          !ports.registration.getSessionGeneration)) ||
       (sessionId !== undefined &&
         ports.registrationState.getSessionId(sessionId) !== sessionId)
     )
       throw new Error(
-        "Telegram follower session change requires acknowledged leader registration.",
+        "Telegram follower session change requires acknowledged leader registration and a current canonical context.",
       );
-    await ports.registration.onRegistered?.(ctx);
+    // Connect has a command context; inbound work uses the session's canonical object.
+    await ports.registration.onRegistered?.(executionContext);
     if (
       generation &&
       ports.registrationState.getGeneration() === generation &&
       ports.registration.getSessionGeneration?.() === sessionGeneration &&
+      ports.receiver.getContext() === executionContext &&
       ports.registration.getSessionId?.(ctx) === sessionId &&
-      ports.registration.isContextActive?.(ctx) !== false
+      ports.registration.getSessionId?.(executionContext) === sessionId &&
+      ports.registration.isContextActive?.(ctx) !== false &&
+      ports.registration.isContextActive?.(executionContext) !== false
     )
-      readyContext = { generation, ctx, sessionGeneration, sessionId };
+      readyContext = {
+        generation,
+        ctx: executionContext,
+        sessionGeneration,
+        sessionId,
+      };
   };
   const sharedRuntimeDeps = {
     instanceId: ports.instanceId,
@@ -792,7 +814,7 @@ export function createTelegramBusFollowerRuntimeAssembly<
         ports.registration.isContextActive?.(ctx) === false
       )
         return;
-      if (!isReadyContext(ctx)) await prepareContext(ctx);
+      if (!isReadyContext()) await prepareContext(ctx);
     },
   };
   return {
@@ -929,7 +951,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
         isCurrent(): boolean;
         /** Captured prepared-branch target; equality must precede local apply or release grants. */
         expectedTarget?: TelegramTarget & { threadId: number };
-        release?: (canRelease: () => boolean) => void;
+        release?: (canRelease: () => boolean, target: TelegramTarget & { threadId: number }) => void;
         observeWork?: (
           oldTarget: TelegramTarget & { threadId: number },
         ) => void;
@@ -952,6 +974,9 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
       workObserver = scope && ports!.observeWork?.bind(scope);
     const captured = deps.getContextAuthority(ctx);
     if (!captured) throw new Error("Stale Telegram follower Restore context.");
+    const snapshotStore = deps.topicTargetStore,
+      liveSnapshot = snapshotStore.withWorkspaceLiveRebindSnapshot,
+      restoreSnapshot = snapshotStore.withWorkspaceRestoreSnapshot;
     const authority = structuredClone(captured);
     const request = structuredClone({
       operationId: input.operationId,
@@ -1015,6 +1040,10 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
     const assertCurrent = (): void => {
       if (
         !isDeepStrictEqual(deps.getContextAuthority(ctx), authority) ||
+        deps.topicTargetStore !== snapshotStore ||
+        (liveCurrent
+          ? snapshotStore.withWorkspaceLiveRebindSnapshot !== liveSnapshot
+          : snapshotStore.withWorkspaceRestoreSnapshot !== restoreSnapshot) ||
         liveCurrent?.() === false ||
         (scope &&
           (input.liveRebind !== scope ||
@@ -1042,6 +1071,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
           (liveCurrent
             ? !("kind" in intent) ||
               intent.kind !== "live-rebind" ||
+              (intent.inputRelease !== undefined && !hasTelegramBusCapability(authority.leaderProtocol, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION)) ||
               !isDeepStrictEqual(
                 [...intent.request.source.updateIds].sort((a, b) => a - b),
                 sourceUpdateIds,
@@ -1071,7 +1101,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
             "Telegram follower Restore intent does not match this recipient.",
           );
         const expected = structuredClone(intent);
-        await deps.topicTargetStore.load();
+        await snapshotStore.load();
         assertCurrent();
         const observe = (
           canonical: Readonly<
@@ -1159,13 +1189,19 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
             ready,
           };
         };
+        const withSnapshot = (observer: Parameters<typeof restoreSnapshot>[1]): void => {
+          assertCurrent();
+          if ("kind" in expected) {
+            if (!liveSnapshot)
+              throw new Error("Live-rebind read-only Workspace snapshot is unavailable.");
+            liveSnapshot.call(snapshotStore, expected, observer);
+          } else restoreSnapshot.call(snapshotStore, expected, observer);
+          assertCurrent();
+        };
         let result: TelegramBusWorkspaceRestoreObservation | undefined;
-        deps.topicTargetStore.withWorkspaceRestoreSnapshot(
-          expected,
-          (snapshot) => {
-            result = observe(snapshot);
-          },
-        );
+        withSnapshot((snapshot) => {
+          result = observe(snapshot);
+        });
         if (!result)
           throw new Error(
             "Telegram follower Restore observation was not completed.",
@@ -1174,40 +1210,35 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
           if (
             !("kind" in expected) ||
             expected.kind !== "live-rebind" ||
-            expected.phase !== "released" ||
+            (release ? !Threads.isTelegramLiveRebindInputAuthorized(expected)
+              : !(Threads.isTelegramLiveRebindInputAuthorized(expected) || expected.phase === "released" && expected.inputRelease === "held" && !expected.cleanup)) ||
             !result.ready ||
             request.mode !== "inspect"
           )
             throw new Error(
               "Live-rebind dispatch has no canonical released/local-applied grant.",
             );
-          // Journal reads stay outside the canonical transaction; each barrier check reobserves only Workspace authority.
+          // Live barriers reobserve read-only Workspace evidence; journal reads never borrow publication authority.
           if (workObserver)
             sampleWork = () => {
-              deps.topicTargetStore.withWorkspaceRestoreSnapshot(
-                expected,
-                (snapshot) => {
-                  if (!observe(snapshot).ready)
-                    throw new Error(
-                      "Live-rebind work observation lost local target application.",
-                    );
-                  workObserver(expected.request.binding.target);
-                  assertCurrent();
-                },
-              );
+              withSnapshot((snapshot) => {
+                if (!observe(snapshot).ready)
+                  throw new Error(
+                    "Live-rebind work observation lost local target application.",
+                  );
+                workObserver(expected.request.binding.target);
+                assertCurrent();
+              });
             };
           release?.(() => {
             assertCurrent();
             let ready = false;
-            deps.topicTargetStore.withWorkspaceRestoreSnapshot(
-              expected,
-              (snapshot) => {
-                ready = observe(snapshot).ready;
-              },
-            );
+            withSnapshot((snapshot) => {
+              ready = observe(snapshot).ready;
+            });
             assertCurrent();
             return ready;
-          });
+          }, { ...expected.request.target });
         }
         return result;
       },
@@ -1352,8 +1383,7 @@ export function createTelegramBusFollowerWorkspaceRestoreHandler<
           if (
             !value ||
             value.kind !== "live-rebind" ||
-            value.phase !== "released" ||
-            value.cleanup ||
+            !Threads.isTelegramLiveRebindInputAuthorized(value) ||
             value.request.operationId !== expected.operationId ||
             value.recipient.kind !== "follower" ||
             value.recipient.instanceId !== instanceId ||
@@ -1846,14 +1876,18 @@ export function createTelegramBusFollowerSelectedMenuCaller<TContext>(deps: {
 
 export function createTelegramBusFollowerApiCaller(
   deps: TelegramBusFollowerApiCallerDeps,
-): (method: string, args: unknown[]) => Promise<unknown> {
+): (method: string, args: unknown[], localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown> {
   const getNowMs = deps.getNowMs ?? Date.now;
   const timeoutMs = deps.timeoutMs ?? TELEGRAM_BUS_FOLLOWER_CLIENT_TIMEOUT_MS;
-  return async (method, args) => {
+  return async (method, args, localOptions) => {
+    const assertion = localOptions?.assertAuthority;
+    const assertCurrent = () => assertTelegramApiCallAuthority(assertion, false);
+    assertCurrent();
     const registration = await resolveTelegramBusFollowerRegistration(
       deps,
       timeoutMs,
     );
+    assertCurrent();
     const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
     let response: TelegramBusEnvelope | undefined;
     try {
@@ -1870,8 +1904,10 @@ export function createTelegramBusFollowerApiCaller(
           args,
           sentAtMs: getNowMs(),
         },
+        assertion ? assertCurrent : undefined,
       );
     } catch (error) {
+      if (error instanceof TelegramBusLocalAuthorityError) throw new TelegramApiAuthorityError(error.requestIssued);
       const apiMethod =
         (method === "call" || method === "callMultipart") &&
         typeof args[0] === "string"
@@ -2223,186 +2259,345 @@ export type TelegramBusFollowerHeartbeatRecoveryHandler<TContext> = ((
   ctx: TContext,
 ) => Promise<void>) & { halt: () => void; resume: () => void };
 
+/** The whole recovery lifecycle state; only `transitionTelegramBusFollowerRecovery` produces a new one. */
+export interface TelegramBusFollowerRecoveryState {
+  /** Bumped by halt and resume, so a recovery or retry from before an operator stop or connect is inert. */
+  readonly epoch: number;
+  readonly halted: boolean;
+  /** One recovery runs at a time; it belongs to the epoch it started in. */
+  readonly recovering: boolean;
+  readonly retryId: number | null;
+  readonly nextRetryId: number;
+}
+
+export type TelegramBusFollowerRecoveryEvent =
+  | { type: "recoverRequested" }
+  | { type: "recoverySettled"; epoch: number }
+  | { type: "retryRequested"; epoch: number }
+  | { type: "retryFired"; retryId: number }
+  | { type: "halted" }
+  | { type: "resumed" };
+
+export type TelegramBusFollowerRecoveryEffect =
+  | { type: "runRecovery"; epoch: number }
+  | { type: "armRetry"; retryId: number }
+  | { type: "cancelRetry"; retryId: number };
+
+export function createTelegramBusFollowerRecoveryState(): TelegramBusFollowerRecoveryState {
+  return {
+    epoch: 0,
+    halted: false,
+    recovering: false,
+    retryId: null,
+    nextRetryId: 0,
+  };
+}
+
+/**
+ * Pure follower-recovery lifecycle. An operator stop halts it and a connect resumes it, each in a new epoch: work
+ * from the old epoch, a recovery still awaiting or a retry still armed, can no longer register or promote.
+ */
+export function transitionTelegramBusFollowerRecovery(
+  state: TelegramBusFollowerRecoveryState,
+  event: TelegramBusFollowerRecoveryEvent,
+): Machine.TelegramMachineStep<
+  TelegramBusFollowerRecoveryState,
+  TelegramBusFollowerRecoveryEffect
+> {
+  const cancelRetry: TelegramBusFollowerRecoveryEffect[] =
+    state.retryId === null
+      ? []
+      : [{ type: "cancelRetry", retryId: state.retryId }];
+  const start = (
+    from: TelegramBusFollowerRecoveryState,
+  ): Machine.TelegramMachineStep<
+    TelegramBusFollowerRecoveryState,
+    TelegramBusFollowerRecoveryEffect
+  > =>
+    from.halted || from.recovering
+      ? { state: from, effects: [] }
+      : {
+          state: { ...from, recovering: true },
+          effects: [{ type: "runRecovery", epoch: from.epoch }],
+        };
+  switch (event.type) {
+    case "recoverRequested":
+      return start(state);
+    case "recoverySettled":
+      return event.epoch === state.epoch
+        ? { state: { ...state, recovering: false }, effects: [] }
+        : { state, effects: [] };
+    case "retryRequested": {
+      if (event.epoch !== state.epoch || state.halted)
+        return { state, effects: [] };
+      const retryId = state.nextRetryId + 1;
+      return {
+        state: { ...state, retryId, nextRetryId: retryId },
+        effects: [...cancelRetry, { type: "armRetry", retryId }],
+      };
+    }
+    case "retryFired":
+      if (state.retryId !== event.retryId) return { state, effects: [] };
+      return start({ ...state, retryId: null });
+    case "halted":
+    case "resumed":
+      return {
+        state: {
+          ...state,
+          epoch: state.epoch + 1,
+          halted: event.type === "halted",
+          recovering: false,
+          retryId: null,
+        },
+        effects: cancelRetry,
+      };
+  }
+}
+
 export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
   deps: TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext>,
 ): TelegramBusFollowerHeartbeatRecoveryHandler<TContext> {
   // Promotion stops registration internally and must keep retrying; only an operator stop or a confirmed
   // switch to classic mode halts recovery, so it never re-registers behind a disconnect.
-  let halted = false;
   const promotionGraceMs =
     deps.promotionGraceMs ?? TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS;
   const sleep =
     deps.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  // A cancelled retry still fires through an injected scheduler; its id no longer matches and it does nothing.
   const scheduleRetry =
     deps.scheduleRetry ??
     ((retry: () => void, delayMs: number) => {
       const timer = setTimeout(retry, delayMs);
       timer.unref?.();
     });
-  let promotionPending = false;
-  const safeUpdateStatus = (ctx: TContext) => {
+  /** The recovery request carried by each retry; the machine decides whether the retry still counts. */
+  type RecoveryRequest = {
+    reason: unknown;
+    ctx: TContext;
+    binding?: TelegramBusFollowerPromotedBinding;
+  };
+  const retryRequests = new Map<number, RecoveryRequest>();
+  let pendingRetry: RecoveryRequest | undefined;
+  let request: RecoveryRequest | undefined;
+  let running: Promise<void> = Promise.resolve();
+  const machine = Machine.createTelegramMachineRunner<
+    TelegramBusFollowerRecoveryState,
+    TelegramBusFollowerRecoveryEvent,
+    TelegramBusFollowerRecoveryEffect
+  >({
+    initial: createTelegramBusFollowerRecoveryState(),
+    transition: transitionTelegramBusFollowerRecovery,
+    run(effect) {
+      switch (effect.type) {
+        case "runRecovery": {
+          const started = request!;
+          running = runRecovery(started, effect.epoch).finally(() =>
+            machine.dispatch({ type: "recoverySettled", epoch: effect.epoch }),
+          );
+          return;
+        }
+        case "armRetry": {
+          const retryId = effect.retryId;
+          retryRequests.set(retryId, pendingRetry!);
+          const fire = () => {
+            const carried = retryRequests.get(retryId);
+            if (!carried || machine.state.retryId !== retryId) return;
+            const activeCtx = deps.getActiveContext
+              ? deps.getActiveContext()
+              : carried.ctx;
+            if (!activeCtx) {
+              scheduleRetry(fire, promotionGraceMs);
+              return;
+            }
+            retryRequests.delete(retryId);
+            void requestRecovery(
+              { ...carried, ctx: activeCtx },
+              {
+                type: "retryFired",
+                retryId,
+              },
+            );
+          };
+          scheduleRetry(fire, promotionGraceMs);
+          return;
+        }
+        case "cancelRetry":
+          retryRequests.delete(effect.retryId);
+          return;
+      }
+    },
+  });
+  const requestRecovery = (
+    next: RecoveryRequest,
+    event: TelegramBusFollowerRecoveryEvent,
+  ): Promise<void> => {
+    const before = running;
+    request = next;
     try {
-      deps.updateStatus(ctx);
-    } catch (error) {
-      if (!isPiStaleContextError(error)) throw error;
-      deps.recordRuntimeEvent("bus", error, {
-        phase: "follower-stale-context-status",
-      });
+      machine.dispatch(event);
+    } finally {
+      request = undefined;
     }
+    return running === before ? Promise.resolve() : running;
   };
-  const clearRegisteredState = (ctx: TContext) => {
-    deps.registrationState.setRegistered(false);
-    safeUpdateStatus(ctx);
-  };
-  const tryRegisterWithLeader = async (
-    ctx: TContext,
-    leader: TelegramBusFollowerLeaderLock,
-    phase: string,
-    binding?: TelegramBusFollowerPromotedBinding,
-  ) => {
-    try {
-      const restored = await deps
-        .getRegistrationRuntime()
-        .registerWithLeader(
-          ctx,
-          leader,
-          binding?.target ? { target: binding.target } : undefined,
+  const runRecovery = async (
+    { reason: error, ctx, binding: carriedBinding }: RecoveryRequest,
+    epoch: number,
+  ): Promise<void> => {
+    const isCurrent = (): boolean =>
+      machine.state.epoch === epoch && !machine.state.halted;
+    const scheduleRecovery = (
+      reason: unknown,
+      fallbackCtx: TContext,
+      binding: TelegramBusFollowerPromotedBinding,
+    ) => {
+      pendingRetry = { reason, ctx: fallbackCtx, binding };
+      try {
+        machine.dispatch({ type: "retryRequested", epoch });
+      } finally {
+        pendingRetry = undefined;
+      }
+    };
+    const safeUpdateStatus = (ctx: TContext) => {
+      try {
+        deps.updateStatus(ctx);
+      } catch (error) {
+        if (!isPiStaleContextError(error)) throw error;
+        deps.recordRuntimeEvent("bus", error, {
+          phase: "follower-stale-context-status",
+        });
+      }
+    };
+    const clearRegisteredState = (ctx: TContext) => {
+      deps.registrationState.setRegistered(false);
+      safeUpdateStatus(ctx);
+    };
+    const tryRegisterWithLeader = async (
+      ctx: TContext,
+      leader: TelegramBusFollowerLeaderLock,
+      phase: string,
+      binding?: TelegramBusFollowerPromotedBinding,
+    ) => {
+      if (!isCurrent()) return false;
+      try {
+        const restored = await deps
+          .getRegistrationRuntime()
+          .registerWithLeader(
+            ctx,
+            leader,
+            binding?.target ? { target: binding.target } : undefined,
+          );
+        // Registration owns its attempt cleanup; an obsolete recovery cannot stop the shared replacement runtime.
+        if (!restored || !isCurrent()) return false;
+        deps.setLifecyclePhase(undefined);
+        safeUpdateStatus(ctx);
+        deps.recordRuntimeEvent(
+          "bus",
+          "Telegram follower registration restored",
+          {
+            phase,
+          },
         );
-      if (!restored) return false;
-      if (halted) {
-        deps.getRegistrationRuntime().stop();
+        return true;
+      } catch (error) {
+        if (!isCurrent()) return false;
+        clearRegisteredState(ctx);
+        deps.recordRuntimeEvent("bus", error, { phase });
         return false;
       }
+    };
+    const snapshotBinding = (): TelegramBusFollowerPromotedBinding => ({
+      target: deps.registrationState.getTarget(),
+      slot: deps.registrationState.getSlot(),
+      threadName: deps.registrationState.getThreadName(),
+    });
+    const promoteToLeader = async (
+      reason: unknown,
+      ctx: TContext,
+      binding: TelegramBusFollowerPromotedBinding,
+      election: TelegramBusFollowerElection,
+    ) => {
+      if (!isCurrent()) return;
+      const activeCtx = deps.getActiveContext?.();
+      if (deps.getActiveContext && activeCtx !== ctx) {
+        scheduleRecovery(reason, ctx, binding);
+        return;
+      }
+      deps.setLifecyclePhase("electing");
+      safeUpdateStatus(ctx);
+      deps.recordRuntimeEvent("bus", reason, {
+        phase: "follower-promotion-electing",
+      });
+      deps.getRegistrationRuntime().stop();
+      deps.setLifecyclePhase("electing");
+      safeUpdateStatus(ctx);
+      deps.recordRuntimeEvent("bus", "Telegram follower attempting promotion", {
+        phase: "follower-promotion-electing",
+      });
+      const promoted = await deps.promoteToLeader(ctx, binding, election);
+      if (!isCurrent()) return;
       deps.setLifecyclePhase(undefined);
       safeUpdateStatus(ctx);
       deps.recordRuntimeEvent(
         "bus",
-        "Telegram follower registration restored",
+        promoted
+          ? "Telegram follower promotion completed"
+          : "Telegram follower promotion lost election",
         {
-          phase,
+          phase: promoted
+            ? "follower-promotion-complete"
+            : "follower-promotion-lost",
         },
       );
-      return true;
-    } catch (error) {
-      clearRegisteredState(ctx);
-      deps.recordRuntimeEvent("bus", error, { phase });
-      return false;
-    }
-  };
-  const snapshotBinding = (): TelegramBusFollowerPromotedBinding => ({
-    target: deps.registrationState.getTarget(),
-    slot: deps.registrationState.getSlot(),
-    threadName: deps.registrationState.getThreadName(),
-  });
-  const scheduleRecovery = (
-    reason: unknown,
-    fallbackCtx: TContext,
-    binding: TelegramBusFollowerPromotedBinding,
-  ) => {
-    const retry = () => {
-      if (halted) return;
-      const activeCtx = deps.getActiveContext
-        ? deps.getActiveContext()
-        : fallbackCtx;
-      if (!activeCtx) {
-        scheduleRetry(retry, promotionGraceMs);
-        return;
-      }
-      void recover(reason, activeCtx, binding);
+      if (!promoted) scheduleRecovery(reason, ctx, binding);
     };
-    scheduleRetry(retry, promotionGraceMs);
-  };
-  const promoteToLeader = async (
-    reason: unknown,
-    ctx: TContext,
-    binding: TelegramBusFollowerPromotedBinding,
-    election: TelegramBusFollowerElection,
-  ) => {
-    const activeCtx = deps.getActiveContext?.();
-    if (deps.getActiveContext && activeCtx !== ctx) {
-      scheduleRecovery(reason, ctx, binding);
-      return;
-    }
-    deps.setLifecyclePhase("electing");
-    safeUpdateStatus(ctx);
-    deps.recordRuntimeEvent("bus", reason, {
-      phase: "follower-promotion-electing",
-    });
-    deps.getRegistrationRuntime().stop();
-    deps.setLifecyclePhase("electing");
-    safeUpdateStatus(ctx);
-    deps.recordRuntimeEvent("bus", "Telegram follower attempting promotion", {
-      phase: "follower-promotion-electing",
-    });
-    const promoted = await deps.promoteToLeader(ctx, binding, election);
-    deps.setLifecyclePhase(undefined);
-    safeUpdateStatus(ctx);
-    deps.recordRuntimeEvent(
-      "bus",
-      promoted
-        ? "Telegram follower promotion completed"
-        : "Telegram follower promotion lost election",
-      {
-        phase: promoted
-          ? "follower-promotion-complete"
-          : "follower-promotion-lost",
-      },
-    );
-    if (!promoted) scheduleRecovery(reason, ctx, binding);
-  };
-  const attemptPreferredPromotion = async (
-    reason: unknown,
-    ctx: TContext,
-    binding: TelegramBusFollowerPromotedBinding,
-    candidateState: TelegramBusFollowerLeaderState,
-  ): Promise<void> => {
-    const slot = binding.slot;
-    const lowerEligibleSlot = slot
-      ? deps.registrationState
-          .getEligibleElectionSlots()
-          .find((candidate) => candidate < slot)
-      : undefined;
-    if (lowerEligibleSlot) {
-      deps.recordRuntimeEvent(
-        "bus",
-        "Telegram follower deferring to a lower-slot election candidate",
-        {
-          phase: "follower-promotion-slot-priority",
-          slot,
-          lowerEligibleSlot,
-        },
-      );
-      await sleep(promotionGraceMs);
-      candidateState = deps.getLeaderState();
-      if (candidateState.kind === "active-elsewhere") {
-        if (
-          !(await tryRegisterWithLeader(
-            ctx,
-            candidateState.lock,
-            "follower-register-preferred-successor",
-            binding,
-          ))
-        ) {
-          scheduleRecovery(reason, ctx, binding);
+    const attemptPreferredPromotion = async (
+      reason: unknown,
+      ctx: TContext,
+      binding: TelegramBusFollowerPromotedBinding,
+      candidateState: TelegramBusFollowerLeaderState,
+    ): Promise<void> => {
+      const slot = binding.slot;
+      const lowerEligibleSlot = slot
+        ? deps.registrationState
+            .getEligibleElectionSlots()
+            .find((candidate) => candidate < slot)
+        : undefined;
+      if (lowerEligibleSlot) {
+        deps.recordRuntimeEvent(
+          "bus",
+          "Telegram follower deferring to a lower-slot election candidate",
+          {
+            phase: "follower-promotion-slot-priority",
+            slot,
+            lowerEligibleSlot,
+          },
+        );
+        await sleep(promotionGraceMs);
+        if (!isCurrent()) return;
+        candidateState = deps.getLeaderState();
+        if (candidateState.kind === "active-elsewhere") {
+          if (
+            !(await tryRegisterWithLeader(
+              ctx,
+              candidateState.lock,
+              "follower-register-preferred-successor",
+              binding,
+            ))
+          ) {
+            scheduleRecovery(reason, ctx, binding);
+          }
+          return;
         }
-        return;
       }
-    }
-    if (candidateState.kind !== "stale" && candidateState.kind !== "inactive")
-      return;
-    await promoteToLeader(reason, ctx, binding, {
-      expectedOwner:
-        candidateState.kind === "stale" ? candidateState.lock : undefined,
-    });
-  };
-  const recover = async (
-    error: unknown,
-    ctx: TContext,
-    carriedBinding?: TelegramBusFollowerPromotedBinding,
-  ): Promise<void> => {
-    if (promotionPending || halted) return;
-    promotionPending = true;
+      if (candidateState.kind !== "stale" && candidateState.kind !== "inactive")
+        return;
+      await promoteToLeader(reason, ctx, binding, {
+        expectedOwner:
+          candidateState.kind === "stale" ? candidateState.lock : undefined,
+      });
+    };
     deps.registrationState.beginRecovery();
     const initialBinding = carriedBinding ?? snapshotBinding();
     try {
@@ -2414,8 +2609,9 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
           phase: "follower-thread-mode-read",
         });
       }
+      if (!isCurrent()) return;
       if (threadModeDisabled) {
-        halted = true;
+        machine.dispatch({ type: "halted" });
         deps.getRegistrationRuntime().stop();
         deps.setLifecyclePhase(undefined);
         safeUpdateStatus(ctx);
@@ -2439,6 +2635,7 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
         ) {
           return;
         }
+        if (!isCurrent()) return;
         deps.setLifecyclePhase("electing");
         safeUpdateStatus(ctx);
         deps.recordRuntimeEvent(
@@ -2447,6 +2644,7 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
           { phase: "follower-promotion-grace" },
         );
         await sleep(promotionGraceMs);
+        if (!isCurrent()) return;
         const graceState = deps.getLeaderState();
         if (graceState.kind === "active-elsewhere") {
           if (
@@ -2459,7 +2657,11 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
           ) {
             return;
           }
-          if (await deps.proveLeaderUnresponsive?.(graceState.lock)) {
+          const unresponsive = await deps.proveLeaderUnresponsive?.(
+            graceState.lock,
+          );
+          if (!isCurrent()) return;
+          if (unresponsive) {
             await promoteToLeader(error, ctx, initialBinding, {
               expectedOwner: graceState.lock,
               unresponsive: true,
@@ -2485,6 +2687,7 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
       }
       await attemptPreferredPromotion(error, ctx, initialBinding, state);
     } catch (promotionError) {
+      if (!isCurrent()) return;
       deps.setLifecyclePhase(undefined);
       safeUpdateStatus(ctx);
       if (isPiStaleContextError(promotionError)) {
@@ -2497,18 +2700,20 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
         phase: "follower-promotion-failed",
       });
       scheduleRecovery(promotionError, ctx, initialBinding);
-    } finally {
-      promotionPending = false;
     }
   };
-  return Object.assign(recover, {
-    halt() {
-      halted = true;
+  return Object.assign(
+    (error: unknown, ctx: TContext): Promise<void> =>
+      requestRecovery({ reason: error, ctx }, { type: "recoverRequested" }),
+    {
+      halt() {
+        machine.dispatch({ type: "halted" });
+      },
+      resume() {
+        machine.dispatch({ type: "resumed" });
+      },
     },
-    resume() {
-      halted = false;
-    },
-  });
+  );
 }
 
 export function createTelegramBusFollowerRegistrationRuntime<
@@ -2590,6 +2795,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
     const leaderSocketPath = activeLeaderSocketPath;
     const registrationGeneration = activeRegistrationGeneration;
     const heartbeatContext = activeContext;
+    const heartbeatTarget = deps.registrationState?.getTarget();
     if (!leaderSocketPath || !registrationGeneration) return;
     const isCurrentHeartbeat = (): boolean =>
       activeLeaderSocketPath === leaderSocketPath &&
@@ -2621,6 +2827,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
         deps.registrationState?.setEligibleElectionSlots(slots);
         if (
           typeof heartbeatResult?.displayTitle === "string" &&
+          isDeepStrictEqual(deps.registrationState?.getTarget(), heartbeatTarget) &&
           deps.registrationState?.setDisplayTitle(
             heartbeatResult.displayTitle,
             registrationGeneration,
@@ -3276,12 +3483,14 @@ function sendTelegramBusOperation(
   socketPath: string,
   timeoutMs: number,
   envelope: TelegramBusEnvelope,
+  assertAuthority?: () => void,
 ) {
   return sendTelegramBusLocalEnvelope({
     socketPath,
     timeoutMs,
     envelope,
-    retry: getTelegramBusTransportRetryPolicy({
+    assertAuthority,
+    retry: assertAuthority ? { attempts: 1, delayMs: 0 } : getTelegramBusTransportRetryPolicy({
       endpoint: socketPath,
       operation: "operation",
     }),
@@ -3817,9 +4026,10 @@ export function createTelegramBusFollowerLiveRebindRuntime<TContext>(deps: {
         !matchesLiveRebindCarrier(record.observation, envelope)
       )
         throw new Error("Live-rebind settlement has no exact current carrier.");
-      if (envelope.mode === "observe") {
+      if (envelope.mode === "observe" || envelope.mode === "observe-held") {
+        const beforeRelease = envelope.mode === "observe-held";
         if (
-          record.outcome?.status !== "released" ||
+          (beforeRelease ? !!record.outcome || !record.applyIssued || !record.held.confirmSaved() : record.outcome?.status !== "released") ||
           !deps.applyTarget ||
           !deps.observeWork ||
           !envelope.oldTarget
@@ -3864,7 +4074,7 @@ export function createTelegramBusFollowerLiveRebindRuntime<TContext>(deps: {
           if (!current() || !work)
             throw new Error("Live-rebind work observation is unconfirmed.");
           // Unfinished or unconfirmed selected execution stays unknown; later settled delivery cannot clear it.
-          if (commandWork && status!.result !== "completed")
+          if (!beforeRelease && commandWork && status!.result !== "completed")
             work.unknown = true;
           if (!current())
             throw new Error("Live-rebind work observer authority changed.");
@@ -3917,10 +4127,12 @@ export function createTelegramBusFollowerLiveRebindRuntime<TContext>(deps: {
               sourceUpdateIds: record.observation.sourceUpdateIds,
               isCurrent: current,
               ...copyLiveRebindCommandTarget(record.observation),
-              release(canRelease) {
+              release(canRelease, target) {
+                if (!target) throw new Error("Live-rebind release target is unconfirmed.");
                 record.outcome = observation("unknown");
                 record.outcome = record.held.release(
                   () => current() && canRelease(),
+                  target,
                 )
                   ? observation("released")
                   : undefined;
@@ -4327,6 +4539,8 @@ export function createTelegramBusForwardedUpdateReceiverRuntime<TContext>(
           TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE,
           ...(apply ? [TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY] : []),
           ...(settle ? [TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE] : []),
+          ...(envelope.kind === "leader.settleLiveRebind" && envelope.mode === "observe-held"
+            ? [TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION] : []),
           ...(commandInput
             ? [
                 TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY,

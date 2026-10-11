@@ -6,6 +6,7 @@
 
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { withoutTelegramTurnReplyAnchor } from "./turns.ts";
 
 import type {
   TelegramBusEnvelope,
@@ -552,7 +553,10 @@ interface TelegramUpdateAdmissionBinding {
   prepareLiveInput?: (
     sourceUpdateIds: readonly number[],
     isCurrent: () => boolean,
+    onTransferred?: () => void,
   ) => TelegramLiveDeferredInputPreparation | undefined;
+  /** Internal notification after the worker's exact donor-removal ACK; never issues completion itself. */
+  acknowledgeTransferred?: () => void;
   prepareQueueAdmission?: () =>
     TelegramDeferredQueueAdmissionPreparation | undefined;
   prepareSourceCompletion?: () =>
@@ -614,6 +618,7 @@ export function bindTelegramUpdateAdmissionSource<
     | "inspectSourceSnapshot"
     | "inspectCompletion"
     | "isSourceUnsettled"
+    | "acknowledgeTransferred"
     | "prepareLiveInput"
     | "prepareQueueAdmission"
     | "prepareSourceCompletion"
@@ -761,20 +766,24 @@ export function prepareTelegramLiveDeferredInput(
     )
   )
     return undefined;
-  const unsettled = () =>
-    carriers.every(
-      (value) =>
-        getTelegramUpdateAdmissionBinding(value)?.isSourceUnsettled?.() ===
-        true,
-    );
+  const bindings = carriers.map(getTelegramUpdateAdmissionBinding);
+  const acknowledgers = bindings.map(binding => binding?.acknowledgeTransferred);
+  const bindingsCurrent = () => carriers.every((value, index) =>
+    getTelegramUpdateAdmissionBinding(value) === bindings[index] && bindings[index]?.acknowledgeTransferred === acknowledgers[index]);
+  const unsettled = () => bindingsCurrent() && bindings.every(binding => binding?.isSourceUnsettled?.() === true);
   if (!unsettled()) return undefined;
+  let transferred = false;
   const prepared = getTelegramUpdateAdmissionBinding(first)?.prepareLiveInput?.(
     ids,
     () =>
-      isCurrent() &&
+      bindingsCurrent() && isCurrent() &&
       carriers.every(
         (value) => getTelegramUpdateExecutionFence(value)?.isCurrent() === true,
       ),
+    () => {
+      transferred = true;
+      for (let index = 0; index < bindings.length; index++) acknowledgers[index]?.call(bindings[index]);
+    },
   );
   return (
     prepared && {
@@ -785,7 +794,7 @@ export function prepareTelegramLiveDeferredInput(
         unsettled() && prepared.beginRelease(() => unsettled() && canRelease()),
       settleTransferred: (canSettle) =>
         unsettled()
-          ? prepared.settleTransferred(() => unsettled() && canSettle())
+          ? prepared.settleTransferred(() => (transferred || unsettled()) && canSettle())
           : "protected",
       cancel: () => unsettled() && prepared.cancel(),
     }
@@ -2350,6 +2359,7 @@ export interface TelegramUpdateWorkerRuntimeDeps<TContext> {
     update: TelegramJournaledUpdate,
     ctx: TContext,
     signal: AbortSignal,
+    target?: TelegramTarget & { threadId: number },
   ) => Promise<TelegramUpdateAdmissionOutcome> | TelegramUpdateAdmissionOutcome;
   /** Native source-only binding, installed by the admission-worker assembly rather than ordinary dispatch. */
   admitPreparedLiveInput?: (
@@ -2466,7 +2476,7 @@ export interface TelegramLiveInputPreparation {
   prepareStatusConsumption?(input: TelegramLiveStatusConsumption): boolean;
   /** Native owner availability before recipient append; not admission or future target activation. */
   canPrepareStatusConsumption?(): boolean;
-  release(canRelease: () => boolean): boolean;
+  release(canRelease: () => boolean, target?: TelegramTarget & { threadId: number }): boolean;
   /** Ends a failed pre-append attempt only when no selected input was saved. */
   cancelEmpty(): boolean;
   /** One fenced removal of this never-dispatched recipient copy; unknown issuance cannot be retried. */
@@ -2532,6 +2542,7 @@ export interface TelegramUpdateWorkerRuntime<TContext> {
     sourceUpdateIds: readonly number[];
     signal: AbortSignal;
     isCurrent(): boolean;
+    onTransferred?(): void;
   }) => TelegramLiveDeferredInputPreparation | undefined;
   prepareDeferredQueueAdmission?: (input: {
     updateId: number;
@@ -2652,6 +2663,7 @@ interface TelegramLiveInputPreparationState<TContext> {
   saved?: TelegramUpdateWorkerJournalSnapshot["entries"][number][];
   discardIssued?: true;
   released?: true;
+  target?: TelegramTarget & { threadId: number };
   status?: {
     current(): boolean;
     assertCurrent(): void;
@@ -3707,6 +3719,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
     expectedOwner: TelegramUpdateWorkerOwner<TContext>,
     update: TelegramJournaledUpdate,
     preparedExecute?: TelegramUpdateWorkerRuntimeDeps<TContext>["executeUpdate"],
+    target?: TelegramTarget & { threadId: number },
   ): Promise<
     | TelegramUpdateWorkerExecutionSettlement
     | typeof TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED
@@ -3735,6 +3748,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
                 update,
                 expectedOwner.ctx,
                 expectedOwner.controller.signal,
+                target,
               ),
     );
     const settlement: Promise<TelegramUpdateWorkerExecutionSettlement> =
@@ -4739,6 +4753,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
                 return admitted.outcome;
               }
             : undefined,
+          prepared?.target,
         );
         if (execution === TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED) {
           return "aborted";
@@ -4820,6 +4835,11 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
           }
           snapshotInvalidated = true;
           break;
+        }
+        if (prepared?.target) {
+          prepared.ids = new Set([...prepared.ids].filter(id => id !== entry.updateId));
+          if (!prepared.ids.size && livePreparation === prepared) livePreparation = undefined;
+          updateClaimCounts();
         }
         const postExecutionAuthority = checkAuthority(
           expectedOwner,
@@ -5270,6 +5290,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
     prepareDeferredLiveInput(input) {
       const expectedOwner = owner,
         binding = deps.getJournalBindingKey?.(),
+        onTransferred = input.onTransferred,
         ids = [...input.sourceUpdateIds];
       const sources = ids.map((id) => deferredSources.get(id));
       const ownerCurrent = () =>
@@ -5282,7 +5303,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
         deps.hasAuthority(expectedOwner.ctx) &&
         deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
         isQueueOwnerIdentityCurrent(expectedOwner) &&
-        input.isCurrent();
+        input.onTransferred === onTransferred && input.isCurrent();
       const sourcesCurrent = () =>
         ownerCurrent() &&
         sources.every(
@@ -5381,13 +5402,11 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
               undefined,
               () => current() && canSettle(),
             );
-            if (
-              !current() ||
-              !canSettle() ||
-              result.removedUpdateIds.length !== ids.length ||
-              !ids.every((id) => result.removedUpdateIds.includes(id))
-            )
+            if (result.removedUpdateIds.length !== ids.length || !ids.every(id => result.removedUpdateIds.includes(id)))
               return "unknown";
+            // A consumed routing clock is expected only after this exact ACK, never after uncertain removal.
+            onTransferred?.call(input);
+            if (!current() || !canSettle()) return "unknown";
           } catch (error) {
             recordRuntimeEvent(error, {
               phase: "live-deferred-transfer-settlement",
@@ -5511,7 +5530,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
         }
       };
       const finish = () => {
-        if (!held.released || !held.status) livePreparation = undefined;
+        if (!held.released || !held.status && !held.target) livePreparation = undefined;
         updateClaimCounts();
         notifyStateChange();
         blocked = false;
@@ -5659,7 +5678,7 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
           };
           return held.status.current();
         },
-        release(canRelease) {
+        release(canRelease, target) {
           if (
             !current() ||
             held.discardIssued ||
@@ -5676,6 +5695,14 @@ export function createTelegramUpdateWorkerRuntime<TContext>(
             !current()
           )
             return false;
+          if (target) {
+            if (!Number.isSafeInteger(target.chatId) || target.chatId === 0 || !Number.isSafeInteger(target.threadId) || target.threadId <= 0 ||
+              entries.some(entry => {
+                const message = (entry.update.message ?? entry.update.edited_message) as { chat?: { id?: number } } | undefined;
+                return message?.chat?.id !== target.chatId;
+              })) return false;
+            if (!held.status) held.target = { ...target };
+          }
           released = true;
           held.released = true;
           finish();
@@ -8846,7 +8873,8 @@ function createTelegramUpdateSourceAdmissionHandle<
                   signal,
                 })
               : undefined,
-          prepareLiveInput: (sourceUpdateIds, isCurrent) =>
+          acknowledgeTransferred: () => { settlementReported = true; },
+          prepareLiveInput: (sourceUpdateIds, isCurrent, onTransferred) =>
             execution.isCurrent() &&
             !immediate &&
             !settlementReported &&
@@ -8856,6 +8884,7 @@ function createTelegramUpdateSourceAdmissionHandle<
                   sourceUpdateIds,
                   signal,
                   isCurrent: () => execution.isCurrent() && isCurrent(),
+                  onTransferred,
                 })
               : undefined,
           isHistorical: (matchesOriginal) =>
@@ -10599,11 +10628,19 @@ export function createTelegramUpdateAdmissionWorkerRuntime<
             ),
         }
       : {}),
-    async executeUpdate(update, ctx, signal) {
+    async executeUpdate(update, ctx, signal, target) {
       const typedUpdate = update as TUpdate;
+      const prepared = deps.prepareUpdateForExecution?.(typedUpdate) ?? typedUpdate;
+      // Journal/source evidence remains the original; only the warm released handler projection changes destination.
+      const routed = target ? { ...prepared,
+        ...(prepared.message ? { message: prepared.message.message_thread_id === target.threadId ? { ...prepared.message }
+          : withoutTelegramTurnReplyAnchor({ ...prepared.message, message_thread_id: target.threadId, reply_to_message: undefined }) } : {}),
+        ...(prepared.edited_message ? { edited_message: prepared.edited_message.message_thread_id === target.threadId ? { ...prepared.edited_message }
+          : withoutTelegramTurnReplyAnchor({ ...prepared.edited_message, message_thread_id: target.threadId, reply_to_message: undefined }) } : {}),
+      } as TUpdate : prepared;
       try {
         return await executeUpdate(
-          deps.prepareUpdateForExecution?.(typedUpdate) ?? typedUpdate,
+          routed,
           ctx,
           signal,
         );

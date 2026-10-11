@@ -726,7 +726,7 @@ export interface TelegramDispatchRuntimeDeps<TContext = unknown> {
     executeControlItem: (item: Extract<TelegramQueueDispatchAction<TContext>, {
         kind: "control";
     }>["item"]) => void;
-    onPromptDispatchStart: (chatId: number) => void;
+    onPromptDispatchStart: (chatId: number, target?: TelegramQueueTarget) => void;
     commitPromptDispatch?: (item: Extract<TelegramQueueDispatchAction<TContext>, {
         kind: "prompt";
     }>["item"]) => boolean;
@@ -745,7 +745,7 @@ export interface TelegramQueueDispatchControllerDeps<TContext = unknown> extends
     isDispatchGenerationActive?: (generation: number) => boolean;
     updateStatus: (ctx: TContext, error?: string) => void;
     sendTextReply: TelegramControlRuntimeDeps<TContext>["sendTextReply"];
-    onPromptDispatchStart: (ctx: TContext, chatId: number) => void;
+    onPromptDispatchStart: (ctx: TContext, chatId: number, target?: TelegramQueueTarget) => void;
     commitPromptDispatch?: (item: Extract<TelegramQueueDispatchAction<TContext>, {
         kind: "prompt";
     }>["item"], ctx: TContext) => boolean;

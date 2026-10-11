@@ -449,6 +449,32 @@ function createMalformedApiTextResponse(text: string): Response {
   } as Response;
 }
 
+for (const fail of ["none", "capture", "sync", "async"] as const)
+test(`API drain observation follows per-target and chat counts without changing requests (${fail})`, async () => {
+  let notifications = 0;
+  const activity = createTelegramApiTargetActivityRuntime({ captureDrain() {
+    if (fail === "capture") throw new Error("observer");
+    return () => {
+      if (fail === "sync") throw new Error("observer");
+      if (fail === "async") return Promise.reject(new Error("observer"));
+      notifications++;
+    };
+  } });
+  const first = activity.begin("sendMessage", { chat_id: 7, message_thread_id: 10 });
+  const last = activity.begin("sendMessage", { chat_id: 7, message_thread_id: 10 });
+  first(); first();
+  assert.equal(activity.hasPendingTarget({ chatId: 7, threadId: 10 }), true);
+  assert.equal(notifications, 0);
+  last(); last();
+  assert.equal(activity.hasPendingTarget({ chatId: 7, threadId: 10 }), false);
+  const chat = activity.begin("editMessageText", { chat_id: 7, message_id: 99 });
+  assert.equal(activity.hasPendingTarget({ chatId: 7, threadId: 42 }), true);
+  chat();
+  assert.equal(activity.hasPendingTarget({ chatId: 7, threadId: 42 }), false);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(notifications, fail === "none" ? 2 : 0);
+});
+
 function getApiTestFetchUrl(input: string | URL | Request): string {
   return typeof input === "string" ? input : input.toString();
 }
@@ -640,7 +666,7 @@ test("Sealed preview drains its issued request but never waits for a 429 draft r
     preview.resetState();
     await preview.onMessageUpdate({ message: { text: "Completed answer." } });
     t.mock.timers.tick(2000);
-    flush = preview.getState()?.flushPromise;
+    flush = preview.flush(7);
     await issued;
     final = preview.finalizeMarkdown(7, "Completed answer.", 21);
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -815,7 +841,7 @@ test("Telegram bridge API runtime coalesces identical actions and suppresses con
   assert.equal(calls, 1);
   releaseFirst(true);
   assert.deepEqual(await Promise.all([first, joined]), [true, true]);
-  assert.deepEqual(callOptions, [{ retryRateLimit: false }]);
+  assert.deepEqual(callOptions, [{ retryRateLimit: false, maxAttempts: 1, retrySafety: "non-idempotent" }]);
 
   nowMs = 2999;
   assert.equal(await runtime.call<boolean>("sendChatAction", body), true);
@@ -937,7 +963,7 @@ test("Telegram bridge API runtime shares retry-after suppression across one chat
   }
 });
 
-test("Telegram bridge API runtime preserves transient 5xx chat-action retries", async () => {
+for (const action of ["typing", "record_voice"] as const) test(`Chat-action retry policy preserves voice but never replays typing (${action})`, async () => {
   let calls = 0;
   const restoreFetch = setApiTestFetch(async () => {
     calls += 1;
@@ -954,14 +980,13 @@ test("Telegram bridge API runtime preserves transient 5xx chat-action retries", 
       recordRuntimeEvent: () => {},
     });
 
-    assert.equal(
-      await runtime.call<boolean>(
-        "sendChatAction",
-        { chat_id: 7, action: "typing" },
-        { retryBaseDelayMs: 0, sleep: async () => {} },
-      ),
-      true,
-    );
+    const attempt = () => runtime.call<boolean>("sendChatAction", { chat_id: 7, action },
+      { maxAttempts: 3, retrySafety: "safe", retryBaseDelayMs: 0, sleep: async () => {} });
+    if (action === "typing") {
+      await assert.rejects(attempt(), error => isTelegramApiCommitUnknownError(error));
+      assert.equal(calls, 1, "Even explicit caller retry options cannot grant replay of ephemeral typing");
+      assert.equal(await attempt(), true, "A fresh owner-controlled keepalive is an independent attempt");
+    } else assert.equal(await attempt(), true);
     assert.equal(calls, 2);
   } finally {
     restoreFetch();
@@ -1914,6 +1939,63 @@ test("Telegram file downloads reject files above configured limits", async () =>
   } finally {
     restoreFetch();
   }
+});
+
+for (const method of ["sendMessage", "sendRichMessage", "sendPhoto", "sendVoice", "sendMediaGroup", "copyMessage", "copyMessages", "forwardMessage", "forwardMessages", "sendMessageDraft", "sendRichMessageDraft", "sendChatAction"]) {
+  test(`Threaded Bot API refuses output to All before transport (${method})`, async () => {
+    let calls = 0, threaded = true;
+    const restoreFetch = setApiTestFetch(async () => { calls++; return createApiJsonResponse({ message_id: 1 }); });
+    const runtime = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", isThreadedMode: () => threaded, recordRuntimeEvent() {} });
+    try {
+      for (const message_thread_id of [undefined, 0, "0", "", true, -1]) await assert.rejects(
+        runtime.call(method, { chat_id: "0007", message_thread_id, text: "output", action: "typing" }), /All is input-only/);
+      assert.equal(calls, 0);
+      await runtime.call(method, { chat_id: 7, message_thread_id: 42, text: "temporary/bound Thread", action: "typing" });
+      await runtime.call(method, { chat_id: "@channel_name", text: "explicit channel" });
+      threaded = false;
+      await runtime.call(method, { chat_id: 7, text: "classic DM" });
+      assert.equal(calls, 3);
+    } finally { restoreFetch(); }
+  });
+}
+
+test("Threaded multipart refuses All before file access and fences mode change before upload", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-output-policy-")), path = join(dir, "voice.ogg");
+  let calls = 0, threaded = true;
+  const restoreFetch = setApiTestFetch(async () => { calls++; return createApiJsonResponse(true); });
+  const runtime = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", isThreadedMode: () => threaded, recordRuntimeEvent() {} });
+  try {
+    await assert.rejects(runtime.callMultipart("sendVoice", { chat_id: "7" }, "voice", join(dir, "missing"), "voice.ogg"), /All is input-only/);
+    await writeFile(path, "voice fixture");
+    threaded = false;
+    const pending = runtime.callMultipart("sendVoice", { chat_id: "7" }, "voice", path, "voice.ogg");
+    threaded = true;
+    await assert.rejects(pending, /authority/i); assert.equal(calls, 0);
+    await runtime.callMultipart("sendVoice", { chat_id: "7", message_thread_id: "42" }, "voice", path, "voice.ogg");
+    assert.equal(calls, 1);
+  } finally { restoreFetch(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Threaded policy preserves non-output operations and cannot be evaded by a reply anchor or caller guard", async () => {
+  let calls = 0;
+  const restoreFetch = setApiTestFetch(async () => { calls++; return createApiJsonResponse(true); });
+  const client = createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => true });
+  try {
+    await assert.rejects(client.call("sendMessage", { chat_id: 7, text: "All", reply_parameters: { message_id: 1, message_thread_id: 42 } }, { assertAuthority() {} }), /All is input-only/);
+    for (const method of ["deleteMessage", "answerCallbackQuery", "getMe", "createForumTopic", "deleteForumTopic"]) await client.call(method, { chat_id: 7 });
+    await client.call("sendMessage", { chat_id: 7, business_connection_id: "business", text: "separate namespace" });
+    assert.equal(calls, 6);
+  } finally { restoreFetch(); }
+});
+
+test("Threaded policy stops a classic output retry after mode changes", async () => {
+  let threaded = false, calls = 0;
+  const restoreFetch = setApiTestFetch(async () => { calls++; threaded = true; return createApiJsonResponse(true); });
+  const client = createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => threaded });
+  try {
+    await assert.rejects(client.call("sendMessage", { chat_id: 7, text: "classic" }, { maxAttempts: 3 }), /authority/i);
+    assert.equal(calls, 1);
+  } finally { restoreFetch(); }
 });
 
 test("Telegram streaming downloads remove partial files after limit failures", async () => {

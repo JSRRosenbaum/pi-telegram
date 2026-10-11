@@ -73,6 +73,13 @@ export function createTelegramCleanupTargetProtection(store, departingRecord) {
     // optional fields; neither changes the authority represented by a snapshot.
     const sameSnapshot = (left, right) => isDeepStrictEqual(JSON.parse(JSON.stringify(left)), JSON.parse(JSON.stringify(right)));
     return (target, action) => {
+        try {
+            if (store.listProtectedLiveRebindTargets?.().some(candidate => targetMatches(candidate, target)))
+                return true;
+        }
+        catch {
+            return true;
+        }
         // A source-bound temporary tab is removed only by its own Forward/Cancel, never by generic reconciliation.
         if (store.listTemporaryThreadTargets) {
             try {
@@ -1069,6 +1076,8 @@ function isWorkspaceLiveRebindIntent(value) {
             "recipient",
             "phase",
             "cleanup",
+            "inputRelease",
+            "oldTargetProtected",
         ]) ||
         value.kind !== "live-rebind" ||
         !isTelegramWorkspaceRestoreRequest(value.request) ||
@@ -1084,6 +1093,13 @@ function isWorkspaceLiveRebindIntent(value) {
         value.recipient.instanceId !== value.request.owner.instanceId ||
         value.recipient.kind !==
             (value.request.owner.owner?.kind === "leader" ? "leader" : "follower"))
+        return false;
+    if (value.inputRelease !== undefined &&
+        (!["held", "issued", "accepted"].includes(value.inputRelease) ||
+            (value.inputRelease !== "held" && !["released", "finished"].includes(value.phase))))
+        return false;
+    if (value.oldTargetProtected !== undefined &&
+        (value.oldTargetProtected !== true || value.inputRelease === undefined || value.phase !== "finished" || value.cleanup !== "not-issued"))
         return false;
     if (value.phase === "rebound")
         return value.cleanup === undefined;
@@ -1272,11 +1288,33 @@ function conflictsWithWorkspaceRestoreProvision(request, provision) {
             (targetMatches(provision.target, request.binding.target) ||
                 targetMatches(provision.target, request.target))));
 }
+/** Canonical issuance is distinct from cleanup completion, source disposition and peer dispatch readiness. */
+export function isTelegramLiveRebindInputAuthorized(value) {
+    return value.inputRelease === undefined
+        ? value.phase === "released" && value.cleanup === undefined
+        : ["issued", "accepted"].includes(value.inputRelease) &&
+            ["released", "finished"].includes(value.phase) && value.cleanup !== "issued";
+}
+function liveRebindInputPending(value) {
+    return value.inputRelease !== undefined && value.inputRelease !== "accepted";
+}
+function liveRebindActive(value) {
+    return value.phase !== "finished" || liveRebindInputPending(value);
+}
+function liveRebindOldTargetUnknown(value) {
+    return value.phase === "finished" && value.cleanup === "unknown" && value.inputRelease !== undefined;
+}
+function retainLiveRebind(value) {
+    return liveRebindActive(value) || liveRebindOldTargetUnknown(value) || value.oldTargetProtected === true;
+}
+function protectedLiveRebindOldTargets(snapshot) {
+    return (snapshot?.liveRebindings ?? []).filter(value => value.oldTargetProtected === true || liveRebindOldTargetUnknown(value) || value.inputRelease !== undefined && value.cleanup === "issued").map(value => ({ ...value.request.binding.target }));
+}
 function pendingWorkspaceRelocationRequests(snapshot) {
     return [
         ...(snapshot?.operations ?? []).map((value) => value.request),
         ...(snapshot?.liveRebindings ?? [])
-            .filter((value) => value.phase !== "finished")
+            .filter(liveRebindActive)
             .map((value) => value.request),
     ];
 }
@@ -1311,7 +1349,7 @@ function assertWorkspaceRestoreBindingProtection(file) {
         const owners = (file.threads ?? []).filter((value) => value.slot === current.slot ||
             targetMatches(value.target, request.binding.target) ||
             targetMatches(value.target, request.target));
-        const live = file.workspaceRestore?.liveRebindings?.some((value) => value.phase !== "finished" &&
+        const live = file.workspaceRestore?.liveRebindings?.some((value) => liveRebindActive(value) &&
             value.request.operationId === request.operationId);
         if (owners.length > 1 ||
             owners.some((value) => value.slot !== current.slot ||
@@ -1323,6 +1361,13 @@ function assertWorkspaceRestoreBindingProtection(file) {
                     !isDeepStrictEqual(owners[0]?.owner, request.owner.owner)))) {
             throw new Error("Protected Workspace Restore owner target changed.");
         }
+    }
+    for (const old of protectedLiveRebindOldTargets(file.workspaceRestore)) {
+        if (file.workspaceBindings?.some(value => targetMatches(value.target, old)) ||
+            file.threads?.some(value => targetMatches(value.target, old) && ["active", "starting", "pending", "probe-required"].includes(value.status)) ||
+            file.pendingProvisions?.some(value => !value.target || targetMatches(value.target, old)) ||
+            file.reservations?.some(value => targetMatches(value.target, old)))
+            throw new Error("Unknown live cleanup target remains protected.");
     }
     const operations = [
         ...(file.workspaceRestore?.operations ?? []),
@@ -1405,11 +1450,11 @@ function parseWorkspaceRestore(value) {
     if (liveOperations.some((operation, index) => liveOperations
         .slice(index + 1)
         .some((other) => operation.request.operationId === other.request.operationId ||
-        (operation.phase !== "finished" &&
-            other.phase !== "finished" &&
+        (liveRebindActive(operation) &&
+            liveRebindActive(other) &&
             workspaceRestoresConflict(operation.request, other.request))) ||
         snapshot.operations.some((other) => operation.request.operationId === other.request.operationId ||
-            (operation.phase !== "finished" &&
+            (liveRebindActive(operation) &&
                 workspaceRestoresConflict(operation.request, other.request)))))
         throw new Error("Conflicting Workspace live rebinding evidence.");
     const entries = snapshot.temporaryThreads ?? [];
@@ -1424,7 +1469,7 @@ function parseWorkspaceRestore(value) {
         entries.some((entry) => !!entry.target &&
             [
                 ...snapshot.operations,
-                ...liveOperations.filter((value) => value.phase !== "finished"),
+                ...liveOperations.filter(liveRebindActive),
             ].some(({ request }) => targetMatches(request.binding.target, entry.target) ||
                 (targetMatches(request.target, entry.target) &&
                     !isTemporaryThreadRestore(entry, [{ request }])))))
@@ -2461,7 +2506,7 @@ export function createTelegramTopicTargetStore(options) {
                         (transition.kind === "relocate"
                             ? !isDeepStrictEqual(transition.restore.operations.slice(0, -1), workspaceRestore?.operations ?? [])
                             : !isDeepStrictEqual(transition.restore.operations, workspaceRestore?.operations ?? []) ||
-                                !isDeepStrictEqual(transition.restore.liveRebindings?.slice(0, -1), (workspaceRestore?.liveRebindings ?? []).filter((value) => value.phase !== "finished"))))
+                                !isDeepStrictEqual(transition.restore.liveRebindings?.slice(0, -1), (workspaceRestore?.liveRebindings ?? []).filter(retainLiveRebind))))
                         return false;
                     file.workspaceRestore = structuredClone(transition.restore);
                     parseWorkspaceRestore(file.workspaceRestore);
@@ -2891,6 +2936,14 @@ export function createTelegramTopicTargetStore(options) {
                 !isDeepStrictEqual(parseTopicTargetFile(readStoreSnapshot(path, false)), file))
                 throw new Error("Workspace live-rebind observation changed.");
         },
+        hasPreDispatchRebindEvidence() {
+            const file = parseTopicTargetFile(readStoreSnapshot(getPath(), false) ?? { version: 1, records: [] });
+            return file.workspaceRestore?.liveRebindings?.some(value => value.inputRelease !== undefined) === true;
+        },
+        listProtectedLiveRebindTargets() {
+            const file = parseTopicTargetFile(readStoreSnapshot(getPath(), false) ?? { version: 1, records: [] });
+            return protectedLiveRebindOldTargets(file.workspaceRestore);
+        },
         isWorkspaceLiveRebindCleanupTargetProtected(input) {
             try {
                 const expected = structuredClone(input), path = getPath(), profile = activeProfile(), revision = mutationRevision;
@@ -2951,8 +3004,8 @@ export function createTelegramTopicTargetStore(options) {
                     targetMatches(other.request.target, old);
                 if (file.workspaceRestore.operations.some(touchesOld) ||
                     file.workspaceRestore.liveRebindings?.some((other) => other.request.operationId !== request.operationId &&
-                        other.phase !== "finished" &&
-                        touchesOld(other)))
+                        (liveRebindActive(other) && touchesOld(other) ||
+                            (liveRebindOldTargetUnknown(other) || other.oldTargetProtected) && targetMatches(other.request.binding.target, old))))
                     return true;
                 for (const claim of workspaceClaims.values()) {
                     const bindings = canonical.filter((binding) => binding.bindingKey === claim.identity.bindingKey);
@@ -3113,12 +3166,14 @@ export function createTelegramTopicTargetStore(options) {
                                 intent.routing !== undefined))
                         return false;
                     const state = read().state;
+                    if (protectedLiveRebindOldTargets(state).some(old => targetMatches(old, intent.request.binding.target) || targetMatches(old, intent.request.target)))
+                        return false;
                     if (pendingWorkspaceRelocationRequests(state).some((request) => workspaceRestoresConflict(request, intent.request)) ||
                         state.liveRebindings?.some((value) => value.request.operationId === intent.request.operationId))
                         return false;
                     if (state.revision === Number.MAX_SAFE_INTEGER)
                         throw new Error("Workspace Restore revision exhausted.");
-                    const pendingLive = (state.liveRebindings ?? []).filter((value) => value.phase !== "finished");
+                    const pendingLive = (state.liveRebindings ?? []).filter(retainLiveRebind);
                     if ((live ? pendingLive.length : state.operations.length) >= 26)
                         throw new Error("Workspace Restore operation capacity reached.");
                     const restore = {
@@ -3352,7 +3407,7 @@ export function createTelegramTopicTargetStore(options) {
             return {
                 list: () => structuredClone(storage.read().operations),
                 listLiveRebindings: () => structuredClone(storage.read().liveRebindings ?? []),
-                async commitLiveRebind(requestInput, recipientInput, authority) {
+                async commitLiveRebind(requestInput, recipientInput, authority, options) {
                     const request = structuredClone(requestInput), recipient = structuredClone(recipientInput);
                     const executor = structuredClone(authority.executor), operatorUserId = authority.operatorUserId;
                     const current = () => currentScope() &&
@@ -3370,6 +3425,7 @@ export function createTelegramTopicTargetStore(options) {
                         createdAtMs: at,
                         updatedAtMs: at,
                         phase: "rebound",
+                        ...(options?.holdInput ? { inputRelease: "held" } : {}),
                     };
                     if (!current() || !isWorkspaceLiveRebindIntent(intent))
                         return undefined;
@@ -3383,7 +3439,8 @@ export function createTelegramTopicTargetStore(options) {
                             isDeepStrictEqual(value.request, request) &&
                             isDeepStrictEqual(value.recipient, recipient) &&
                             isDeepStrictEqual(value.executor, executor) &&
-                            value.operatorUserId === operatorUserId
+                            value.operatorUserId === operatorUserId &&
+                            (value.inputRelease !== undefined) === (options?.holdInput === true)
                             ? structuredClone(value)
                             : undefined;
                     };
@@ -3411,14 +3468,24 @@ export function createTelegramTopicTargetStore(options) {
                         if (!entry ||
                             !isDeepStrictEqual(entry, expected) ||
                             entry.operatorUserId !== operator ||
-                            entry.phase === "finished")
+                            (entry.phase === "finished" && step !== "issue-input" && step !== "accept-input"))
                             return undefined;
-                        const issuing = step === "release" || step === "issue-cleanup";
+                        const issuing = step === "release" || step === "issue-cleanup" || step === "issue-input" || step === "accept-input" || step === "protect-old-target";
                         if ((issuing || step === "confirmed") &&
                             !isDeepStrictEqual(entry.executor, executor))
                             return undefined;
                         let next;
-                        if (step === "release") {
+                        if (step === "issue-input" || step === "accept-input") {
+                            if (!["released", "finished"].includes(entry.phase) || entry.cleanup === "issued" || entry.inputRelease !== (step === "issue-input" ? "held" : "issued"))
+                                return undefined;
+                            next = { ...entry, inputRelease: step === "issue-input" ? "issued" : "accepted" };
+                        }
+                        else if (step === "protect-old-target") {
+                            if (entry.phase !== "released" || entry.cleanup !== undefined || entry.inputRelease !== "held")
+                                return undefined;
+                            next = { ...entry, phase: "finished", cleanup: "not-issued", oldTargetProtected: true };
+                        }
+                        else if (step === "release") {
                             if (entry.phase !== "rebound")
                                 return undefined;
                             next = { ...entry, phase: "released" };
@@ -3673,8 +3740,18 @@ export function createTelegramTopicTargetStore(options) {
                     });
                 },
                 listTemporaryThreads: () => structuredClone(storage.read().temporaryThreads ?? []),
-                reserveTemporaryThread(sourceInput, token, authority) {
+                reserveTemporaryThread(sourceInput, token, authority, groupInput) {
                     const source = structuredClone(sourceInput);
+                    const group = groupInput
+                        ? structuredClone(groupInput)
+                        : {
+                            journalBindingKey: source.journalBindingKey,
+                            updateIds: [source.updateId],
+                        };
+                    if (!isTemporaryThreadInput(group) ||
+                        group.journalBindingKey !== source.journalBindingKey ||
+                        Math.min(...group.updateIds) !== source.updateId)
+                        return undefined;
                     let reserved = false;
                     const entry = mutate(authority, (file, executor, operator) => {
                         const entries = file.temporaryThreads ?? [];
@@ -3690,12 +3767,7 @@ export function createTelegramTopicTargetStore(options) {
                             throw new Error("Invalid Workspace Restore clock.");
                         const next = {
                             source,
-                            inputs: [
-                                {
-                                    journalBindingKey: source.journalBindingKey,
-                                    updateIds: [source.updateId],
-                                },
-                            ],
+                            inputs: [group],
                             operatorUserId: operator,
                             executor,
                             token,
@@ -3708,7 +3780,7 @@ export function createTelegramTopicTargetStore(options) {
                         if (!isTemporaryThreadEntry(next) ||
                             entries.some((value) => value.token === token ||
                                 getTelegramTemporaryThreadInputs(value).some((input) => input.journalBindingKey === source.journalBindingKey &&
-                                    input.updateIds.includes(source.updateId))))
+                                    input.updateIds.some((id) => group.updateIds.includes(id)))))
                             return undefined;
                         if (entries.length >= TEMPORARY_THREAD_CAPACITY)
                             throw new Error("Temporary Thread capacity reached.");
@@ -4075,7 +4147,8 @@ export function createTelegramTopicTargetStore(options) {
         },
         reserveThread(reservation) {
             if (pendingWorkspaceRelocationRequests(workspaceRestore).some((request) => conflictsWithWorkspaceRestoreProvision(request, reservation)) ||
-                conflictsWithTemporaryThread(workspaceRestore, reservation.target)) {
+                conflictsWithTemporaryThread(workspaceRestore, reservation.target) ||
+                protectedLiveRebindOldTargets(workspaceRestore).some(old => targetMatches(old, reservation.target))) {
                 throw new Error("Protected Workspace Restore provisioning conflict.");
             }
             const next = { ...reservation };
@@ -4086,7 +4159,8 @@ export function createTelegramTopicTargetStore(options) {
         },
         upsertPendingProvision(provision) {
             if (pendingWorkspaceRelocationRequests(workspaceRestore).some((request) => conflictsWithWorkspaceRestoreProvision(request, provision)) ||
-                conflictsWithTemporaryThread(workspaceRestore, provision.target)) {
+                conflictsWithTemporaryThread(workspaceRestore, provision.target) ||
+                protectedLiveRebindOldTargets(workspaceRestore).some(old => !provision.target || targetMatches(old, provision.target))) {
                 throw new Error("Protected Workspace Restore provisioning conflict.");
             }
             const next = {
@@ -4937,7 +5011,7 @@ export function createTelegramTopicTargetStore(options) {
             const next = normalizeWorkspaceBindingRecord(binding);
             if (next && hasWorkspaceRetirementConflict(next))
                 return undefined;
-            if (!next)
+            if (!next || protectedLiveRebindOldTargets(workspaceRestore).some(old => targetMatches(old, next.target)))
                 return undefined;
             const nextMapKey = getWorkspaceBindingMapKey(next);
             let claim = workspaceClaims.get(nextMapKey);
@@ -4994,16 +5068,19 @@ export function createTelegramTopicTargetStore(options) {
             if (previous?.manualThreadName && !next.manualThreadName) {
                 next.manualThreadName = previous.manualThreadName;
             }
-            if (previous) {
+            if (previous || replacedTargetBinding) {
                 const journalBindingKeys = Array.from(new Set([
-                    ...(previous.journalBindingKeys ?? []),
+                    ...(previous?.journalBindingKeys ?? []),
+                    ...(replacedTargetBinding?.journalBindingKeys ?? []),
                     ...(next.journalBindingKeys ?? []),
                 ]));
-                if (journalBindingKeys.length || previous.journalBindingsComplete)
+                const retainedComplete = (!previous || previous.journalBindingsComplete === true) &&
+                    (!replacedTargetBinding || replacedTargetBinding.journalBindingsComplete === true);
+                if (journalBindingKeys.length || retainedComplete)
                     next.journalBindingKeys = journalBindingKeys;
                 else
                     delete next.journalBindingKeys;
-                if (previous.journalBindingsComplete)
+                if (retainedComplete)
                     next.journalBindingsComplete = true;
                 else
                     delete next.journalBindingsComplete;

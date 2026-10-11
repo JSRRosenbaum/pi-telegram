@@ -5,6 +5,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { withoutTelegramTurnReplyAnchor } from "./turns.js";
 import { createTelegramUserPairingRuntime, getTelegramAuthorizationState, } from "./config.js";
 import { TELEGRAM_UPDATE_JOURNAL_CUSTODY_VERSION, TELEGRAM_UPDATE_JOURNAL_EXCLUSION_VERSION, TELEGRAM_UPDATE_JOURNAL_FAILURE_CLASS_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_FAILURE_SUMMARY_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_QUEUE_OWNER_ID_MAX_LENGTH, TELEGRAM_UPDATE_JOURNAL_VERSION, areTelegramUpdateJournalQueueOwnersEqual, createTelegramUpdateJournalEntryDigest, doesTelegramJournalUpdateNameThread, isTelegramJournalLoneCallbackUpdate, getTelegramUpdateJournalBindingPath, isTelegramUpdateJournalLegacyFamilyVersion, isTelegramUpdateJournalQueueOwnerProcess, parseTelegramUpdateJournalQueueOwner, } from "./journal.js";
 import { isPiStaleContextError } from "./pi.js";
@@ -262,19 +263,26 @@ export function prepareTelegramLiveDeferredInput(values, isCurrent) {
         carriers.some((value) => getTelegramUpdateExecutionFence(value)?.signal !== execution.signal ||
             getTelegramUpdateExecutionFence(value)?.isCurrent() !== true))
         return undefined;
-    const unsettled = () => carriers.every((value) => getTelegramUpdateAdmissionBinding(value)?.isSourceUnsettled?.() ===
-        true);
+    const bindings = carriers.map(getTelegramUpdateAdmissionBinding);
+    const acknowledgers = bindings.map(binding => binding?.acknowledgeTransferred);
+    const bindingsCurrent = () => carriers.every((value, index) => getTelegramUpdateAdmissionBinding(value) === bindings[index] && bindings[index]?.acknowledgeTransferred === acknowledgers[index]);
+    const unsettled = () => bindingsCurrent() && bindings.every(binding => binding?.isSourceUnsettled?.() === true);
     if (!unsettled())
         return undefined;
-    const prepared = getTelegramUpdateAdmissionBinding(first)?.prepareLiveInput?.(ids, () => isCurrent() &&
-        carriers.every((value) => getTelegramUpdateExecutionFence(value)?.isCurrent() === true));
+    let transferred = false;
+    const prepared = getTelegramUpdateAdmissionBinding(first)?.prepareLiveInput?.(ids, () => bindingsCurrent() && isCurrent() &&
+        carriers.every((value) => getTelegramUpdateExecutionFence(value)?.isCurrent() === true), () => {
+        transferred = true;
+        for (let index = 0; index < bindings.length; index++)
+            acknowledgers[index]?.call(bindings[index]);
+    });
     return (prepared && {
         ...prepared,
         isCurrent: () => unsettled() && prepared.isCurrent(),
         confirmSaved: () => unsettled() && prepared.confirmSaved(),
         beginRelease: (canRelease) => unsettled() && prepared.beginRelease(() => unsettled() && canRelease()),
         settleTransferred: (canSettle) => unsettled()
-            ? prepared.settleTransferred(() => unsettled() && canSettle())
+            ? prepared.settleTransferred(() => (transferred || unsettled()) && canSettle())
             : "protected",
         cancel: () => unsettled() && prepared.cancel(),
     });
@@ -1714,7 +1722,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
         transition("blocked", currentUpdateId, "authority-lost");
         return "blocked";
     };
-    const executeWithinOwner = async (expectedOwner, update, preparedExecute) => {
+    const executeWithinOwner = async (expectedOwner, update, preparedExecute, target) => {
         if (expectedOwner.controller.signal.aborted) {
             return TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED;
         }
@@ -1723,7 +1731,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             ? preparedExecute(update, expectedOwner.ctx, expectedOwner.controller.signal)
             : deps.executeCustodiedUpdate
                 ? deps.executeCustodiedUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal)
-                : deps.executeUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal));
+                : deps.executeUpdate(update, expectedOwner.ctx, expectedOwner.controller.signal, target));
         const settlement = execution.then((outcome) => custodied
             ? {
                 ok: true,
@@ -2434,7 +2442,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                             throw new Error("Prepared status admission is unconfirmed.");
                         return admitted.outcome;
                     }
-                    : undefined);
+                    : undefined, prepared?.target);
                 if (execution === TELEGRAM_UPDATE_WORKER_EXECUTION_ABORTED) {
                     return "aborted";
                 }
@@ -2489,6 +2497,12 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     }
                     snapshotInvalidated = true;
                     break;
+                }
+                if (prepared?.target) {
+                    prepared.ids = new Set([...prepared.ids].filter(id => id !== entry.updateId));
+                    if (!prepared.ids.size && livePreparation === prepared)
+                        livePreparation = undefined;
+                    updateClaimCounts();
                 }
                 const postExecutionAuthority = checkAuthority(expectedOwner, entry.updateId);
                 if (postExecutionAuthority)
@@ -2856,7 +2870,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
             launchDrain();
         },
         prepareDeferredLiveInput(input) {
-            const expectedOwner = owner, binding = deps.getJournalBindingKey?.(), ids = [...input.sourceUpdateIds];
+            const expectedOwner = owner, binding = deps.getJournalBindingKey?.(), onTransferred = input.onTransferred, ids = [...input.sourceUpdateIds];
             const sources = ids.map((id) => deferredSources.get(id));
             const ownerCurrent = () => !!expectedOwner &&
                 owner === expectedOwner &&
@@ -2867,7 +2881,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 deps.hasAuthority(expectedOwner.ctx) &&
                 deps.isContextCurrent?.(expectedOwner.ctx) !== false &&
                 isQueueOwnerIdentityCurrent(expectedOwner) &&
-                input.isCurrent();
+                input.onTransferred === onTransferred && input.isCurrent();
             const sourcesCurrent = () => ownerCurrent() &&
                 sources.every((source, index) => !!source &&
                     deferredSources.get(ids[index]) === source &&
@@ -2946,10 +2960,11 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     held.discardIssued = true;
                     try {
                         const result = completeExact(ids, expected, undefined, () => current() && canSettle());
-                        if (!current() ||
-                            !canSettle() ||
-                            result.removedUpdateIds.length !== ids.length ||
-                            !ids.every((id) => result.removedUpdateIds.includes(id)))
+                        if (result.removedUpdateIds.length !== ids.length || !ids.every(id => result.removedUpdateIds.includes(id)))
+                            return "unknown";
+                        // A consumed routing clock is expected only after this exact ACK, never after uncertain removal.
+                        onTransferred?.call(input);
+                        if (!current() || !canSettle())
                             return "unknown";
                     }
                     catch (error) {
@@ -3063,7 +3078,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                 }
             };
             const finish = () => {
-                if (!held.released || !held.status)
+                if (!held.released || !held.status && !held.target)
                     livePreparation = undefined;
                 updateClaimCounts();
                 notifyStateChange();
@@ -3180,7 +3195,7 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                     };
                     return held.status.current();
                 },
-                release(canRelease) {
+                release(canRelease, target) {
                     if (!current() ||
                         held.discardIssued ||
                         !held.saved ||
@@ -3193,6 +3208,16 @@ export function createTelegramUpdateWorkerRuntime(deps) {
                         !canRelease() ||
                         !current())
                         return false;
+                    if (target) {
+                        if (!Number.isSafeInteger(target.chatId) || target.chatId === 0 || !Number.isSafeInteger(target.threadId) || target.threadId <= 0 ||
+                            entries.some(entry => {
+                                const message = (entry.update.message ?? entry.update.edited_message);
+                                return message?.chat?.id !== target.chatId;
+                            }))
+                            return false;
+                        if (!held.status)
+                            held.target = { ...target };
+                    }
                     released = true;
                     held.released = true;
                     finish();
@@ -5257,7 +5282,8 @@ function createTelegramUpdateSourceAdmissionHandle(deps, capture) {
                     signal,
                 })
                 : undefined,
-            prepareLiveInput: (sourceUpdateIds, isCurrent) => execution.isCurrent() &&
+            acknowledgeTransferred: () => { settlementReported = true; },
+            prepareLiveInput: (sourceUpdateIds, isCurrent, onTransferred) => execution.isCurrent() &&
                 !immediate &&
                 !settlementReported &&
                 !suspended
@@ -5266,6 +5292,7 @@ function createTelegramUpdateSourceAdmissionHandle(deps, capture) {
                     sourceUpdateIds,
                     signal,
                     isCurrent: () => execution.isCurrent() && isCurrent(),
+                    onTransferred,
                 })
                 : undefined,
             isHistorical: (matchesOriginal) => !signal.aborted &&
@@ -6299,10 +6326,18 @@ export function createTelegramUpdateAdmissionWorkerRuntime(deps) {
                     update, ctx, signal),
             }
             : {}),
-        async executeUpdate(update, ctx, signal) {
+        async executeUpdate(update, ctx, signal, target) {
             const typedUpdate = update;
+            const prepared = deps.prepareUpdateForExecution?.(typedUpdate) ?? typedUpdate;
+            // Journal/source evidence remains the original; only the warm released handler projection changes destination.
+            const routed = target ? { ...prepared,
+                ...(prepared.message ? { message: prepared.message.message_thread_id === target.threadId ? { ...prepared.message }
+                        : withoutTelegramTurnReplyAnchor({ ...prepared.message, message_thread_id: target.threadId, reply_to_message: undefined }) } : {}),
+                ...(prepared.edited_message ? { edited_message: prepared.edited_message.message_thread_id === target.threadId ? { ...prepared.edited_message }
+                        : withoutTelegramTurnReplyAnchor({ ...prepared.edited_message, message_thread_id: target.threadId, reply_to_message: undefined }) } : {}),
+            } : prepared;
             try {
-                return await executeUpdate(deps.prepareUpdateForExecution?.(typedUpdate) ?? typedUpdate, ctx, signal);
+                return await executeUpdate(routed, ctx, signal);
             }
             catch (error) {
                 if (await deps.settleTerminalExecutionFailure?.(error)) {
