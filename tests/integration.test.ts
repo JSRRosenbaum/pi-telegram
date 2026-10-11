@@ -1142,7 +1142,7 @@ for (const scenario of [
       },
     });
     let requests = 0;
-    const attempts: Bus.TelegramBusForwardOwnership[] = [];
+    const ownershipChecks: Bus.TelegramBusForwardOwnership[] = [];
     const rejectedDeliveryIds: string[] = [];
     const validate = Bus.createTelegramBusForwardOwnershipValidator(registry);
     const forwarder = Bus.createTelegramBusForeignOwnedUpdateForwarder<
@@ -1154,7 +1154,7 @@ for (const scenario of [
         if (typeof details?.deliveryId === "string") rejectedDeliveryIds.push(details.deliveryId);
       },
       validateForwardOwnership(snapshot) {
-        attempts.push(snapshot);
+        ownershipChecks.push(snapshot);
         return validate(snapshot);
       },
     });
@@ -1212,10 +1212,11 @@ for (const scenario of [
       }
       await worker.waitForDrain();
       assert.deepEqual(leaderJournal.read().entries, []);
-      assert.equal(attempts.length, 3);
-      assert.deepEqual(attempts.map((attempt) => attempt.ownerGeneration),
-        scenario.replace ? ["g1", "g2", "g2"] : ["g1", "g1", "g1"]);
-      assert.equal(attempts.every((attempt) =>
+      assert.equal(requests, 3, "Three semantic forwarding attempts retain the existing durable retry contract");
+      assert.equal(ownershipChecks.length, 15, "Each attempt validates ownership before send, connect, encoding/write and ACK");
+      assert.deepEqual(ownershipChecks.map((snapshot) => snapshot.ownerGeneration),
+        (scenario.replace ? ["g1", "g2", "g2"] : ["g1", "g1", "g1"]).flatMap(generation => Array(5).fill(generation)));
+      assert.equal(ownershipChecks.every((attempt) =>
         JSON.stringify(attempt.protocolIdentity) === JSON.stringify(registration.protocol)), true);
       const admitted = followerJournal.read().entries;
       assert.deepEqual(admitted.map((entry) => entry.updateId), [source.update_id]);

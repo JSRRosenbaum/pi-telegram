@@ -388,6 +388,7 @@ export declare function createTelegramBusFollowerClientRuntime<TContext, TReacti
             message: TMessage;
             ownership: TelegramBusForwardOwnership;
             ctx: TContext;
+            assertAuthority?: () => void;
         }) => Promise<import("./bus.ts").TelegramBusForeignUpdateSettlement>;
         forwardEditedMessage: (input: {
             message: TMessage;

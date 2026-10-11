@@ -1558,7 +1558,7 @@ export interface TelegramInboundRouteRuntimeDeps<
     requiredJournalBindingKeys: readonly string[],
     ownInputs?: readonly Threads.TelegramTemporaryThreadInput[],
   ) => readonly number[] | undefined;
-  /** Quiet period after the last cancelled input before one cleanup attempt; defaults to 1000 ms. */
+  /** Quiet period after the last cancelled input before one cleanup attempt; defaults to 0 ms. */
   temporaryThreadCleanupDelayMs?: number;
   /** Live-rebind cleanup attempt pacing; the bounded window ends in `not-issued`, never a time-based deletion. */
   liveRebindCleanupSchedule?: {
@@ -1943,10 +1943,21 @@ export function createTelegramInboundRouteRuntime<
     temporaryThread?: Threads.TelegramTemporaryThreadEntry;
     /** Source copies left in All (a menu-picked command); deleted once, when the input is consumed. */
     allTabCopies?: number[];
-    /** The tab holds a forwarded copy of the threadless original, which then left All at once. */
-    allTabCopiesForwarded?: true;
+    /** This live opening attempt did not remove its All originals; replay/revival cannot reconstruct that fact. */
+    allTabSourceRetained?: true;
+    /** Complete warm copy identity; journal originals stay unchanged even after their All messages leave. */
+    allTabCopiesForwarded?: {
+      target: { chatId: number; threadId: number };
+      sourceMessageIds: readonly number[];
+      messageIds: readonly number[];
+    };
     /** Acknowledged same-tab membership stays protective when its reader disappears; never a dispatch/cleanup grant. */
     temporaryMembership?: true;
+    /** Confirmed display copies only; the durable Forward fact remains the native one-shot authority. */
+    rerouteCopies?: {
+      target: { chatId: number; threadId: number };
+      bySourceUpdateId: ReadonlyMap<number, number>;
+    };
     /** Re-entrancy lock for one command route in flight; orthogonal to `phase`. */
     dispatching?: boolean;
     abandonment?: {
@@ -2415,15 +2426,22 @@ export function createTelegramInboundRouteRuntime<
   const cloneTelegramMessagesForThread = (
     messages: TMessage[],
     threadId: number,
+    copies?: ReadonlyMap<number, number>,
   ): TMessage[] => {
-    return messages.map((message) =>
-      Updates.carryTelegramUpdateExecutionFence(message, {
+    return messages.map((message) => {
+      const ids = Updates.collectTelegramAdmissionSourceUpdateIds([message]);
+      const copyId = copies && ids.length === 1 ? copies.get(ids[0]!) : undefined;
+      if (copies && (!Number.isSafeInteger(copyId) || copyId! <= 0))
+        throw new Error("Reroute destination copy identity is unavailable.");
+      const routed = {
         ...message,
-        message_id: 0,
+        message_id: copyId ?? 0,
         message_thread_id: threadId,
         reply_to_message: undefined,
-      } as TMessage),
-    );
+      } as TMessage;
+      return Updates.carryTelegramUpdateExecutionFence(message,
+        copies ? Turns.withTelegramTurnReplyAnchor(routed) : routed);
+    });
   };
   /** Whether a chooser is still pending in this Thread, ignoring the ones the caller itself owns. */
   const hasPendingRerouteForTarget = (
@@ -2819,9 +2837,11 @@ export function createTelegramInboundRouteRuntime<
   const deleteAllTabMessages = async (
     chatId: number,
     messageIds: readonly number[],
+    isCurrent?: () => boolean,
   ): Promise<void> => {
     if (!deps.deleteMessage) return;
     for (const messageId of messageIds) {
+      if (isCurrent?.() === false) return;
       try {
         await deps.deleteMessage(chatId, messageId);
       } catch (error) {
@@ -2834,10 +2854,14 @@ export function createTelegramInboundRouteRuntime<
     }
   };
   /** One-shot per chooser: the copies are taken before deletion, so a later consuming path finds none. */
-  const deleteAllTabCopies = (pending: PendingUnboundReroute): Promise<void> =>
+  const deleteAllTabCopies = (
+    pending: PendingUnboundReroute,
+    isCurrent?: () => boolean,
+  ): Promise<void> =>
     deleteAllTabMessages(
       pending.sourceTarget.chatId,
       pending.allTabCopies?.splice(0) ?? [],
+      isCurrent,
     );
   /**
    * Restore keeps the tab as the Thread, so the input must stay visible there: the All original goes only when the tab
@@ -2846,7 +2870,11 @@ export function createTelegramInboundRouteRuntime<
   const releaseAllTabCopiesIntoSurvivingTab = (
     pending: PendingUnboundReroute,
   ): Promise<void> => {
-    if (pending.allTabCopiesForwarded) return deleteAllTabCopies(pending);
+    if (
+      pending.allTabCopiesForwarded &&
+      isDeepStrictEqual(pending.allTabCopiesForwarded.target, pending.sourceTarget)
+    )
+      return deleteAllTabCopies(pending);
     pending.allTabCopies?.splice(0);
     return Promise.resolve();
   };
@@ -2862,26 +2890,38 @@ export function createTelegramInboundRouteRuntime<
   ): Promise<number | undefined> => {
     const messageIds = [...(pending.allTabCopies ?? [])].sort((a, b) => a - b);
     if (messageIds.length === 0 || !deps.callApi || !isCurrent()) return;
+    const copyTarget = { ...target };
     const route = {
-      chat_id: target.chatId,
-      message_thread_id: target.threadId,
+      chat_id: copyTarget.chatId,
+      message_thread_id: copyTarget.threadId,
       from_chat_id: pending.sourceTarget.chatId,
       disable_notification: true,
+    };
+    const options = {
+      maxAttempts: 1,
+      retrySafety: "non-idempotent" as const,
+      assertAuthority() {
+        if (!isCurrent())
+          throw new Error("Temporary Thread source forwarding authority changed.");
+      },
     };
     try {
       // An album moves as one album; forwardMessages skips what it cannot forward, so a short reply is not a move.
       const copies =
         messageIds.length === 1
           ? [
-              await deps.callApi<{ message_id?: unknown }>("forwardMessage", {
-                ...route,
-                message_id: messageIds[0],
-              }),
+              await deps.callApi<{ message_id?: unknown }>(
+                "forwardMessage",
+                { ...route, message_id: messageIds[0] },
+                options,
+              ),
             ]
           : await deps.callApi<Array<{ message_id?: unknown }>>(
               "forwardMessages",
               { ...route, message_ids: messageIds },
+              options,
             );
+      if (!isCurrent()) return;
       const copyIds = Array.isArray(copies)
         ? copies.map((copy) => copy?.message_id)
         : [];
@@ -2889,19 +2929,87 @@ export function createTelegramInboundRouteRuntime<
         copyIds.length !== messageIds.length ||
         !copyIds.every(
           (id): id is number =>
-            typeof id === "number" && Number.isSafeInteger(id),
-        )
+            typeof id === "number" && Number.isSafeInteger(id) && id > 0,
+        ) ||
+        new Set(copyIds).size !== copyIds.length
       )
         return;
-      pending.allTabCopiesForwarded = true;
-      await deleteAllTabCopies(pending);
-      return copyIds[0];
+      pending.allTabCopiesForwarded = {
+        target: copyTarget,
+        sourceMessageIds: messageIds,
+        messageIds: copyIds,
+      };
+      await deleteAllTabCopies(pending, isCurrent);
+      if (!isCurrent()) return;
+      return pending.allTabCopiesForwarded.messageIds[0];
     } catch (error) {
-      deps.recordRuntimeEvent?.("routing", error, {
-        phase: "temporary-thread-source-forward",
-      });
+      if (isCurrent())
+        deps.recordRuntimeEvent?.("routing", error, {
+          phase: "temporary-thread-source-forward",
+        });
       return;
     }
+  };
+  /** Read original source addresses, not warm target rewrites; unknown copy provenance never grants a Reroute. */
+  const resolvePendingRerouteForwardSource = (
+    pending: PendingUnboundReroute,
+  ): { chatId: number; sourceUpdateIds: number[]; sourceMessageIds: number[]; messageIds: number[] } | undefined => {
+    try {
+      const originals = pending.messages.map((message) => {
+        const snapshot = Updates.inspectTelegramDeferredSourceSnapshot(message);
+        const ids = Updates.collectTelegramAdmissionSourceUpdateIds([message]);
+        const original = snapshot?.update.message as TMessage | undefined;
+        if (
+          !snapshot ||
+          ids.length !== 1 ||
+          snapshot.source.updateId !== ids[0] ||
+          snapshot.update.update_id !== ids[0] ||
+          Object.keys(snapshot.update).some((key) => key !== "update_id" && key !== "message") ||
+          snapshot.source.journalBindingKey !== deps.getAdmissionJournalBinding?.() ||
+          !original ||
+          original.chat?.type !== "private" ||
+          original.chat.id !== pending.sourceTarget.chatId ||
+          original.from?.id !== deps.configStore.getAllowedUserId() ||
+          original.from?.is_bot !== false ||
+          !Number.isSafeInteger(original.message_id) ||
+          original.message_id <= 0
+        )
+          return undefined;
+        return { message: original, updateId: ids[0]! };
+      });
+      if (originals.length === 0 || originals.some((source) => !source)) return;
+      originals.sort((a, b) => a!.message.message_id - b!.message.message_id);
+      const sourceMessageIds = originals.map((source) => source!.message.message_id);
+      const sourceUpdateIds = originals.map((source) => source!.updateId);
+      if (
+        new Set(sourceMessageIds).size !== sourceMessageIds.length ||
+        new Set(sourceUpdateIds).size !== sourceUpdateIds.length
+      )
+        return;
+      const copied = pending.allTabCopiesForwarded;
+      if (copied) {
+        if (
+          !isDeepStrictEqual(copied.target, pending.sourceTarget) ||
+          !isDeepStrictEqual(copied.sourceMessageIds, sourceMessageIds) ||
+          copied.messageIds.length !== sourceMessageIds.length ||
+          !copied.messageIds.every((id) => Number.isSafeInteger(id) && id > 0) ||
+          new Set(copied.messageIds).size !== copied.messageIds.length
+        )
+          return;
+        return { chatId: copied.target.chatId, sourceUpdateIds, sourceMessageIds, messageIds: [...copied.messageIds] };
+      }
+      const nativeOriginals = originals.every((source) =>
+        typeof pending.sourceTarget.threadId === "number" &&
+        source!.message.message_thread_id === pending.sourceTarget.threadId);
+      const retainedAllOriginals = pending.allTabSourceRetained === true &&
+        originals.every((source) => source!.message.message_thread_id === undefined) &&
+        isDeepStrictEqual([...(pending.allTabCopies ?? [])].sort((a, b) => a - b), sourceMessageIds);
+      if (nativeOriginals || retainedAllOriginals)
+        return { chatId: pending.sourceTarget.chatId, sourceUpdateIds, sourceMessageIds, messageIds: [...sourceMessageIds] };
+    } catch (error) {
+      deps.recordRuntimeEvent?.("routing", error, { phase: "reroute-source-proof" });
+    }
+    return undefined;
   };
   const dismissRerouteChooserMessage = async (
     query: TCallbackQuery,
@@ -6172,7 +6280,21 @@ export function createTelegramInboundRouteRuntime<
     for (const wake of [...liveRebindCleanupWakers.values()]) wake(reason);
   };
   const onSessionSettled = (ctx: TContext): void => wakeLiveRebindCleanup(ctx, "session-settled");
-  const onDeliverySettled = (ctx: TContext): void => wakeLiveRebindCleanup(ctx, "delivery-drained");
+  const onDeliverySettled = (ctx: TContext): void => {
+    wakeLiveRebindCleanup(ctx, "delivery-drained");
+    const cap = captureTemporaryThreadAuthority(ctx);
+    if (!cap?.isCurrent()) return;
+    try {
+      for (const entry of cap.store.listTemporaryThreads()) {
+        if (!cap.isCurrent()) return;
+        if (entry.phase === "created" && entry.target && !entry.cleanupIssued &&
+          Threads.isTelegramTemporaryThreadFullyResolved(entry))
+          scheduleTemporaryThreadCleanup(entry.target, ctx);
+      }
+    } catch (error) {
+      deps.recordRuntimeEvent?.("routing", error, { phase: "temporary-thread-cleanup-drain" });
+    }
+  };
   const restoreWorkspace = deps.workspaceRestoreRecipient
     ? async (input: {
         operationId: string;
@@ -6802,6 +6924,97 @@ export function createTelegramInboundRouteRuntime<
       return false;
     }
   };
+  /** Publish display copies under the native one-shot grant; positive output is not input/source settlement. */
+  const publishPendingRerouteCopies = async (
+    pending: PendingUnboundReroute,
+    record: Threads.TelegramTopicTargetRecord,
+    ctx: TContext,
+    assertExecutionCurrent: () => void,
+    foreign: boolean,
+  ): Promise<(() => void) | undefined> => {
+    const source = resolvePendingRerouteForwardSource(pending);
+    const target = { ...record.target };
+    const recordIdentity = (value: Threads.TelegramTopicTargetRecord | undefined) => value && ({
+      target: value.target, profileKey: value.profileKey, owner: value.owner,
+      instanceId: value.instanceId, slot: value.slot, createdAtMs: value.createdAtMs,
+    });
+    const bindingIdentity = () => deps.threadStore!.listWorkspaceBindings()
+      .filter((value) => isDeepStrictEqual(value.target, target))
+      .map((value) => ({ bindingKey: value.bindingKey, sessionId: value.sessionId, sessionKey: value.sessionKey,
+        cwd: value.cwd, workspaceKey: value.workspaceKey, instanceSlot: value.instanceSlot, slot: value.slot,
+        target: value.target }));
+    const expectedRecord = structuredClone(recordIdentity(record));
+    const expectedBindings = structuredClone(bindingIdentity());
+    const ownership = deps.getTargetOwnership?.(target);
+    if (
+      !source || !deps.callApi || expectedBindings.length > 1 ||
+      (foreign && (!ownership || ownership.instanceId !== record.instanceId ||
+        !ownership.ownerGeneration || !ownership.recipientBindingKey))
+    )
+      return;
+    const expectedOwnership = ownership && structuredClone(ownership);
+    const cap = captureTemporaryThreadAuthority(ctx, () => {
+      try {
+        assertExecutionCurrent();
+        const current = getTelegramRoutableThreadRecords(deps.threadStore!.list(), deps.getLiveThreadTargets?.())
+          .find((value) => isDeepStrictEqual(value.target, target));
+        return isDeepStrictEqual(recordIdentity(current), expectedRecord) &&
+          isDeepStrictEqual(bindingIdentity(), expectedBindings) &&
+          (!foreign || Bus.isTelegramBusForwardOwnershipCurrent(expectedOwnership!, deps.getTargetOwnership?.(target)));
+      } catch { return false; }
+    });
+    if (!cap?.isCurrent()) return;
+    const temporary = pending.temporaryThread ?? findCreatedTemporaryThread(pending.sourceTarget);
+    if (!temporary || !issueTemporaryThreadForward(pending, ctx)) return;
+    pending.phase = { kind: "forward-unknown" };
+    const assertRecipientCurrent = (): void => {
+      assertExecutionCurrent();
+      if (!cap.isCurrent()) throw new Error("Reroute publication recipient authority changed.");
+    };
+    const assertPublicationCurrent = (): void => {
+      assertRecipientCurrent();
+      const entry = cap.store.listTemporaryThreads().find((value) => value.token === temporary.token);
+      const ids = [...source.sourceUpdateIds].sort((a, b) => a - b);
+      if (
+        !entry || entry.phase !== "created" || entry.cleanupIssued ||
+        entry.operatorUserId !== cap.operatorUserId ||
+        !isDeepStrictEqual(entry.executor, cap.authority.executor) ||
+        !isDeepStrictEqual(entry.target, pending.sourceTarget) ||
+        !entry.forwardedInputs?.some((input) => input.journalBindingKey === cap.journalBindingKey &&
+          isDeepStrictEqual(input.updateIds, ids)) ||
+        !isDeepStrictEqual(resolvePendingRerouteForwardSource(pending), source)
+      )
+        throw new Error("Reroute publication source authority changed.");
+    };
+    try {
+      assertPublicationCurrent();
+      // Bot API requires ascending source IDs. Preserve the source-UID association even if copy IDs reorder them.
+      const order = source.messageIds.map((_, index) => index)
+        .sort((a, b) => source.messageIds[a]! - source.messageIds[b]!);
+      const messageIds = order.map((index) => source.messageIds[index]!);
+      const body = { chat_id: target.chatId, message_thread_id: target.threadId,
+        from_chat_id: source.chatId, disable_notification: true };
+      const options = { maxAttempts: 1, retrySafety: "non-idempotent" as const, assertAuthority: assertPublicationCurrent };
+      const copies = messageIds.length === 1
+        ? [await deps.callApi<{ message_id?: unknown }>("forwardMessage", { ...body, message_id: messageIds[0] }, options)]
+        : await deps.callApi<Array<{ message_id?: unknown }>>("forwardMessages", { ...body, message_ids: messageIds }, options);
+      assertPublicationCurrent();
+      const copyIds = Array.isArray(copies) ? copies.map((copy) => copy?.message_id) : [];
+      if (
+        copyIds.length !== messageIds.length ||
+        !copyIds.every((id): id is number => typeof id === "number" && Number.isSafeInteger(id) && id > 0) ||
+        new Set(copyIds).size !== copyIds.length
+      )
+        return;
+      pending.rerouteCopies = { target, bySourceUpdateId: new Map(order.map((index, position) =>
+        [source.sourceUpdateIds[index]!, copyIds[position]!] as const)) };
+      pending.phase = { kind: "selected" };
+      return assertRecipientCurrent;
+    } catch (error) {
+      if (cap.isCurrent()) deps.recordRuntimeEvent?.("routing", error, { phase: "reroute-destination-forward" });
+      return;
+    }
+  };
   const forwardPendingRerouteMessages = async (
     pending: PendingUnboundReroute,
     instanceId: string,
@@ -6827,12 +7040,19 @@ export function createTelegramInboundRouteRuntime<
     )
       return false;
     const ownership = structuredClone(liveOwnership);
-    const messages = cloneTelegramMessagesForThread(pending.messages, threadId);
+    const copies = pending.rerouteCopies;
+    const published = !!copies && isDeepStrictEqual(copies.target, target);
+    const messages = cloneTelegramMessagesForThread(
+      pending.messages,
+      threadId,
+      published ? copies.bySourceUpdateId : undefined,
+    );
     // Issuance is durable before the RPC: an unacknowledged temporary-tab Forward never becomes another dispatch grant,
     // even after restart. Any refusal or publication failure sends nothing and keeps the input held.
     if (
       !recordForwardAcceptance &&
       isTemporaryReroute(pending) &&
+      !published &&
       !issueTemporaryThreadForward(pending, ctx)
     ) {
       if (isTemporaryThreadForwardIssued(pending))
@@ -6847,6 +7067,10 @@ export function createTelegramInboundRouteRuntime<
           message,
           ownership,
           ctx,
+          assertAuthority() {
+            assertExecutionCurrent?.();
+            Updates.assertTelegramUpdateExecutionCurrent(message);
+          },
         }),
       ),
     );
@@ -7073,6 +7297,16 @@ export function createTelegramInboundRouteRuntime<
       temporaryCleanupTimers.delete(token);
       if (retry) restoreSettlementTasks.add(task);
       runTemporaryThreadCleanup(token, cap, reconcileExpiry)
+        .then(() => {
+          if (!cap.isCurrent()) return;
+          const retained = cap.store.listTemporaryThreads().find(value => value.token === token);
+          // A follower ACK can precede recipient receipt disposal. Reobserve a protected, unissued tab;
+          // elapsed time never grants deletion, and an issued/unknown delete can never enter this path.
+          if (retained?.phase === "created" && !retained.cleanupIssued &&
+            Threads.isTelegramTemporaryThreadFullyResolved(retained) &&
+            cap.store.inspectTemporaryThreadTarget(retained, cap.authority)?.kind === "temporary" && cap.isCurrent())
+            queueTemporaryThreadCleanup(token, cap, 1000, reconcileExpiry, true);
+        })
         .catch((error) => {
           deps.recordRuntimeEvent?.("routing", error, {
             phase: "temporary-thread-cleanup",
@@ -7799,7 +8033,7 @@ export function createTelegramInboundRouteRuntime<
             ).includes(source.original.updateId)
           )
             continue;
-          movedIntoTab ||= pending.allTabCopiesForwarded === true;
+          movedIntoTab ||= pending.allTabCopiesForwarded !== undefined;
           removePendingReroute(id);
           if (
             signal.aborted ||
@@ -8901,6 +9135,14 @@ export function createTelegramInboundRouteRuntime<
       );
       return true;
     }
+    if (
+      !parsed.useNewSlot &&
+      isTemporaryReroute(pending) &&
+      !resolvePendingRerouteForwardSource(pending)
+    ) {
+      await deps.answerCallbackQuery(query.id, "Source copy unavailable; not routing");
+      return true;
+    }
     if (!(await selectPendingDestination())) return true;
     if (parsed.useNewSlot && sourceTarget && restoreWorkspace) {
       const selection = (pending.workspaceRestore ??= {
@@ -9006,6 +9248,19 @@ export function createTelegramInboundRouteRuntime<
       );
       return true;
     }
+    let assertRerouteCurrent = assertExecutionCurrent;
+    if (isTemporaryReroute(pending)) {
+      const confirmed = await publishPendingRerouteCopies(pending, record, ctx, assertExecutionCurrent,
+        !!record.instanceId && record.instanceId !== currentInstanceId && !isCurrentLeaderRecord);
+      if (!confirmed) {
+        await deps.answerCallbackQuery(query.id, pending.phase.kind === "forward-unknown"
+          ? "Publication unconfirmed; not resending"
+          : "Publication unavailable; input kept");
+        return true;
+      }
+      assertRerouteCurrent = confirmed;
+    }
+    assertRerouteCurrent();
     if (
       record.instanceId &&
       record.instanceId !== currentInstanceId &&
@@ -9016,7 +9271,7 @@ export function createTelegramInboundRouteRuntime<
         record.instanceId,
         parsed.threadId,
         ctx,
-        assertExecutionCurrent,
+        assertRerouteCurrent,
       );
       if (!allForwarded) {
         await deps.answerCallbackQuery(
@@ -9032,6 +9287,7 @@ export function createTelegramInboundRouteRuntime<
     // Local handlers and queue admission consume the same one-time group grant as follower forwarding.
     if (
       isTemporaryReroute(pending) &&
+      !pending.rerouteCopies &&
       !issueTemporaryThreadForward(pending, ctx)
     ) {
       await deps.answerCallbackQuery(
@@ -9040,7 +9296,11 @@ export function createTelegramInboundRouteRuntime<
       );
       return true;
     }
-    await dispatchPendingRerouteMessages(pending, reroutedMessages, ctx);
+    const localMessages = pending.rerouteCopies
+      ? cloneTelegramMessagesForThread(pending.messages, parsed.threadId, pending.rerouteCopies.bySourceUpdateId)
+      : reroutedMessages;
+    await dispatchPendingRerouteMessages(pending, localMessages, ctx);
+    assertRerouteCurrent();
     pending.messages = [];
     return completeRoutedReroute();
   };
@@ -10632,6 +10892,16 @@ export function createTelegramInboundRouteRuntime<
     const tabCopyId = openedNow
       ? await moveAllTabSourceIntoTab(pending, target, current)
       : undefined;
+    if (!current()) {
+      removePendingReroute(rerouteId);
+      throw new Error("Temporary Thread source presentation authority changed.");
+    }
+    if (
+      openedNow &&
+      !pending.allTabCopiesForwarded &&
+      pending.allTabCopies.length === held.length
+    )
+      pending.allTabSourceRetained = true;
     try {
       if (!deps.sendInteractiveMessage)
         throw new Error("Temporary Thread chooser publication is unavailable.");

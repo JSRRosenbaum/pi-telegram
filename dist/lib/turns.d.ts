@@ -9,6 +9,10 @@ import { type TelegramVoiceReplyMode } from "./voice.ts";
 export declare const TELEGRAM_PREFIX = "[telegram]";
 /** A routed source keeps its unique message/file/group identity, but cannot quote an anchor in its former tab. */
 export declare function withoutTelegramTurnReplyAnchor<TMessage extends object>(message: TMessage): TMessage;
+/** A confirmed same-target copy may replace the former-tab suppression on a warm input projection. */
+export declare function withTelegramTurnReplyAnchor<TMessage extends {
+    message_id: number;
+}>(message: TMessage): TMessage;
 export declare const TELEGRAM_GUEST_TURN_NOTE = "[guest] delivery: answer quickly with one concise, self-contained reply";
 export interface TelegramTurnTarget {
     chatId: number;

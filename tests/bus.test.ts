@@ -2516,6 +2516,60 @@ test("Bus foreign-owned update forwarder sends routed update envelopes", async (
   }
 });
 
+for (const mode of ["current", "source-ended-initial", "source-ended-before-connect", "source-ended-before-write",
+  "recipient-ended-before-connect", "source-ended-after-write", "recipient-ended-after-write", "connection-refused"] as const) {
+  test(`Guarded foreign forward fences native IPC issuance and ACK (${mode})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-telegram-forward-guard-"));
+    const socketPath = getTelegramBusFollowerSocketPath("guarded", dir);
+    const ownership = { instanceId: "guarded", ownerGeneration: "g1", recipientBindingKey: "manual:guarded" };
+    let sourceCurrent = mode !== "source-ended-initial", ownershipCurrent = true;
+    let guardCalls = 0, ownershipReads = 0;
+    const received: TelegramBusEnvelope[] = [];
+    const server = createTelegramBusLocalServer({ socketPath, handleEnvelope(envelope) {
+      received.push(envelope);
+      assert.equal(envelope.kind, "leader.forwardMessage");
+      if (envelope.kind !== "leader.forwardMessage") throw new Error("Unexpected probe request");
+      assert.equal(envelope.auth, "guard-secret");
+      assert.equal(envelope.recipientRegistrationGeneration, "g1");
+      if (mode === "source-ended-after-write") sourceCurrent = false;
+      if (mode === "recipient-ended-after-write") ownershipCurrent = false;
+      return { kind: "bus.ack", requestId: envelope.requestId, ok: true,
+        result: { deliveryId: envelope.delivery.deliveryId, sourceUpdateId: envelope.delivery.sourceUpdateId } };
+    } });
+    const message = { message_id: 1000, pi_telegram_source_update_id: 51,
+      get text() { if (mode === "source-ended-before-write") sourceCurrent = false; return "held source"; } };
+    const forwarder = createTelegramBusForeignOwnedUpdateForwarder({ socketPath,
+      createRequestId: () => "guarded:request", getAuthSecret: () => "guard-secret",
+      validateForwardOwnership() { ownershipReads++; return ownershipCurrent; },
+    });
+    try {
+      if (mode !== "connection-refused") await server.start();
+      const pending = forwarder.forwardMessage({ message, ownership, ctx: { generation: 1 }, assertAuthority() {
+        guardCalls++;
+        if (!sourceCurrent) throw new Error("Source authority changed.");
+      } });
+      if (mode === "source-ended-before-connect") queueMicrotask(() => { sourceCurrent = false; });
+      if (mode === "recipient-ended-before-connect") queueMicrotask(() => { ownershipCurrent = false; });
+      const result = await pending;
+      assert.equal(result.status, mode === "current" ? "accepted" : "retryable");
+      const alreadyIssued = mode === "current" || mode.endsWith("after-write");
+      assert.equal(received.length, alreadyIssued ? 1 : 0,
+        "Ended authority prevents new issuance; it never claims to unsend an issued envelope");
+      assert.doesNotMatch(JSON.stringify(received), /assertAuthority|Source authority changed|generation/);
+      assert.equal(result.delivery?.sourceUpdateId, 51, "Authority refusal retains the same durable delivery/source identity");
+      if (mode === "current") {
+        assert.ok(guardCalls >= 4, "The local guard reaches connect, post-encoding write and ACK boundaries");
+        assert.ok(ownershipReads >= 4, "Ownership is not a one-time pre-connect observation");
+      }
+      if (mode === "connection-refused") assert.equal(guardCalls, 1, "Guarded sends disable platform reconnect retry");
+      if (mode.startsWith("source-ended")) {
+        assert.equal(result.status, "retryable");
+        assert.match("message" in result ? result.message ?? "" : "", /authority/);
+      }
+    } finally { await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
 test("Bus forwarder selects payload-free custody wake only for capable peers", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-custody-forwarder-"));
   const socketPath = join(dir, "bus.sock");
