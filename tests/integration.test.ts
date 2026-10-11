@@ -58,6 +58,7 @@ import * as Sync from "../lib/sync.ts";
 import * as Updates from "../lib/updates.ts";
 import {
   createTelegramBridgeApiRuntime,
+  createTelegramApiClient,
   type TelegramApiClient,
   type TelegramBridgeApiRuntime,
 } from "../lib/telegram-api.ts";
@@ -2451,6 +2452,9 @@ test("Public activity delivery reaches the classic instance without blocking age
       lastUpdateId: 0,
     });
     await writeRuntimeTelegramLocks({});
+    const classicSeed = await createRuntimeSeedWorkspaceStore();
+    classicSeed.threads.setBotState({ threadMode: "disabled", updatedAtMs: Date.now() });
+    await classicSeed.threads.persist(); await classicSeed.release();
     (await getRuntimeTelegramExtension())(pi);
     const ctx = createRuntimeExtensionContext();
     await handlers.get("session_start")?.({}, ctx);
@@ -2547,6 +2551,9 @@ test("Verbose activity reaches classic transport before the final assistant answ
     });
     await writeRuntimeTelegramLocks({});
     (await getRuntimeTelegramExtension())(pi);
+    const classicSeed = await createRuntimeSeedWorkspaceStore();
+    classicSeed.threads.setBotState({ threadMode: "disabled", updatedAtMs: Date.now() });
+    await classicSeed.threads.persist(); await classicSeed.release();
     const ctx = createRuntimeExtensionContext({
       cwd: "/repo/verbose-classic",
     });
@@ -2806,7 +2813,41 @@ test("Verbose activity uses follower transport and loses stale registration auth
   runtime.stop();
 });
 
-test("Follower aggregate delivery crosses the authorized leader transport", async () => {
+for (const mode of ["thread", "classic", "thread-unavailable"] as const) {
+  test(`Queue dispatch preserves typing destination through native runtime and API fences (${mode})`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const Runtime = await import("../lib/runtime.ts");
+    const runtime = Runtime.createTelegramBridgeRuntime(), ctx = { id: "session" };
+    const threaded = mode !== "classic", target = mode === "thread" ? { chatId: 7, threadId: 42 } : { chatId: 7 };
+    let authority: string | undefined = "current", apiCalls = 0, injections = 0;
+    const bodies: Array<Record<string, unknown>> = [], failures: unknown[] = [];
+    const restoreFetch = setRuntimeTestFetch(async (_input, init) => { bodies.push(parseJsonRequestBody(init) ?? {}); return createRuntimeTelegramApiResponse(true); });
+    const client = createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => threaded });
+    const prompt = Runtime.createTelegramPromptDispatchRuntime({ lifecycle: runtime.lifecycle, typing: runtime.typing,
+      getDefaultChatId: () => 7, isThreadedMode: () => threaded, getTransportAuthority: () => authority,
+      isContextActive: value => value === ctx, updateStatus() {}, recordRuntimeEvent(_category, error) { failures.push(error); },
+      async sendTypingAction(chatId, options) { apiCalls++; return client.call("sendChatAction", { chat_id: chatId, action: "typing",
+        ...(options?.message_thread_id !== undefined ? { message_thread_id: options.message_thread_id } : {}) }, { assertAuthority: options?.assertAuthority }); } });
+    const turn: Queue.PendingTelegramTurn = { kind: "prompt", chatId: 7, target, replyToMessageId: 0, sourceMessageIds: [12],
+      queueOrder: 1, queueLane: "default", laneOrder: 1, queuedAttachments: [], content: [{ type: "text", text: "retained All input" }], historyText: "input", statusSummary: "input" };
+    let items: Queue.TelegramQueueItem<typeof ctx>[] = [turn];
+    const dispatch = Queue.createTelegramQueueDispatchController<typeof ctx>({ getQueuedItems: () => items, setQueuedItems(next) { items = next; },
+      canDispatch: () => !runtime.lifecycle.hasDispatchPending(), updateStatus() {}, sendTextReply: async () => undefined,
+      onPromptDispatchStart: prompt.onPromptDispatchStart, sendUserMessage() { injections++; }, onPromptDispatchFailure: prompt.onPromptDispatchFailure });
+    try {
+      dispatch.dispatchNext(ctx); await flushMicrotasks(20);
+      assert.equal(injections, 1); assert.equal(runtime.lifecycle.hasDispatchPending(), true);
+      assert.equal(items[0], turn, "Typing cannot consume the pending Pi-owned head");
+      assert.equal(apiCalls, mode === "thread-unavailable" ? 0 : 1);
+      assert.deepEqual(bodies, mode === "thread-unavailable" ? [] : [{ chat_id: 7, action: "typing", ...(mode === "thread" ? { message_thread_id: 42 } : {}) }]);
+      assert.deepEqual(failures, [], "Missing Thread is an upstream refusal, not an API-fence diagnostic");
+      authority = undefined; t.mock.timers.tick(6000); await flushMicrotasks(20);
+      assert.equal(apiCalls, mode === "thread-unavailable" ? 0 : 1, "Authority loss cannot refresh or reroute activity");
+    } finally { runtime.typing.stop(); restoreFetch(); }
+  });
+}
+
+test("Follower All output is refused by delivery policy and leader authorization", async () => {
   const follower = {
     instanceId: "follower-one",
     connectedAtMs: 1,
@@ -2832,10 +2873,7 @@ test("Follower aggregate delivery crosses the authorized leader transport", asyn
     ownsDirect: () => false,
     getDefaultTarget: () => follower.target,
     async callFollowerApi(method, args) {
-      assert.equal(
-        Bus.isTelegramFollowerApiCallAllowed({ follower, method, args }),
-        true,
-      );
+      if (!Bus.isTelegramFollowerApiCallAllowed({ follower, method, args })) throw new Error("Follower All output is denied");
       return leaderProxy(method, args);
     },
   });
@@ -2857,10 +2895,9 @@ test("Follower aggregate delivery crosses the authorized leader transport", asyn
     { scope: { kind: "aggregate" } },
   );
 
-  assert.equal(result.ok, true);
-  assert.deepEqual(directBodies, [
-    { chat_id: 77, text: "Aggregate activity" },
-  ]);
+  assert.equal(result.ok, false);
+  await assert.rejects(busAwareApi.call("sendMessage", { chat_id: 77, text: "Legacy All", __piTelegramAggregateDelivery: true }), /All output is denied/);
+  assert.deepEqual(directBodies, []);
 });
 
 test("Leader transport coalesces matching direct and follower chat actions", async () => {
@@ -4320,7 +4357,16 @@ for (const fault of ["current", "session-held", "response-session", "lost-ack", 
         assert.equal(journal.read().entries.some(row => row.updateId === 100), !reported);
         await click();
         assert.equal(answers.some(text => text?.includes("Command source disposal confirmed")), ack);
-        if (ack) assert.ok(answers.some(text => text?.includes(commandName === "compact" ? "confirmation delivery and actual compaction" : "confirmation delivery and actual session replacement")));
+        if (ack) {
+          const restore = Locks.readTelegramRuntimeState(statePath).profiles.default.workspace.workspaceRestore.liveRebindings[0];
+          assert.equal(restore.inputRelease, "accepted", "Native producer admission is distinct from its exact source ACK");
+          const cleanupText = restore.cleanup === "confirmed" ? "old-Thread removal confirmed"
+            : restore.cleanup === "unknown" ? "old-Thread removal unconfirmed; deletion will not repeat"
+            : restore.cleanup === "failed" ? "old-Thread removal failed"
+            : restore.cleanup === "not-issued" ? "old-Thread removal was not issued"
+            : commandName === "compact" ? "confirmation delivery and actual compaction" : "confirmation delivery and actual session replacement";
+          assert.ok(answers.some(text => text?.includes(cleanupText)), "Confirmation copy must reflect the retained cleanup outcome, not claim scheduled cleanup after completion");
+        }
         if (reported) {
           assert.equal(typeof captured.effectGuard, "function"); assert.doesNotThrow(captured.effectGuard);
           originals.get(100).text = "changed after handled completion";
@@ -8279,6 +8325,7 @@ test("Extension runtime sends proactive checkpoints and final once in source ord
       },
       ctx,
     );
+    await waitForEventLoopCondition(() => sentBodies.length >= 2);
     await flushMicrotasks(20);
     assert.equal(sentBodies.length, 2);
     assert.deepEqual(

@@ -3496,10 +3496,13 @@ for (const timing of ["queued", "flushing"] as const) {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let active = true;
     const effects: string[] = [];
-    const preview = createTelegramPreviewController({ sendDraft: async () => { effects.push("clear"); } });
-    const original = preview.createState();
-    original.mode = "draft"; original.draftId = 1; original.flushPromise = gate;
-    preview.setState(original);
+    // A real issued draft whose request is still in flight: the draft send waits on the gate, the clear is recorded.
+    const preview = createTelegramPreviewController({ minDraftIntervalMs: 0,
+      sendDraft: async (_chat, _draft, text) => { if (text !== undefined) { await gate; return; } effects.push("clear"); } });
+    preview.resetState(); preview.setPendingText("Draft in flight");
+    const inFlight = preview.flush(7);
+    const original = preview.getState()!;
+    assert.equal(original.draftId, 1); assert.equal(preview.isFlushing(), true);
     let task: (() => Promise<void>) | undefined;
     let delivery: Promise<void> | undefined;
     let hook: Promise<void> | undefined;
@@ -3527,8 +3530,8 @@ for (const timing of ["queued", "flushing"] as const) {
         delivery = task();
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
-      const next = preview.createState();
-      if (replacement === "preview") preview.setState(next);
+      if (replacement === "preview") preview.resetState();
+      const next = preview.getState();
       if (replacement === "authority") active = false;
       if (timing === "queued") delivery = task();
       release();
@@ -3537,9 +3540,9 @@ for (const timing of ["queued", "flushing"] as const) {
         ...(replacement === "none" ? ["clear"] : []),
         ...(stopReason === "error" && replacement !== "authority" ? ["error"] : []),
       ]);
-      assert.equal(preview.getState(), replacement === "none" ? undefined : replacement === "preview" ? next : original);
+      assert.equal(preview.getState()?.id, replacement === "none" ? undefined : replacement === "preview" ? next?.id : original.id);
     } finally {
-      release(); await hook; await delivery; preview.invalidate();
+      release(); await hook; await delivery; await inFlight; preview.invalidate();
     }
   });
 }
@@ -5552,8 +5555,9 @@ test("Dispatch runtime idles on none and executes control items directly", () =>
   assert.deepEqual(events, ["idle", "control"]);
 });
 
-test("Dispatch runtime sends prompt turns as normal user messages", () => {
+test("Dispatch runtime sends prompt turns as normal user messages with the exact typing target", () => {
   const events: string[] = [];
+  const target = { chatId: 2, threadId: 42 };
   executeTelegramQueueDispatchPlan(
     {
       kind: "prompt",
@@ -5569,6 +5573,7 @@ test("Dispatch runtime sends prompt turns as normal user messages", () => {
         content: [{ type: "text", text: "prompt" }],
         historyText: "prompt",
         statusSummary: "prompt",
+        target,
       },
       remainingItems: [],
     },
@@ -5576,7 +5581,8 @@ test("Dispatch runtime sends prompt turns as normal user messages", () => {
       executeControlItem: () => {
         events.push("control");
       },
-      onPromptDispatchStart: (chatId) => {
+      onPromptDispatchStart: (chatId, selectedTarget) => {
+        assert.deepEqual(selectedTarget, target);
         events.push(`start:${chatId}`);
       },
       sendUserMessage: (_content, options) => {

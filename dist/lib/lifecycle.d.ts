@@ -6,6 +6,7 @@
  */
 import * as BusFollower from "./bus-follower.ts";
 import type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionCompactFailedEvent, SessionShutdownEvent, SessionStartEvent, ToolExecutionEndEvent, ToolExecutionStartEvent, ToolExecutionUpdateEvent, UIPromptEndEvent, UIPromptStartEvent } from "./pi.ts";
+import * as Machine from "./machine.ts";
 import * as Queue from "./queue.ts";
 export declare function createAgentStartDedupHook(inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>, resetReplyDedup: () => void, schedulePublication?: (task: () => Promise<void>) => void): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>;
 type TelegramBeforeAgentStartEvent = Omit<BeforeAgentStartEvent, "systemPrompt"> & {
@@ -112,6 +113,13 @@ export interface TelegramSessionContextStore<TContext> {
 export declare function createTelegramSessionContextStore<TContext>(options?: {
     getIdentity?: (ctx: TContext) => unknown;
 }): TelegramSessionContextStore<TContext>;
+/** Capture drain hints at work admission; late completion never borrows a replacement session or transport. */
+export declare function createTelegramSessionDrainObserver<TContext, TAuthority>(deps: {
+    context: Pick<TelegramSessionContextStore<TContext>, "get" | "getGeneration" | "isCurrent">;
+    captureAuthority: () => TAuthority | undefined;
+    isAuthorityActive: (authority: TAuthority) => boolean;
+    onDrained: (ctx: TContext) => void;
+}): () => (() => void) | undefined;
 export declare function createTelegramSessionGenerationFence(store: TelegramSessionContextStore<ExtensionContext>, hooks: TelegramSessionLifecycleHooks): TelegramSessionLifecycleHooks;
 export interface TelegramBridgeSessionServiceRuntime {
     connection?: TelegramConnectionLifecycle;
@@ -192,9 +200,69 @@ export interface TelegramCompactionObserverRuntime<TContext> {
     onSessionCompactFailed: (event: SessionCompactFailedEvent, ctx: TContext) => void;
     onSessionShutdown: () => void;
 }
+/** The whole compaction-observer state; only `transitionTelegramCompactionObserver` produces a new one. */
+export interface TelegramCompactionObserverState {
+    /** The fallback timer's observation; a timer from any other one is inert. */
+    readonly observation: number | null;
+    /** The typing loop is the observer's to stop; a loop the agent already ran is never stopped by compaction. */
+    readonly typingOwned: boolean;
+    readonly nextObservation: number;
+}
+export type TelegramCompactionObserverEvent = {
+    type: "beforeCompact";
+}
+/** The outcome of the observer's own typing start, reported back by the shell. */
+ | {
+    type: "typingStarted";
+    started: boolean;
+} | {
+    type: "compacted";
+} | {
+    type: "compactFailed";
+} | {
+    type: "timerFired";
+    observation: number;
+    contextActive: boolean;
+} | {
+    type: "shutdown";
+};
+export type TelegramCompactionObserverEffect = {
+    type: "setInProgress";
+    inProgress: boolean;
+} | {
+    type: "startTyping";
+} | {
+    type: "stopTyping";
+} | {
+    type: "updateStatus";
+} | {
+    type: "armTimer";
+    observation: number;
+} | {
+    type: "cancelTimer";
+} | {
+    type: "recordTimeout";
+} | {
+    type: "abandoned";
+} | {
+    type: "requestDispatch";
+};
+export declare function createTelegramCompactionObserverState(): TelegramCompactionObserverState;
+/**
+ * Pure compaction-observer transition. A completion or failure always releases presence; the timeout releases only its
+ * own observation. Typing ownership is sticky: a repeated start while the observer's own loop runs reports `false`
+ * from the shared loop, and must not hand that loop to nobody.
+ */
+export declare function transitionTelegramCompactionObserver(state: TelegramCompactionObserverState, event: TelegramCompactionObserverEvent): Machine.TelegramMachineStep<TelegramCompactionObserverState, TelegramCompactionObserverEffect>;
+/**
+ * The shell around `transitionTelegramCompactionObserver`: it fences inactive contexts, runs effects with the calling
+ * context, reports the typing start back and owns the fallback timer, which keeps the context it was armed under.
+ */
 export declare function createTelegramCompactionObserverRuntime<TContext>(deps: TelegramCompactionObserverRuntimeDeps<TContext>): TelegramCompactionObserverRuntime<TContext>;
 export interface TelegramMessageActivityTypingDeps<TContext> {
     hasActiveTurn: () => boolean;
+    isContextActive?: (ctx: TContext) => boolean;
+    getSessionGeneration?: () => number;
     startTypingLoop: (ctx: TContext) => void;
     onMessageStart: TelegramLifecycleRegistrationDeps["onMessageStart"];
     onMessageUpdate: TelegramLifecycleRegistrationDeps["onMessageUpdate"];

@@ -201,8 +201,6 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     onItemsDiscarded: options.onItemsDiscarded,
     updateStatus: () => events.push("status"),
   });
-  const pendingModelSwitchStore =
-    Model.createPendingModelSwitchStore<Model.ScopedTelegramModel<TestModel>>();
   const currentModelRuntime = Model.createCurrentModelRuntime<
     TestContext,
     TestModel
@@ -216,8 +214,6 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
       Model.ScopedTelegramModel<TestModel>
     >({
       isIdle: () => true,
-      getPendingModelSwitch: pendingModelSwitchStore.get,
-      setPendingModelSwitch: pendingModelSwitchStore.set,
       getActiveTurn: activeTurnRuntime.get,
       getAbortHandler: bridgeRuntime.abort.getHandler,
       hasAbortHandler: bridgeRuntime.abort.hasHandler,

@@ -1521,6 +1521,7 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
 
 test("Lifecycle binding routes native typing, previews, and normalized activity", async () => {
   const events: string[] = [];
+  let generation = 1, previewGate: Promise<void> | undefined;
   const harness = createBindingApiHarness();
   const runtime = Runtime.createTelegramBridgeRuntime();
   let activeTurn = false;
@@ -1593,7 +1594,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
       resetState: () => undefined,
       clear: () => {},
       setPendingText: () => {},
-      onMessageStart: async () => events.push("preview:start"),
+      onMessageStart: async () => { events.push("preview:start"); await previewGate; },
       onMessageUpdate: async () => events.push("preview:update"),
     },
     promptDispatchRuntime: {
@@ -1629,6 +1630,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     finalizeMarkdownPreview: async () => undefined,
     proactivePushTargetGetter: () => ({ chatId: 42, threadId: 8 }),
     canSendAgentActivity: () => true,
+    getSessionGeneration: () => generation,
     updateStatus: () => {},
     recordRuntimeEvent: () => {},
   } as unknown as Parameters<typeof registerTelegramLifecycleRuntimeHooks>[0];
@@ -1734,4 +1736,16 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
   // Pi hooks keep their order without waiting for the independently delivered projection.
   assert.deepEqual(events.filter((event) => !event.startsWith("send:")), expected.filter((event) => !event.startsWith("send:")));
   assert.deepEqual(events.filter((event) => event.startsWith("send:")), expected.filter((event) => event.startsWith("send:")));
+
+  events.length = 0; activeTurn = true;
+  let finish!: () => void;
+  previewGate = new Promise<void>(resolve => { finish = resolve; });
+  const sameContext = { abort() {} } as ExtensionContext;
+  const oldMessage = getRequiredBindingHandler(harness.handlers, "message_start")({ message: {} }, sameContext);
+  await Promise.resolve(); generation++; finish(); await oldMessage;
+  assert.deepEqual(events, ["typing:42:9", "preview:start"], "A held old message cannot re-arm typing in its finally after a generation change");
+  events.length = 0;
+  const oldStart = getRequiredBindingHandler(harness.handlers, "agent_start")({ type: "agent_start" }, sameContext);
+  generation++; await oldStart;
+  assert.deepEqual(events, [], "A superseded agent-start continuation cannot publish activity or claim replacement typing");
 });

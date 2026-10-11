@@ -234,9 +234,9 @@ Examples:
 
 ## Route Chooser
 
-A message (or All-tab command) held in an unbound or temporary tab gets one route chooser.
+A message (or All-tab command) held in an unbound or temporary tab gets one route chooser. In Threaded Mode every input sent from `All` gets one, text, voice notes, files and stickers alike, and an album gets one chooser for the whole album. If no routing Thread can be prepared, retain the input without an All notice.
 
-- Root text: bold heading `🚦 Route this message:` (or `🚦 Route <code>/start</code>:` for a command), a blank line, then the italic note `The choice expires in 60 minutes.` When Reroute is the only possible action (an All-tab command without a temporary tab), the italic note says `To restore a Pi instead, send a message in a new tab.` instead.
+- Root text: bold heading `🚦 Route this message:` (or `🚦 Route <code>/start</code>:` for a command), a blank line, then the italic note `The choice expires in 60 minutes.`
 - Root buttons, one per row and only when available: `🔀 Reroute: send it to a Pi thread`, `🔁 Restore: move a Pi into this tab`, `⛔️ Cancel routing`. The `🚦` heading echoes these three choices, with `⛔️` as the red stop.
 - Submenus start with `⬆️ Back`, which restores the root with its exact original text. Headings are bold: `🔀 Reroute this message to:` / `🔀 Reroute <code>/start</code> to:` name the root's subject, and `🔁 Restore a Pi into this tab:` names a command only when there is one (`🔁 Restore a Pi into this tab for <code>/start</code>:`). Every target button below is a thread, written `🧵 <display title>`.
 - Cancel appears only at the root.

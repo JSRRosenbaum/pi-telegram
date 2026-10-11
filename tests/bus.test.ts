@@ -55,7 +55,6 @@ import {
   isTelegramBusForwardOwnershipCurrent,
   isTelegramFollowerApiCallAllowed,
   isSameTelegramBusFollowerRegistration,
-  markTelegramBusAggregateDelivery,
   markTelegramBusCrossTargetDelivery,
   parseTelegramBusEnvelope,
   probeTelegramBusLeader,
@@ -84,6 +83,23 @@ function selectedCommandInputWire(kind: "leader.prepareLiveRebind" | "leader.app
     selectedCommand: { name, target: { chatId: 7, threadId: 42 } },
     ...(kind === "leader.prepareLiveRebind" ? { updates: [{ update_id: 100, message: { text: `/${name}` } }] } : { sourceUpdateIds: [100], mode: kind === "leader.applyLiveRebind" ? "apply" : "release",
       preparedSource: { journalBindingKey: "journal", updateId: 100, sourceSha256: "a".repeat(64) } }) };
+}
+
+for (const fault of ["current", "missing-old", "foreign-old", "source", "unknown-mode"] as const) {
+  test(`Pre-dispatch work observation is an exact read-only wire branch (${fault})`, () => {
+    const wire: Record<string, unknown> = { ...selectedCommandInputWire("leader.settleLiveRebind"),
+      mode: fault === "unknown-mode" ? "observe-hold" : "observe-held", oldTarget: { chatId: 7, threadId: 11 } };
+    if (fault === "missing-old") delete wire.oldTarget;
+    if (fault === "foreign-old") wire.oldTarget = { chatId: 7, threadId: 0 };
+    if (fault === "source") wire.sourceUpdateIds = [101];
+    const parsed = parseTelegramBusEnvelope(JSON.stringify(wire));
+    assert.equal(!!parsed, fault === "current");
+    if (parsed) {
+      assert.equal(parsed.kind, "leader.settleLiveRebind");
+      assert.equal(Reflect.get(parsed, "mode"), "observe-held");
+      assert.equal(Reflect.get(parsed, "updates"), undefined);
+    }
+  });
 }
 
 for (const name of ["status", "abort"] as const) for (const kind of ["leader.prepareLiveRebind", "leader.applyLiveRebind", "leader.settleLiveRebind"] as const) {
@@ -1449,7 +1465,7 @@ test("Bus follower API allowlist permits own-chat typing and safe identity reads
       method: "call",
       args: ["sendChatAction", { chat_id: 100, action: "typing" }],
     }),
-    true,
+    false,
   );
   assert.equal(
     isTelegramFollowerApiCallAllowed({
@@ -1461,24 +1477,21 @@ test("Bus follower API allowlist permits own-chat typing and safe identity reads
   );
 });
 
-test("Bus follower API allowlist permits marked aggregate delivery only in its own chat", () => {
+test("Bus follower API refuses All even with a retained aggregate marker", () => {
   const follower = {
     instanceId: "inst-a",
     connectedAtMs: 1000,
     lastHeartbeatMs: 1000,
     target: { chatId: 100, threadId: 42 },
   };
-  const marked = markTelegramBusAggregateDelivery({
-    chat_id: 100,
-    text: "Aggregate",
-  });
+  const marked = { chat_id: 100, text: "Aggregate", __piTelegramAggregateDelivery: true };
   assert.equal(
     isTelegramFollowerApiCallAllowed({
       follower,
       method: "call",
       args: ["sendMessage", marked],
     }),
-    true,
+    false,
   );
   assert.equal(
     isTelegramFollowerApiCallAllowed({
@@ -1494,7 +1507,7 @@ test("Bus follower API allowlist permits marked aggregate delivery only in its o
       method: "call",
       args: [
         "sendMessage",
-        markTelegramBusAggregateDelivery({ chat_id: 101, text: "Wrong chat" }),
+        { chat_id: 101, text: "Wrong chat", __piTelegramAggregateDelivery: true },
       ],
     }),
     false,

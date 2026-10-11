@@ -94,6 +94,9 @@ import {
   createTelegramBusFollowerSourceReferenceAdmissionRuntime,
   createTelegramBusFollowerPairedAdmission,
   createTelegramBusFollowerHeartbeatRecoveryHandler,
+  createTelegramBusFollowerRecoveryState,
+  transitionTelegramBusFollowerRecovery,
+  type TelegramBusFollowerRecoveryEvent,
   createTelegramBusFollowerInputCustodyPorts,
   type TelegramBusFollowerInputCustodyBundle,
   createTelegramBusFollowerRegistrationRuntime as createRawTelegramBusFollowerRegistrationRuntime,
@@ -145,7 +148,7 @@ import { createTelegramActivityBridgeRuntime, createTelegramActivityPublicationR
 import { createTelegramDeliveryRuntime } from "../lib/delivery.ts";
 import { createTelegramApiTargetActivityRuntime } from "../lib/telegram-api.ts";
 import { createTelegramConfigStore } from "../lib/config.ts";
-import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, withTelegramFileTransaction } from "../lib/locks.ts";
+import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, createTelegramLockRuntime, withTelegramFileTransaction } from "../lib/locks.ts";
 import { createTelegramUpdateJournalBotIdentity, createTelegramUpdateJournalStore,
   createTelegramUpdateJournalBindingRuntime, getTelegramUpdateJournalBindingPath } from "../lib/journal.ts";
 import { resolveTelegramSessionJournalPath, resolveTelegramFollowerJournalPath } from "../lib/paths.ts";
@@ -156,6 +159,7 @@ import {
 } from "../lib/bus-leader.ts";
 import {
   createTelegramTopicTargetStore,
+  createTelegramConsolidatedWorkspaceStorage,
   createTelegramWorkspaceBindingIdentity,
   getTelegramLeaderSessionHandoff,
   setTelegramLeaderSessionHandoff,
@@ -1776,6 +1780,154 @@ test("Bus follower receiver rejects journal admission failure without a receipt"
   }
 });
 
+test("Bus follower recovery in flight cannot register after an operator stop and reconnect", async () => {
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 }, { slot: "F", threadName: "Fjord" });
+  let registers = 0;
+  let releaseSleep!: () => void;
+  const sleeping = new Promise<void>((resolve) => { releaseSleep = resolve; });
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({ registerWithLeader: async () => { registers += 1; return false; }, setContext: () => undefined, stop: () => undefined }),
+    getLeaderState: () => ({ kind: "active-elsewhere", lock: { pid: 99 } }) as never,
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async () => false,
+    sleep: () => sleeping,
+    scheduleRetry: () => undefined,
+    promotionGraceMs: 0,
+    recordRuntimeEvent: () => undefined,
+  });
+  const running = handler(new Error("heartbeat failed"), "ctx");
+  await new Promise((resolve) => setImmediate(resolve));
+  const before = registers;
+  // `/telegram-disconnect` then `/telegram-connect` while the old recovery waits out its grace period.
+  handler.halt();
+  handler.resume();
+  releaseSleep();
+  await running;
+  assert.equal(registers, before, "The old recovery's epoch ended; it cannot register beside the fresh connect");
+});
+
+test("Bus follower retry armed before an operator stop and reconnect never fires a recovery", async () => {
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 }, { slot: "F", threadName: "Fjord" });
+  let retry: (() => void) | undefined;
+  let promotions = 0;
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({ registerWithLeader: async () => false, setContext: () => undefined, stop: () => undefined }),
+    getLeaderState: () => ({ kind: "inactive" }) as never,
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async () => { promotions += 1; return false; },
+    sleep: async () => undefined,
+    scheduleRetry: (next) => { retry = next; },
+    promotionGraceMs: 0,
+    recordRuntimeEvent: () => undefined,
+  });
+  await handler(new Error("heartbeat failed"), "ctx");
+  assert.ok(retry, "A lost election arms a retry");
+  const before = promotions;
+  handler.halt();
+  handler.resume();
+  retry!();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(promotions, before, "The cancelled retry is inert even when its scheduler still fires it");
+});
+
+for (const outcome of ["registered", "registration-failed", "promotion-lost", "promotion-failed"] as const) {
+  test(`Bus follower obsolete recovery settlement is inert after reconnect (${outcome})`, async () => {
+    const registrationState = createTelegramBusFollowerRegistrationState();
+    registrationState.setRegistered(true, { chatId: 42, threadId: 10 }, { slot: "F", threadName: "Fjord" });
+    const target = { chatId: 42, threadId: 11 };
+    let replacement = false;
+    const staleEffects: string[] = [];
+    let handler!: ReturnType<typeof createTelegramBusFollowerHeartbeatRecoveryHandler<string>>;
+    const registration = {
+      async registerWithLeader() {
+        queueMicrotask(reconnect);
+        if (outcome === "registration-failed") throw new Error("Obsolete registration failed");
+        return true;
+      },
+      setContext() {},
+      stop() {
+        if (replacement) staleEffects.push("stop");
+        registrationState.setRegistered(false);
+      },
+    };
+    const reconnect = (): void => {
+      handler.halt();
+      registration.stop();
+      handler.resume();
+      registrationState.setRegistered(true, target, { slot: "F", threadName: "Fjord", generation: "fresh" });
+      replacement = true;
+    };
+    handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+      registrationState,
+      getRegistrationRuntime: () => registration,
+      getLeaderState: () => outcome.startsWith("promotion")
+        ? { kind: "inactive" }
+        : ({ kind: "active-elsewhere", lock: { pid: 99 } } as never),
+      setLifecyclePhase: () => { if (replacement) staleEffects.push("phase"); },
+      updateStatus: () => { if (replacement) staleEffects.push("status"); },
+      promoteToLeader: async () => {
+        queueMicrotask(reconnect);
+        if (outcome === "promotion-failed") throw new Error("Obsolete promotion failed");
+        return false;
+      },
+      sleep: async () => {},
+      scheduleRetry: () => { if (replacement) staleEffects.push("retry"); },
+      promotionGraceMs: 0,
+      recordRuntimeEvent: () => {},
+    });
+    await handler(new Error("Heartbeat failed"), "ctx");
+    assert.equal(replacement, true);
+    assert.equal(registrationState.isRegistered(), true, "Obsolete success and failure retain the fresh registration");
+    assert.equal(registrationState.getGeneration(), "fresh");
+    assert.deepEqual(registrationState.getTarget(), target);
+    assert.deepEqual(staleEffects, [], "An expired recovery can neither stop, clear nor retry beside the replacement");
+  });
+}
+
+function runFollowerRecovery(events: TelegramBusFollowerRecoveryEvent[]) {
+  let state = createTelegramBusFollowerRecoveryState();
+  const effects: string[] = [];
+  for (const event of events) {
+    const next = transitionTelegramBusFollowerRecovery(state, event);
+    state = next.state;
+    effects.push(...next.effects.map((effect) => effect.type));
+  }
+  return { state, effects };
+}
+
+test("Bus follower recovery machine runs one recovery per epoch and fences retries by epoch", () => {
+  assert.deepEqual(runFollowerRecovery([{ type: "recoverRequested" }, { type: "recoverRequested" }]).effects, ["runRecovery"]);
+  const stale = runFollowerRecovery([
+    { type: "recoverRequested" },
+    { type: "resumed" },
+    { type: "retryRequested", epoch: 0 },
+    { type: "recoverySettled", epoch: 0 },
+  ]);
+  assert.deepEqual(stale.effects, ["runRecovery"], "An old epoch can neither arm a retry nor settle the new one");
+  assert.equal(stale.state.epoch, 1);
+  const retried = runFollowerRecovery([
+    { type: "recoverRequested" },
+    { type: "retryRequested", epoch: 0 },
+    { type: "recoverySettled", epoch: 0 },
+    { type: "retryFired", retryId: 1 },
+  ]);
+  assert.deepEqual(retried.effects, ["runRecovery", "armRetry", "runRecovery"]);
+  const halted = runFollowerRecovery([
+    { type: "recoverRequested" },
+    { type: "retryRequested", epoch: 0 },
+    { type: "halted" },
+    { type: "retryFired", retryId: 1 },
+    { type: "recoverRequested" },
+  ]);
+  assert.deepEqual(halted.effects, ["runRecovery", "armRetry", "cancelRetry"], "A halted follower never recovers");
+});
+
 test("Bus follower heartbeat recovery passes current binding into promotion", async () => {
   const promoted: unknown[] = [];
   let leaderStateCalls = 0;
@@ -2828,6 +2980,44 @@ test("Heartbeat ACK carries display titles without changing the follower's stabl
   }
 });
 
+for (const changedTarget of [false, true]) {
+  test(`Heartbeat title ACK stays bound to its captured target (${changedTarget ? "rebound" : "same-target"})`, { timeout: 5000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-telegram-title-target-fence-")), socketPath = join(dir, "bus.sock");
+    const state = createTelegramBusFollowerRegistrationState();
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let title: string | undefined, refreshed = 0, sequence = 0;
+    const handle = createTelegramBusLeaderEnvelopeHandler({ followerRegistry: createTelegramBusFollowerRegistry(),
+      provisionFollowerTarget: () => ({ chatId: 7, threadId: 42, slot: "S", threadName: "Signal" }),
+      getFollowerDisplayTitle: () => title });
+    const server = createTelegramBusLocalServer({ socketPath, async handleEnvelope(envelope) {
+      if (envelope.kind !== "follower.heartbeat") return handle(envelope);
+      title = "Signal";
+      const response = await handle(envelope); entered.resolve(); await release.promise;
+      return response;
+    } });
+    const follower = createTelegramBusFollowerRegistrationRuntime({ instanceId: "follower", registrationState: state,
+      createRequestId: () => `title:${++sequence}`, heartbeatMs: 60_000, onDisplayTitleChanged() { refreshed++; } });
+    let connecting: Promise<boolean> | undefined;
+    try {
+      await server.start();
+      connecting = follower.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath });
+      await entered.promise;
+      if (changedTarget) {
+        const generation = state.getGeneration(); assert.ok(generation);
+        state.setRegistered(true, { chatId: 7, threadId: 43 }, { slot: "S", threadName: "Signal", generation });
+        assert.equal(state.setDisplayTitle("Home", generation), true);
+      }
+      release.resolve(); assert.equal(await connecting, true, "A healthy old-target heartbeat is not a transport failure");
+      assert.equal(state.getDisplayTitle(), changedTarget ? "Home" : "Signal");
+      assert.equal(refreshed, changedTarget ? 0 : 1);
+      assert.equal(state.getThreadName(), "Signal"); assert.equal(state.isRegistered(), true);
+    } finally {
+      release.resolve(); await connecting?.catch(() => undefined); follower.stop(); await server.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test("Follower display setting requests negotiate capability and reject lost leader authority", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-display-setting-ipc-"));
   const socketPath = join(dir, "bus.sock");
@@ -3834,6 +4024,34 @@ test("Bus follower API caller sends method and multipart voice calls over local 
   }
 });
 
+for (const phase of ["waiting", "connecting", "current"] as const) {
+  test(`Follower typing keeps its callback local and fences IPC issuance (${phase})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-telegram-typing-local-guard-")), socketPath = join(dir, "bus.sock"), received: unknown[] = [];
+    let current = true, generation: string | undefined = phase === "waiting" ? undefined : "registration", finish!: (value: string) => void;
+    const registration = new Promise<string>(resolve => { finish = resolve; });
+    const server = createTelegramBusLocalServer({ socketPath, handleEnvelope(envelope) {
+      received.push(envelope); return { kind: "bus.ack", requestId: envelope.requestId, ok: true, result: true };
+    } });
+    const callApi = createTelegramBusFollowerApiCaller({ socketPath, instanceId: "instance", createRequestId: () => "typing:1",
+      getRegistrationGeneration: () => generation, waitForRegistrationGeneration: async () => registration,
+      getAuthSecret() { if (phase === "connecting") current = false; return "fixture-secret"; } });
+    const args = ["sendChatAction", { chat_id: 7, message_thread_id: 42, action: "typing" }, { maxAttempts: 1, retrySafety: "non-idempotent" }];
+    try {
+      await server.start();
+      const delivery = callApi("call", args, { assertAuthority() { if (!current) throw new Error("Context ended"); } });
+      if (phase === "waiting") { await new Promise<void>(resolve => setImmediate(resolve)); current = false; generation = "registration"; finish(generation); }
+      if (phase === "current") {
+        assert.equal(await delivery, true); assert.equal(received.length, 1);
+        const envelope = received[0] as { args: unknown[] }; assert.deepEqual(envelope.args, args);
+        assert.equal(JSON.stringify(envelope).includes("assertAuthority"), false, "Local callback is not serialized into the envelope");
+      } else {
+        await assert.rejects(delivery, error => error instanceof TelegramApiAuthorityError && !error.requestIssued);
+        assert.deepEqual(received, []);
+      }
+    } finally { finish("registration"); await server.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
 test("Bus follower API calls wait for heartbeat recovery before transport", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-api-recovery-"));
   const socketPath = join(dir, "bus.sock");
@@ -4554,8 +4772,8 @@ for (const fault of ["normal", "not-saved", "not-committed", "save-only", "disab
           if (collecting && fault === "observe-canonical-change") assert.ok(f.store.advanceLiveRebind(f.store.listLiveRebindings()[0]!, "not-issued", f.auth));
           return result;
         } }),
-        topicTargetStore: { ...f.threads, withWorkspaceRestoreSnapshot(expected, observe) {
-          applyingSnapshot = true; try { f.threads.withWorkspaceRestoreSnapshot(expected, observe); } finally { applyingSnapshot = false; }
+        topicTargetStore: { ...f.threads, withWorkspaceLiveRebindSnapshot(expected, observe) {
+          applyingSnapshot = true; try { f.threads.withWorkspaceLiveRebindSnapshot(expected, observe); } finally { applyingSnapshot = false; }
         } }, registrationState: { ...registration, setRegistered(...args) {
           applications++; registration.setRegistered(...args); if (fault === "local-lost-reply") throw new Error("Local apply reply lost");
         } },
@@ -4620,7 +4838,8 @@ for (const fault of ["normal", "not-saved", "not-committed", "save-only", "disab
       try {
         await lifecycle.onSessionStart(ctx); await worker.waitForDrain(); await receiver.start();
         if (fault === "release-busy") { journal.appendBatch([{ update_id: 99 }]); lifecycle.signal(); await busyEntered.promise; }
-        if (fault !== "not-saved") assert.equal((await control({ ...identity, updates: f.request.source.updateIds.map(update_id => ({ update_id })) }))?.status,
+        if (fault !== "not-saved") assert.equal((await control({ ...identity, updates: f.request.source.updateIds.map(update_id => ({ update_id,
+          message: { message_id: update_id, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "held input" } })) }))?.status,
           fault === "discard-partial" ? undefined : "saved");
         if (settlement && discard) {
           const settleCommand = { ...command, mode: "discard" as const };
@@ -4739,15 +4958,23 @@ for (const fault of ["normal", "not-saved", "not-committed", "save-only", "disab
   });
 }
 
-for (const boundary of ["ready", "busy", "before-ready", "local-disabled", "wrong-auth", "session-refresh", "journal-missing"] as const) {
+for (const boundary of ["ready", "busy", "before-ready", "local-disabled", "wrong-auth", "session-refresh", "journal-missing", "command-context", "command-context-pre-dispatch", "command-context-session-refresh", "command-context-registration-refresh", "command-context-canonical-change", "command-context-missing-canonical", "command-context-foreign-session", "command-context-inactive-canonical", "command-context-preparation-change", "consolidated", "consolidated-generation", "consolidated-registration", "consolidated-source", "consolidated-no-reader", "consolidated-reader-replaced", "consolidated-observe-generation", "consolidated-release-registration", "consolidated-release-source"] as const) {
   test(`Live-rebind follower assembly uses actual ready session, journal and target owners (${boundary})`, async () => {
     await fixture(async f => {
       const dir = dirname(f.path), leaderSocket = getTelegramBusFollowerSocketPath("leader", dir);
       const socketPath = getTelegramBusFollowerSocketPath("old", dir), ctx = { cwd: "/repo" };
+      const commandContext = { ...ctx, waitForIdle: async () => {} };
+      const consolidated = boundary.startsWith("consolidated");
+      const connectContext = boundary.startsWith("command-context") || consolidated ? commandContext : ctx;
+      let receiverContext: typeof ctx | undefined = boundary === "command-context-missing-canonical" ? undefined : ctx;
+      const isContextCurrent = (value: typeof ctx) => value === commandContext ||
+        (boundary !== "command-context-inactive-canonical" && value === receiverContext);
+      const preparedContexts: typeof ctx[] = [];
       let generation = 1, authenticatedSecret = "secret", journalCurrent = true, appends = 0, applications = 0;
       const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "assembled", capabilities: [
         TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE,
-        TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE] });
+        TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE,
+        "live-rebind-pre-dispatch-reader-v2", "live-rebind-pre-dispatch-v1"] });
       const localProtocol = boundary === "local-disabled" ? TEST_BUS_PROTOCOL_IDENTITY : protocol;
       const registration = createTelegramBusFollowerRegistrationState(), registry = createTelegramBusFollowerRegistry();
       const sourcePath = join(dir, "assembled-recipient.json"), botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "assembled" });
@@ -4759,13 +4986,51 @@ for (const boundary of ["ready", "busy", "before-ready", "local-disabled", "wron
         resolveBinding: () => ({ runtimeKey: "assembled", recoveryKey: key, journal: { ...journal,
           appendBatch(updates) { appends++; return journal.appendBatch(updates); } } }),
         createWorker(source) { return worker = createTelegramUpdateWorkerRuntime({ journal: source,
-          getJournalBindingKey: () => key, isContextCurrent: value => value === ctx, hasAuthority: () => true,
+          getJournalBindingKey: () => key, isContextCurrent, hasAuthority: () => true,
           async executeUpdate(update) {
             executed.push(update.update_id);
             if (update.update_id === 99) { capturedOldTarget = registration.getTarget(); entered.resolve(); await finish.promise; }
             return { kind: "complete" };
           } }); },
       });
+      let restoreStore = f.store, observedStore = f.threads, restoreAuthority = f.auth;
+      let publicationCaptures = 0, legacySnapshots = 0;
+      const rootPath = join(dir, "assembled-state.json");
+      const workspaceOwner = createTelegramLockRuntime({ statePath: rootPath, key: () => "default",
+        instanceId: "leader", runtimeGeneration: 1, isProcessAlive: () => true });
+      if (consolidated) {
+        assert.equal(workspaceOwner.acquire({ cwd: "/leader" }).ok, true);
+        const writer = {
+          captureAuthority() {
+            const epoch = workspaceOwner.getOwnedLeaderEpoch();
+            return epoch === undefined ? undefined : () => workspaceOwner.owns() && workspaceOwner.getOwnedLeaderEpoch() === epoch;
+          },
+          publishIfOwned: workspaceOwner.publishStateSectionIfOwned!,
+        };
+        const storage = createTelegramConsolidatedWorkspaceStorage({ getPath: () => rootPath, getProfile: () => "default", ...writer });
+        assert.equal(storage.capturePublication()!(() => ({ value: JSON.parse(readFileSync(f.path, "utf8")), result: true })).committed, true);
+        const leaderStore = createTelegramTopicTargetStore({ path: rootPath, telegramProfile: "default", consolidated: writer, getNowMs: () => 1000 });
+        await leaderStore.load();
+        f.request.binding = leaderStore.listWorkspaceBindings()[0]!; f.request.owner = leaderStore.list()[0]!;
+        restoreAuthority = { ...f.auth, executor: { instanceId: "leader", leaderEpoch: String(workspaceOwner.getOwnedLeaderEpoch()!) }, isCurrent: () => workspaceOwner.owns() };
+        restoreStore = leaderStore.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64), getNowMs: () => 1000 });
+        observedStore = createTelegramTopicTargetStore({ path: rootPath, telegramProfile: "default", canPersist: () => false, getNowMs: () => 1000,
+          consolidated: {
+            captureAuthority() { publicationCaptures++; return undefined; },
+            publishIfOwned() { assert.fail("A follower cannot publish Workspace or borrow the leader's authority"); },
+          } });
+        await observedStore.load();
+      }
+      const reader = observedStore.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64), getNowMs: () => 1000 });
+      const snapshotStore = { ...observedStore,
+        async load() {
+          await observedStore.load();
+          if (boundary === "consolidated-reader-replaced") snapshotStore.withWorkspaceLiveRebindSnapshot = (...args) => observedStore.withWorkspaceLiveRebindSnapshot(...args);
+        },
+        withWorkspaceRestoreSnapshot(...args: Parameters<typeof observedStore.withWorkspaceRestoreSnapshot>) {
+          legacySnapshots++; return observedStore.withWorkspaceRestoreSnapshot(...args);
+        },
+      };
       const ledger = createTelegramWorkspaceAdmissionLedger({ path: join(dir, "assembled-admission.json"), profileKey: "scope",
         owner: { processId: process.pid, processBirthId: `${process.pid}:assembled` }, getProcessLiveness: () => "alive" });
       const targetOwner = createTelegramBusFollowerWorkspaceRestoreHandler<typeof ctx>({ instanceId: "old",
@@ -4774,13 +5039,13 @@ for (const boundary of ["ready", "busy", "before-ready", "local-disabled", "wron
           getGeneration: () => generation, getProfileBindingKey: () => ledger.getProfileKey(), getOperatorUserId: () => 7,
           getAuthenticatedSecret: () => authenticatedSecret, getLeaderProtocol: registration.getLeaderProtocol,
           getLeaderState: () => ({ kind: "active-elsewhere", lock: { pid: process.pid, cwd: "/leader", heartbeatMs: 1,
-            instanceId: "leader", leaderEpoch: "epoch", busSecret: "secret" } }),
+            ...restoreAuthority.executor, busSecret: "secret" } }),
           capability: TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY,
         }),
         readRestoreIntent() { assert.fail("Live composition must not consume legacy Restore"); },
         readLiveRebindIntent: (id, profile) => profile === ledger.getProfileKey()
-          ? f.store.listLiveRebindings().find(intent => intent.request.operationId === id) : undefined,
-        topicTargetStore: f.threads, getWorkspaceAdmission: () => ledger,
+          ? reader.listLiveRebindings().find(intent => intent.request.operationId === id) : undefined,
+        topicTargetStore: snapshotStore, getWorkspaceAdmission: () => ledger,
         registrationState: { ...registration, setRegistered(...args) { applications++; registration.setRegistered(...args); } },
       });
       const queue = createTelegramQueueStore(), activeTurn = createTelegramActiveTurnStore();
@@ -4797,7 +5062,7 @@ for (const boundary of ["ready", "busy", "before-ready", "local-disabled", "wron
       let sequence = 0;
       const errors: string[] = [];
       const assembly = createTelegramBusFollowerRuntimeAssembly({ instanceId: "old", registrationState: registration,
-        recordRuntimeEvent(_category, error) { errors.push(String(error)); }, receiver: { socketPath, getContext: () => ctx, getAuthSecret: () => authenticatedSecret,
+        recordRuntimeEvent(_category, error) { errors.push(String(error)); }, receiver: { socketPath, getContext: () => receiverContext, getAuthSecret: () => authenticatedSecret,
           getRecipientBindingKey: () => "manual:old", getLiveRebindJournalBindingKey: () => journalCurrent ? admission.getJournalBindingKey() : undefined,
           getSessionId: (): string | undefined => assembly.getReadySessionId(), getLeaderProtocol: registration.getLeaderProtocol, getLocalProtocol: () => localProtocol,
           isLiveRebindSaveEnabled: () => true, isLiveRebindApplyEnabled: () => true, isLiveRebindSettleEnabled: () => true,
@@ -4805,47 +5070,111 @@ for (const boundary of ["ready", "busy", "before-ready", "local-disabled", "wron
           durableAdmission: { async admit() { assert.fail("Live composition cannot use ordinary forwarding"); } },
         }, recovery: { getLeaderState: () => ({ kind: "inactive" }), setLifecyclePhase() {}, updateStatus() {}, promoteToLeader: async () => false },
         registration: { protocolIdentity: localProtocol, getFollowerBusSocketPath: () => socketPath,
-          createRequestId: () => `assembly-${++sequence}`, getProfileKey: () => "manual:old", getSessionId: () => "session",
-          getSessionGeneration: () => generation, isContextActive: current => current === ctx,
+          createRequestId: () => `assembly-${++sequence}`, getProfileKey: () => "manual:old",
+          getSessionId: current => boundary === "command-context-foreign-session" && current === receiverContext ? "foreign-session" : "session",
+          getSessionGeneration: () => generation, isContextActive: isContextCurrent,
           setActiveAuthSecret: secret => { authenticatedSecret = secret ?? ""; },
-          onRegistered: current => admission.onSessionStart(current),
+          async onRegistered(current) {
+            preparedContexts.push(current); await admission.onSessionStart(current);
+            if (boundary === "command-context-preparation-change") receiverContext = { ...ctx };
+          },
         },
       });
       const leader = createRawTelegramBusLocalServer({ socketPath: leaderSocket,
         handleEnvelope: createRawTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry, protocolIdentity: protocol,
           authSecret: "secret", provisionFollowerTarget: () => ({ ...f.request.binding.target, slot: "A" }) }) });
-      const control = createTelegramBusLiveRebindController({ getFollower: registry.get, localProtocolIdentity: protocol,
+      const sendControl = createTelegramBusLiveRebindController({ getFollower: registry.get, localProtocolIdentity: protocol,
         getAuthSecret: () => boundary === "wrong-auth" ? "foreign" : "secret", createRequestId: () => `live-${++sequence}`, timeoutMs: 1000 });
+      const control = async (input: Parameters<typeof sendControl>[0]) => {
+        const bytes = consolidated ? readFileSync(rootPath, "utf8") : undefined;
+        try { return await sendControl(input); }
+        finally { if (bytes !== undefined) assert.equal(readFileSync(rootPath, "utf8"), bytes, "Follower control must not publish even an unchanged Workspace"); }
+      };
       const identity = { operationId: f.request.operationId, instanceId: "old", sessionId: "session", recipientBindingKey: key, isCurrent: () => true };
       const command = { ...identity, mode: "apply" as const, sourceUpdateIds: f.request.source.updateIds, slot: "A",
         target: f.request.target, oldTarget: f.request.binding.target };
       try {
         await leader.start();
-        assert.equal(await assembly.registration.registerWithLeader(ctx, { busSocketPath: leaderSocket, busSecret: "secret" }), true);
-        await worker.waitForDrain(); assert.equal(assembly.getReadySessionId(), "session");
+        if (["command-context-missing-canonical", "command-context-foreign-session", "command-context-inactive-canonical"].includes(boundary)) {
+          await assert.rejects(() => assembly.registration.registerWithLeader(connectContext,
+            { busSocketPath: leaderSocket, busSecret: "secret" }), /current canonical context/);
+          assert.equal(assembly.getReadySessionId(), undefined); assert.equal(registration.isRegistered(), false);
+          assert.deepEqual(preparedContexts, []); assert.equal(appends, 0); assert.equal(applications, 0);
+          assert.deepEqual(journal.read().entries, []); return;
+        }
+        assert.equal(await assembly.registration.registerWithLeader(connectContext, { busSocketPath: leaderSocket, busSecret: "secret" }), true);
+        await worker.waitForDrain();
+        if (boundary === "command-context-preparation-change") {
+          assert.equal(assembly.getReadySessionId(), undefined, "An awaited preparation cannot publish a replaced canonical context");
+          assert.equal(await control({ ...identity, updates: f.request.source.updateIds.map(update_id => ({ update_id,
+            message: { message_id: update_id, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "held input" } })) }), undefined);
+          assert.deepEqual(preparedContexts, [ctx]); assert.equal(appends, 0); assert.equal(applications, 0);
+          assert.deepEqual(journal.read().entries, []); return;
+        }
+        assert.equal(assembly.getReadySessionId(), "session");
         assert.equal(registry.get("old")?.profileKey, "manual:old");
         if (boundary === "before-ready") generation++;
         if (boundary === "busy") { journal.appendBatch([{ update_id: 99 }]); admission.signal(); await entered.promise; }
-        const saved = await control({ ...identity, updates: f.request.source.updateIds.map(update_id => ({ update_id })) });
+        const saved = await control({ ...identity, updates: f.request.source.updateIds.map(update_id => ({ update_id,
+          message: { message_id: update_id, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "held input" } })) });
         if (["before-ready", "local-disabled", "wrong-auth"].includes(boundary)) {
           assert.equal(saved, undefined); assert.equal(appends, 0); assert.equal(applications, 0); assert.deepEqual(journal.read().entries, []); return;
         }
-        assert.equal(saved?.status, "saved"); assert.equal(appends, 1);
-        assert.equal((await control({ ...identity, updates: f.request.source.updateIds.map(update_id => ({ update_id })) }))?.status, "saved");
+        assert.equal(saved?.status, "saved", errors.join("\n")); assert.equal(appends, 1);
+        assert.equal(preparedContexts[0], ctx, "Binding preparation uses the receiver's canonical session context, not Connect's command object");
+        if (boundary === "command-context") {
+          await assembly.registration.setContext(commandContext);
+          assert.equal(preparedContexts.length, 1, "Same-session command refresh cannot replace held input's worker");
+        }
+        assert.equal((await control({ ...identity, updates: f.request.source.updateIds.map(update_id => ({ update_id,
+          message: { message_id: update_id, chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "held input" } })) }))?.status, "saved");
         assert.equal(appends, 1, "Repeated save only observes the same retained carrier");
-        if (boundary === "session-refresh") generation++;
+        if (boundary === "session-refresh" || boundary === "command-context-session-refresh") generation++;
+        if (boundary === "command-context-registration-refresh") registration.setRegistered(true, f.request.binding.target,
+          { slot: "A", generation: "replacement-registration", leaderProtocol: protocol });
+        if (boundary === "command-context-canonical-change") receiverContext = { ...ctx };
         if (boundary === "journal-missing") journalCurrent = false;
-        const intent = await f.store.commitLiveRebind(f.request, { ...recipient("follower"), generation: registration.getGeneration()! }, f.auth);
+        const preDispatch = boundary === "command-context-pre-dispatch" || consolidated;
+        const intent = await restoreStore.commitLiveRebind(f.request, { ...recipient("follower"), generation: registration.getGeneration()! }, restoreAuthority,
+          preDispatch ? { holdInput: true } : undefined);
         assert.ok(intent);
+        if (boundary === "consolidated-generation") generation++;
+        if (boundary === "consolidated-registration") registration.setRegistered(true, f.request.binding.target,
+          { slot: "A", generation: "replacement-registration", leaderProtocol: protocol });
+        if (boundary === "consolidated-source") command.sourceUpdateIds = [999];
+        if (boundary === "consolidated-no-reader") Reflect.deleteProperty(snapshotStore, "withWorkspaceLiveRebindSnapshot");
         const applied = await control(command);
-        if (boundary === "session-refresh" || boundary === "journal-missing") {
+        if (["session-refresh", "journal-missing", "command-context-session-refresh", "command-context-registration-refresh", "command-context-canonical-change", "consolidated-generation", "consolidated-registration", "consolidated-source", "consolidated-no-reader", "consolidated-reader-replaced"].includes(boundary)) {
           assert.equal(applied, undefined); assert.equal(applications, 0); assert.deepEqual(registration.getTarget(), f.request.binding.target);
-          assert.deepEqual(journal.read().entries.map(entry => entry.updateId), f.request.source.updateIds); return;
+          assert.deepEqual(journal.read().entries.map(entry => entry.updateId), f.request.source.updateIds);
+          assert.equal(publicationCaptures, 0); assert.equal(legacySnapshots, 0); assert.deepEqual(executed, []); return;
         }
         assert.equal(applied?.status, "applied", errors.join("\n")); assert.equal(applications, 1);
         assert.equal((await control(command))?.status, "applied"); assert.equal(applications, 1);
-        assert.ok(f.store.advanceLiveRebind(intent, "release", f.auth));
+        let released = restoreStore.advanceLiveRebind(intent, "release", restoreAuthority)!; assert.ok(released);
+        if (preDispatch) {
+          if (boundary === "consolidated-observe-generation") {
+            generation++;
+            assert.equal(await control({ ...command, mode: "observe-held" }), undefined);
+            assert.deepEqual(executed, []); assert.deepEqual(journal.read().entries.map(entry => entry.updateId), f.request.source.updateIds);
+            assert.deepEqual(registration.getTarget(), f.request.target, "Refusal cannot roll back an already applied canonical target");
+            assert.equal(publicationCaptures, 0); assert.equal(legacySnapshots, 0); return;
+          }
+          const heldWork = await control({ ...command, mode: "observe-held" }); assert.equal(heldWork?.status, "observed");
+          assert.deepEqual(executed, [], "A confirmed binding and read-only work observation cannot execute held input");
+          assert.equal(await control({ ...command, mode: "release" }), undefined, "Held input requires its independent durable grant");
+          released = restoreStore.advanceLiveRebind(released, "issue-input", restoreAuthority)!; assert.ok(released);
+        }
+        if (boundary === "consolidated-release-registration" || boundary === "consolidated-release-source") {
+          if (boundary === "consolidated-release-registration") registration.setRegistered(true, f.request.target,
+            { slot: "A", generation: "replacement-registration", leaderProtocol: protocol });
+          else command.sourceUpdateIds = [999];
+          assert.equal(await control({ ...command, mode: "release" }), undefined);
+          assert.deepEqual(executed, []); assert.deepEqual(journal.read().entries.map(entry => entry.updateId), f.request.source.updateIds);
+          assert.equal(appends, 1); assert.equal(applications, 1); assert.equal(publicationCaptures, 0); assert.equal(legacySnapshots, 0); return;
+        }
         assert.equal((await control({ ...command, mode: "release" }))?.status, "released");
+        if (preDispatch) assert.ok(restoreStore.advanceLiveRebind(released, "accept-input", restoreAuthority));
         const observed = await control({ ...command, mode: "observe" }); assert.equal(observed?.status, "observed");
         if (!observed || !("work" in observed)) assert.fail("Missing authenticated work sample");
         assert.equal(observed.work.unknown, false);
@@ -4857,9 +5186,11 @@ for (const boundary of ["ready", "busy", "before-ready", "local-disabled", "wron
         assert.deepEqual(executed, boundary === "busy" ? [99, 100, 101] : [100, 101]);
         assert.equal((await control({ ...command, mode: "release" }))?.status, "released");
         assert.equal(appends, 1); assert.equal(applications, 1); assert.deepEqual(journal.read().entries, []);
+        assert.equal(publicationCaptures, 0); assert.equal(legacySnapshots, 0, "Live observation must never fall back to the publication-backed Restore snapshot");
       } finally {
         finish.resolve(); assembly.registration.stop(); await assembly.receiver.stop(); await leader.stop();
         await admission.onSessionShutdown(); await activity.onSessionShutdown?.();
+        if (consolidated) workspaceOwner.release();
       }
     }, "follower");
   });

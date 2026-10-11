@@ -1957,7 +1957,7 @@ export function executeTelegramQueueDispatchPlan(plan, deps) {
         deps.executeControlItem(plan.item);
         return;
     }
-    deps.onPromptDispatchStart(plan.item.chatId);
+    deps.onPromptDispatchStart(plan.item.chatId, plan.item.target);
     try {
         if (deps.commitPromptDispatch && !deps.commitPromptDispatch(plan.item)) {
             throw new Error("Telegram prompt dispatch could not be committed durably.");
@@ -2188,8 +2188,8 @@ export function createTelegramQueueDispatchController(deps) {
                             },
                         });
                     },
-                    onPromptDispatchStart: (chatId) => {
-                        deps.onPromptDispatchStart(ctx, chatId);
+                    onPromptDispatchStart: (chatId, target) => {
+                        deps.onPromptDispatchStart(ctx, chatId, target);
                     },
                     commitPromptDispatch: deps.commitPromptDispatch
                         ? (item) => deps.commitPromptDispatch(item, ctx)

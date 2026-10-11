@@ -9,6 +9,11 @@ import { appendTelegramAttachmentSection, appendTelegramListSection, buildTelegr
 import { createTelegramQueueAdmissionReceipt, truncateTelegramQueueSummary, } from "./queue.js";
 import { computeVoicePromptContribution, computeVoiceTurnFlags, getTelegramVoiceReplyMode, } from "./voice.js";
 export const TELEGRAM_PREFIX = "[telegram]";
+const REPLY_ANCHOR_SUPPRESSED = Symbol.for("@llblab/pi-telegram:reply-anchor-suppressed");
+/** A routed source keeps its unique message/file/group identity, but cannot quote an anchor in its former tab. */
+export function withoutTelegramTurnReplyAnchor(message) {
+    return { ...message, [REPLY_ANCHOR_SUPPRESSED]: true };
+}
 export const TELEGRAM_GUEST_TURN_NOTE = "[guest] delivery: answer quickly with one concise, self-contained reply";
 function getTelegramTurnTarget(message) {
     return Number.isInteger(message.message_thread_id)
@@ -456,7 +461,7 @@ function buildPreparedTelegramPromptTurn(options, images) {
         kind: "prompt",
         chatId: firstMessage.chat.id,
         target: getTelegramTurnTarget(firstMessage),
-        replyToMessageId: firstMessage.message_id,
+        replyToMessageId: Reflect.get(firstMessage, REPLY_ANCHOR_SUPPRESSED) === true ? 0 : firstMessage.message_id,
         sourceMessageIds: collectTelegramMessageIds(options.messages),
         queueOrder: options.queueOrder,
         queueLane: "default",

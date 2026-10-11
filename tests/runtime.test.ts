@@ -55,6 +55,7 @@ test("Runtime facade binds grouped operations to one bridge state", () => {
 
 test("Runtime state helpers allocate queue order and manage typing loops", async () => {
   const state = Runtime.createTelegramBridgeRuntimeState();
+  const typing = Runtime.createTelegramTypingLoop();
   assert.equal(Runtime.allocateTelegramQueueItemOrder(state), 0);
   assert.equal(Runtime.allocateTelegramQueueItemOrder(state), 1);
   assert.equal(Runtime.allocateTelegramQueueControlOrder(state), 0);
@@ -108,7 +109,7 @@ test("Runtime state helpers allocate queue order and manage typing loops", async
   assert.equal(Runtime.shouldFoldQueuedPromptsIntoHistory(state), false);
   const typingActions: number[] = [];
   assert.equal(
-    Runtime.startTelegramTypingLoop(state, {
+    typing.start({
       chatId: undefined,
       intervalMs: 1000,
       sendTypingAction: async (chatId) => {
@@ -118,7 +119,7 @@ test("Runtime state helpers allocate queue order and manage typing loops", async
     false,
   );
   assert.equal(
-    Runtime.startTelegramTypingLoop(state, {
+    typing.start({
       chatId: 42,
       intervalMs: 1000,
       sendTypingAction: async (chatId) => {
@@ -130,7 +131,7 @@ test("Runtime state helpers allocate queue order and manage typing loops", async
   await flushMicrotasks();
   assert.deepEqual(typingActions, [42]);
   assert.equal(
-    Runtime.startTelegramTypingLoop(state, {
+    typing.start({
       chatId: 43,
       intervalMs: 1000,
       sendTypingAction: async (chatId) => {
@@ -141,12 +142,12 @@ test("Runtime state helpers allocate queue order and manage typing loops", async
   );
   await flushMicrotasks();
   assert.deepEqual(typingActions, [42, 43]);
-  assert.equal(Runtime.stopTelegramTypingLoop(state), true);
-  assert.equal(Runtime.stopTelegramTypingLoop(state), false);
+  assert.equal(typing.stop(), true);
+  assert.equal(typing.stop(), false);
 });
 
 test("Typing loop retargets chat-level activity into the active thread", async () => {
-  const state = Runtime.createTelegramBridgeRuntimeState();
+  const typing = Runtime.createTelegramTypingLoop();
   const typingActions: Array<{
     chatId: number;
     threadId?: number;
@@ -163,7 +164,7 @@ test("Typing loop retargets chat-level activity into the active thread", async (
     });
   };
   assert.equal(
-    Runtime.startTelegramTypingLoop(state, {
+    typing.start({
       chatId: 42,
       intervalMs: 1000,
       sendTypingAction: async (chatId, options) => {
@@ -175,7 +176,7 @@ test("Typing loop retargets chat-level activity into the active thread", async (
   await flushMicrotasks();
   assert.deepEqual(typingActions, [{ chatId: 42 }]);
   assert.equal(
-    Runtime.startTelegramTypingLoop(state, {
+    typing.start({
       chatId: 42,
       target: createTelegramThreadTarget(42, 99),
       intervalMs: 1000,
@@ -190,12 +191,12 @@ test("Typing loop retargets chat-level activity into the active thread", async (
     { chatId: 42 },
     { chatId: 42, threadId: 99 },
   ]);
-  assert.equal(Runtime.stopTelegramTypingLoop(state), true);
+  assert.equal(typing.stop(), true);
 });
 
 test("Typing keepalive retargets queued work without leaking ticks across threads", async (ctx) => {
   ctx.mock.timers.enable({ apis: ["setInterval"] });
-  const state = Runtime.createTelegramBridgeRuntimeState();
+  const typing = Runtime.createTelegramTypingLoop();
   const actions: string[] = [];
   const createDeps = (threadId: number): Runtime.TelegramTypingLoopDeps => ({
     chatId: 42,
@@ -206,13 +207,13 @@ test("Typing keepalive retargets queued work without leaking ticks across thread
     },
   });
 
-  assert.equal(Runtime.startTelegramTypingLoop(state, createDeps(7)), true);
+  assert.equal(typing.start(createDeps(7)), true);
   await flushMicrotasks();
   ctx.mock.timers.tick(1000);
   await flushMicrotasks();
   assert.deepEqual(actions, ["thread:7", "thread:7"]);
 
-  assert.equal(Runtime.startTelegramTypingLoop(state, createDeps(9)), true);
+  assert.equal(typing.start(createDeps(9)), true);
   await flushMicrotasks();
   ctx.mock.timers.tick(2000);
   await flushMicrotasks();
@@ -222,18 +223,18 @@ test("Typing keepalive retargets queued work without leaking ticks across thread
     "thread:9",
     "thread:9",
   ]);
-  assert.equal(Runtime.stopTelegramTypingLoop(state), true);
+  assert.equal(typing.stop(), true);
   ctx.mock.timers.reset();
 });
 
 test("Typing loop sends chat actions only into the exact thread target", async () => {
-  const state = Runtime.createTelegramBridgeRuntimeState();
+  const typing = Runtime.createTelegramTypingLoop();
   const typingActions: Array<{
     chatId: number;
     threadId?: number;
   }> = [];
   assert.equal(
-    Runtime.startTelegramTypingLoop(state, {
+    typing.start({
       chatId: 42,
       target: createTelegramThreadTarget(42, 99),
       intervalMs: 1000,
@@ -248,17 +249,91 @@ test("Typing loop sends chat actions only into the exact thread target", async (
   );
   await flushMicrotasks();
   assert.deepEqual(typingActions, [{ chatId: 42, threadId: 99 }]);
-  assert.equal(Runtime.stopTelegramTypingLoop(state), true);
+  assert.equal(typing.stop(), true);
 });
 
 test("Typing loop idle wait is bounded for slow in-flight chat actions", async () => {
-  const state = Runtime.createTelegramBridgeRuntimeState();
-  state.typingInFlight = new Promise(() => {});
+  const typing = Runtime.createTelegramTypingLoop();
+  typing.start({ chatId: 42, intervalMs: 60_000, sendTypingAction: () => new Promise(() => {}) });
+  await flushMicrotasks();
   const startedAt = Date.now();
 
-  await Runtime.waitForTelegramTypingLoopIdle(state, 1);
+  await typing.waitForIdle(1);
 
   assert.ok(Date.now() - startedAt < 100);
+  assert.equal(typing.stop(), true);
+});
+
+/** Folds events through the pure typing transition, keeping every effect and the last call result. */
+function runTypingMachine(events: Runtime.TelegramTypingEvent[]): {
+  state: Runtime.TelegramTypingMachineState;
+  effects: Runtime.TelegramTypingEffect[];
+  result: boolean;
+} {
+  let state = Runtime.createTelegramTypingMachineState();
+  const effects: Runtime.TelegramTypingEffect[] = [];
+  let result = false;
+  for (const event of events) {
+    const next = Runtime.transitionTelegramTypingLoop(state, event);
+    state = next.state;
+    effects.push(...next.effects);
+    result = next.result;
+  }
+  return { state, effects, result };
+}
+
+const typingStart = (loopId: number, threadId?: number, continues = true): Extract<Runtime.TelegramTypingEvent, { type: "started" }> => ({
+  type: "started", loopId, chatId: 42, key: `42:${threadId ?? "all"}`, intervalMs: 3000, continues,
+  ...(threadId === undefined ? {} : { threadParams: { message_thread_id: threadId } }),
+});
+
+test("Typing machine starts with one action and an interval, and refuses a missing chat", () => {
+  const started = runTypingMachine([typingStart(1, 7)]);
+  assert.equal(started.result, true);
+  assert.deepEqual(started.effects, [
+    { type: "send", loopId: 1, sendId: 1, chatId: 42, threadParams: { message_thread_id: 7 } },
+    { type: "armInterval", intervalMs: 3000 },
+  ]);
+  const refused = runTypingMachine([{ ...typingStart(1), chatId: 0 }]);
+  assert.equal(refused.result, false);
+  assert.deepEqual(refused.effects, []);
+  assert.equal(refused.state.loop, null);
+});
+
+test("Typing machine replaces callbacks on every start but sends at once only for a new target", () => {
+  const same = runTypingMachine([typingStart(1, 7), typingStart(2, 7)]);
+  assert.equal(same.result, false, "A same-target start tells the caller it does not own the loop");
+  assert.deepEqual(same.effects.slice(2), [{ type: "loopEnded", loopId: 1 }]);
+  assert.equal(same.state.loop?.id, 2);
+  assert.equal(same.state.inFlight, null, "The replaced loop's action no longer blocks the next tick");
+  const moved = runTypingMachine([typingStart(1, 7), { type: "sendSettled", sendId: 1 }, typingStart(2, 9)]);
+  assert.equal(moved.result, true);
+  assert.deepEqual(moved.effects.slice(2), [
+    { type: "loopEnded", loopId: 1 },
+    { type: "send", loopId: 2, sendId: 2, chatId: 42, threadParams: { message_thread_id: 9 } },
+  ], "A running interval keeps its phase; no second interval is armed");
+});
+
+test("Typing machine skips ticks while an action is in flight and ignores stale settlements", () => {
+  const busy = runTypingMachine([typingStart(1), { type: "ticked", continues: true }]);
+  assert.equal(busy.effects.filter((effect) => effect.type === "send").length, 1);
+  const stale = runTypingMachine([typingStart(1), typingStart(2, 9), { type: "sendSettled", sendId: 1 }]);
+  assert.equal(stale.state.inFlight, 2, "The replaced loop's late settlement cannot clear the new action");
+  const next = runTypingMachine([typingStart(1), { type: "sendSettled", sendId: 1 }, { type: "ticked", continues: true }]);
+  assert.deepEqual(next.effects.at(-1), { type: "send", loopId: 1, sendId: 2, chatId: 42 });
+});
+
+test("Typing machine ends the loop when its caller stops continuing or stop is requested", () => {
+  const lost = runTypingMachine([typingStart(1), { type: "sendSettled", sendId: 1 }, { type: "ticked", continues: false }]);
+  assert.deepEqual(lost.effects.slice(2), [{ type: "cancelInterval" }, { type: "loopEnded", loopId: 1 }]);
+  assert.equal(lost.state.loop, null);
+  const stopped = runTypingMachine([typingStart(1), { type: "stopRequested" }]);
+  assert.equal(stopped.result, true);
+  assert.equal(stopped.state.inFlight, null);
+  assert.equal(runTypingMachine([{ type: "stopRequested" }]).result, false);
+  const quiet = runTypingMachine([typingStart(1, undefined, false)]);
+  assert.deepEqual(quiet.effects, [{ type: "armInterval", intervalMs: 3000 }],
+    "A fresh loop whose caller already stopped arms its interval and ends on the first tick");
 });
 
 test("Abort handler setter and agent-end resetter bind runtime cleanup", () => {
@@ -432,6 +507,49 @@ test("Typing loop starter sends one exact thread action", async () => {
 
   assert.deepEqual(actions, ["thread:8:44"]);
   assert.equal(runtime.typing.stop(), true);
+});
+
+for (const threaded of [false, true]) {
+  test(`Prompt dispatch starts typing in its exact queued destination (threaded=${threaded})`, async () => {
+    const runtime = Runtime.createTelegramBridgeRuntime();
+    const calls: Array<{ chatId: number; threadId?: number }> = [];
+    const prompt = Runtime.createTelegramPromptDispatchRuntime({ lifecycle: runtime.lifecycle, typing: runtime.typing,
+      getDefaultChatId: () => 7, isThreadedMode: () => threaded,
+      sendTypingAction: async (chatId, options) => { calls.push({ chatId, threadId: options?.message_thread_id }); }, updateStatus() {} });
+    const target = threaded ? { chatId: 7, threadId: 42 } : { chatId: 7 };
+    try {
+      prompt.onPromptDispatchStart({}, 7, target); await flushMicrotasks();
+      assert.equal(runtime.lifecycle.hasDispatchPending(), true);
+      assert.deepEqual(calls, [{ chatId: target.chatId, threadId: target.threadId }]);
+    } finally { runtime.typing.stop(); }
+  });
+}
+
+for (const threadId of [undefined, 0, -1, 1.5, NaN]) {
+  test(`Threaded typing refuses an unavailable or invalid Thread before starting (thread=${threadId})`, async () => {
+    const typing = Runtime.createTelegramTypingLoop(); let calls = 0;
+    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7, isThreadedMode: () => true,
+      sendTypingAction: async () => { calls++; }, updateStatus() {} });
+    try {
+      assert.equal(start({}, 7, { target: { chatId: 7, ...(threadId === undefined ? {} : { threadId }) } }), false);
+      await flushMicrotasks(); assert.equal(calls, 0); assert.equal(typing.stop(), false);
+    } finally { typing.stop(); }
+  });
+}
+
+test("A Classic typing loop stops when Threaded Mode activates, without replacing a valid Thread loop", async (ctx) => {
+  ctx.mock.timers.enable({ apis: ["setInterval"] });
+  const typing = Runtime.createTelegramTypingLoop(); let threaded = false;
+  const calls: Array<{ chatId: number; threadId?: number }> = [];
+  const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7, isThreadedMode: () => threaded,
+    sendTypingAction: async (chatId, options) => { calls.push({ chatId, threadId: options?.message_thread_id }); }, updateStatus() {} });
+  try {
+    assert.equal(start({}), true); await flushMicrotasks(); assert.deepEqual(calls, [{ chatId: 7, threadId: undefined }]);
+    threaded = true; ctx.mock.timers.tick(3000); await flushMicrotasks(); assert.equal(calls.length, 1); assert.equal(typing.stop(), false);
+    assert.equal(start({}, 7, { target: { chatId: 7, threadId: 42 } }), true); await flushMicrotasks();
+    assert.equal(start({}, 7), false); ctx.mock.timers.tick(3000); await flushMicrotasks();
+    assert.deepEqual(calls.slice(1), [{ chatId: 7, threadId: 42 }, { chatId: 7, threadId: 42 }]);
+  } finally { typing.stop(); }
 });
 
 test("Typing loop skips interval ticks while the previous action is in flight", async (ctx) => {
@@ -764,6 +882,96 @@ test("Typing loop fences late failures across transport authority generations", 
   assert.deepEqual(calls, [7, 8]);
   assert.equal(runtime.typing.stop(), true);
 });
+
+for (const threaded of [false, true]) {
+  test(`Stale context cannot start or replace current typing with the same transport epoch (threaded=${threaded})`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const typing = Runtime.createTelegramTypingLoop(), current = {}, stale = {}, calls: number[] = [];
+    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+      isThreadedMode: () => threaded, getTransportAuthority: () => "unchanged", isContextActive: ctx => ctx === current,
+      sendTypingAction: async (_chat, options) => { calls.push(options?.message_thread_id ?? 0); }, updateStatus() {} });
+    try {
+      assert.equal(start(stale, 7, { target: { chatId: 7, ...(threaded ? { threadId: 41 } : {}) } }), false);
+      await flushMicrotasks(); assert.deepEqual(calls, []); assert.equal(typing.stop(), false);
+      assert.equal(start(current, 7, { target: { chatId: 7, ...(threaded ? { threadId: 42 } : {}) } }), true);
+      await flushMicrotasks();
+      assert.equal(start(stale, 7, { target: { chatId: 7, ...(threaded ? { threadId: 43 } : {}) } }), false);
+      t.mock.timers.tick(3000); await flushMicrotasks();
+      assert.deepEqual(calls, threaded ? [42, 42] : [0, 0]);
+    } finally { typing.stop(); }
+  });
+}
+
+for (const pending of [false, true]) {
+  test(`Typing stops after context loss under the same transport epoch (pending=${pending})`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const typing = Runtime.createTelegramTypingLoop(); let active = true, calls = 0;
+    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+      isThreadedMode: () => true, getTransportAuthority: () => "unchanged", isContextActive: () => active,
+      sendTypingAction: async () => { calls++; if (pending) await new Promise(() => {}); }, updateStatus() {} });
+    try {
+      assert.equal(start({}, 7, { target: { chatId: 7, threadId: 42 } }), true); await flushMicrotasks();
+      active = false; t.mock.timers.tick(6000); await flushMicrotasks();
+      assert.equal(calls, 1); assert.equal(typing.stop(), false);
+    } finally { typing.stop(); }
+  });
+}
+
+for (const pending of [false, true]) {
+  test(`Typing captures session generation across reused context and late old failure (pending=${pending})`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const typing = Runtime.createTelegramTypingLoop(), ctx = {}, calls: number[] = [], failures: unknown[] = [];
+    let generation = 1, rejectOld: ((error: Error) => void) | undefined;
+    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+      isThreadedMode: () => true, getTransportAuthority: () => "unchanged", isContextActive: () => true,
+      getSessionGeneration: () => generation,
+      sendTypingAction: async (_chat, options) => { const threadId = options?.message_thread_id ?? 0; calls.push(threadId);
+        if (pending && threadId === 41) await new Promise((_resolve, reject) => { rejectOld = reject; }); },
+      recordRuntimeEvent(_category, error) { failures.push(error); }, updateStatus() {} });
+    try {
+      assert.equal(start(ctx, 7, { target: { chatId: 7, threadId: 41 } }), true); await flushMicrotasks();
+      generation++; t.mock.timers.tick(3000); await flushMicrotasks(); assert.deepEqual(calls, [41]); assert.equal(typing.stop(), false);
+      assert.equal(start(ctx, 7, { target: { chatId: 7, threadId: 42 } }), true); await flushMicrotasks();
+      rejectOld?.(new Error("old context failure")); await flushMicrotasks();
+      t.mock.timers.tick(3000); await flushMicrotasks(); assert.deepEqual(calls, [41, 42, 42]); assert.deepEqual(failures, []);
+    } finally { typing.stop(); }
+  });
+}
+
+for (const replace of [false, true]) test(`Context loss before the scheduled first action refuses sending (replacement=${replace})`, async () => {
+  const typing = Runtime.createTelegramTypingLoop(), old = {}, replacement = {}, calls: number[] = [];
+  let current = old;
+  const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+    isContextActive: ctx => ctx === current, getTransportAuthority: () => "unchanged", isThreadedMode: () => true,
+    sendTypingAction: async (_chat, options) => { calls.push(options?.message_thread_id ?? 0); }, updateStatus() {} });
+  try {
+    start(old, 7, { target: { chatId: 7, threadId: 41 } });
+    current = replacement;
+    if (replace) start(replacement, 7, { target: { chatId: 7, threadId: 42 } });
+    await flushMicrotasks(); assert.deepEqual(calls, replace ? [42] : []); assert.equal(typing.stop(), replace);
+  } finally { typing.stop(); }
+});
+
+for (const end of ["stop", "same-target-replacement"] as const) {
+  test(`Typing transport guard cannot outlive its loop with unchanged context and epoch (${end})`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const typing = Runtime.createTelegramTypingLoop(), ctx = {}, guards: Array<() => void> = [], failures: unknown[] = [];
+    let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+      isContextActive: value => value === ctx, getSessionGeneration: () => 1, getTransportAuthority: () => "unchanged", isThreadedMode: () => true,
+      async sendTypingAction(_chat, options) { guards.push(options!.assertAuthority!); if (guards.length === 1) await held; options!.assertAuthority!(); },
+      recordRuntimeEvent(_category, error) { failures.push(error); }, updateStatus() {} });
+    try {
+      start(ctx, 7, { target: { chatId: 7, threadId: 42 } }); await flushMicrotasks();
+      if (end === "stop") typing.stop(); else start(ctx, 7, { target: { chatId: 7, threadId: 42 } });
+      assert.throws(guards[0], /Typing context authority changed/); release(); await flushMicrotasks();
+      t.mock.timers.tick(3000); await flushMicrotasks(); assert.deepEqual(failures, []);
+      assert.equal(guards.length, end === "stop" ? 1 : 2);
+      if (end !== "stop") assert.doesNotThrow(guards[1]);
+      assert.equal(typing.stop(), end !== "stop");
+    } finally { release(); typing.stop(); }
+  });
+}
 
 test("Typing loop ignores late failures from a replaced session context", async () => {
   const runtime = Runtime.createTelegramBridgeRuntime();

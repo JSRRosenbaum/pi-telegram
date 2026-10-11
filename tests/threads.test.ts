@@ -634,6 +634,46 @@ for (const role of ["leader", "follower"] as const) {
 }
 
 for (const layout of ["standalone", "consolidated"] as const) {
+  for (const cleanup of ["confirmed", "failed", "unknown", "deferred"] as const) {
+    test(`Pre-dispatch input and cleanup have independent durable grants (${layout}, ${cleanup})`, async () => {
+      await withLiveRebindStoreFixture("leader", layout, async f => {
+        assert.equal(await f.store.commitLiveRebind(f.request, recipient("follower"), f.auth, { holdInput: true }), undefined);
+        let row = (await f.store.commitLiveRebind(f.request, recipient("leader"), f.auth, { holdInput: true }))!;
+        assert.equal(row.inputRelease, "held");
+        assert.equal(f.store.advanceLiveRebind(row, "issue-input", f.auth), undefined);
+        row = f.store.advanceLiveRebind(row, "release", f.auth)!;
+        if (cleanup !== "deferred") {
+          row = f.store.advanceLiveRebind(row, "issue-cleanup", f.auth)!;
+          assert.deepEqual(f.threads.listProtectedLiveRebindTargets(), [f.request.binding.target], "In-flight issuance protects against unrelated cleanup even before a result can be recorded");
+          assert.equal(f.store.advanceLiveRebind(row, "issue-input", f.auth), undefined, "Issued delete has no terminal decision");
+          row = f.store.advanceLiveRebind(row, cleanup, f.auth)!;
+          assert.equal(row.phase, "finished"); assert.equal(row.inputRelease, "held");
+          assert.deepEqual(f.open().listLiveRebindings(), [row], "Terminal cleanup is not input completion");
+        }
+        const issued = f.store.advanceLiveRebind(row, "issue-input", f.auth)!;
+        assert.equal(issued.inputRelease, "issued");
+        assert.equal(f.store.advanceLiveRebind(issued, "issue-input", f.auth), undefined, "Input issuance is one-shot too");
+        row = f.store.advanceLiveRebind(issued, "accept-input", f.auth)!;
+        assert.equal(row.inputRelease, "accepted");
+        assert.deepEqual(f.open().listLiveRebindings(), [row]);
+        const cold = createTelegramTopicTargetStore({ path: f.path, telegramProfile: "default",
+          ...(layout === "consolidated" ? { consolidated: { captureAuthority: () => undefined, publishIfOwned: () => ({ committed: false as const }) } } : {}) });
+        const protectedTargets = cleanup === "unknown" ? [f.request.binding.target] : [];
+        assert.deepEqual(cold.listProtectedLiveRebindTargets(), protectedTargets, "Protection reads canonical state without warm loading");
+        assert.equal(cold.hasPreDispatchRebindEvidence(), true);
+        const protect = createTelegramCleanupTargetProtection(cold);
+        const action = { kind: "close-delete-unbound-topic", target: f.request.binding.target } as Parameters<typeof protect>[1];
+        assert.equal(protect(f.request.binding.target, action), cleanup === "unknown");
+        assert.equal(protect(f.request.target, action), false, "Old-target uncertainty does not block the confirmed new target");
+        if (cleanup === "unknown") {
+          const before = await readFile(f.path, "utf8");
+          assert.equal(f.threads.upsertWorkspaceBinding({ ...f.request.binding, target: f.request.binding.target }), undefined);
+          assert.equal(await readFile(f.path, "utf8"), before);
+          assert.equal(f.store.advanceLiveRebind(row, "issue-cleanup", f.auth), undefined);
+        }
+      });
+    });
+  }
   test(`Finished live cleanup leaves the strict temporary-tab cleanup gate unchanged (${layout})`, async () => {
     await withLiveRebindStoreFixture("leader", layout, async f => {
       let live = (await f.store.commitLiveRebind(f.request, recipient("leader"), f.auth))!;
@@ -2764,6 +2804,16 @@ test("Workspace journal keys accumulate while legacy completeness cannot be inve
     store.upsertWorkspaceBinding(legacy);
     store.upsertWorkspaceBinding({ ...legacy, journalBindingKeys: ["manual:current"],
       journalBindingsComplete: true, updatedAtMs: 2 });
+    for (const complete of [undefined, true] as const) {
+      const cwd = complete ? "/known-rekey" : "/unknown-rekey";
+      const target = { chatId: 7, threadId: complete ? 43 : 44 }, slot = complete ? "C" : "D";
+      store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity(cwd, 0, "before")!, target, slot,
+        journalBindingKeys: ["manual:retained"], journalBindingsComplete: complete, updatedAtMs: 1,
+        journalSources: [{ sessionId: "before", recipientBindingKey: "manual:retained" }] });
+      assert.ok(store.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity(cwd, 0, "after")!, target, slot,
+        journalBindingKeys: ["manual:retained", "manual:new"], journalBindingsComplete: true, updatedAtMs: 2,
+        journalSources: [{ sessionId: "after", recipientBindingKey: "manual:new" }] }));
+    }
     await store.persist();
     const restored = createTelegramTopicTargetStore({ path });
     await restored.load();
@@ -2773,6 +2823,15 @@ test("Workspace journal keys accumulate while legacy completeness cannot be inve
     assert.deepEqual(restored.getWorkspaceBinding("/legacy")?.journalBindingKeys,
       ["manual:current"]);
     assert.equal(restored.getWorkspaceBinding("/legacy")?.journalBindingsComplete, undefined);
+    for (const complete of [undefined, true] as const) {
+      const cwd = complete ? "/known-rekey" : "/unknown-rekey";
+      const binding = restored.getWorkspaceBinding(cwd, "a", "after")!; assert.ok(binding);
+      assert.equal(restored.getWorkspaceBinding(cwd, "a", "before"), undefined);
+      assert.deepEqual(binding.journalBindingKeys, ["manual:retained", "manual:new"]);
+      assert.deepEqual(binding.journalSources, [{ sessionId: "before", recipientBindingKey: "manual:retained" },
+        { sessionId: "after", recipientBindingKey: "manual:new" }]);
+      assert.equal(binding.journalBindingsComplete, complete, "Rekey cannot turn unknown retained coverage into a completeness proof");
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

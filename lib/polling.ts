@@ -1366,6 +1366,8 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
   return {
     start(ctx) {
       stop();
+      // Disabled-mode confirmation counts consecutive probes of one run, never observations from before a restart.
+      consecutiveDisabledProbes = 0;
       const expectedGeneration = generation;
       interval = setInterval(() => {
         if (generation !== expectedGeneration) return;

@@ -540,7 +540,22 @@ function parseTelegramApiTargetInteger(value: unknown): number | undefined {
     : undefined;
 }
 
-export function createTelegramApiTargetActivityRuntime(): TelegramApiTargetActivityRuntime {
+/** Optional drain hints are not transport outcomes or request authority. */
+function captureApiDrainObserver(capture?: () => (() => void) | undefined): () => void {
+  try {
+    const notify = capture?.();
+    return () => {
+      try {
+        const emitted: unknown = notify?.();
+        if (emitted) void Promise.resolve(emitted).catch(() => undefined);
+      } catch { /* Observer failure is inert. */ }
+    };
+  } catch { return () => {}; }
+}
+
+export function createTelegramApiTargetActivityRuntime(deps: {
+  captureDrain?: () => (() => void) | undefined;
+} = {}): TelegramApiTargetActivityRuntime {
   const pending = new Map<
     string,
     {
@@ -580,18 +595,19 @@ export function createTelegramApiTargetActivityRuntime(): TelegramApiTargetActiv
       } else {
         pendingChats.set(chatId, (pendingChats.get(chatId) ?? 0) + 1);
       }
+      const notifyDrained = captureApiDrainObserver(deps.captureDrain);
       let completed = false;
       return () => {
         if (completed) return;
         completed = true;
         if (!key) {
           const count = pendingChats.get(chatId);
-          if (!count || count <= 1) pendingChats.delete(chatId);
+          if (!count || count <= 1) { pendingChats.delete(chatId); notifyDrained(); }
           else pendingChats.set(chatId, count - 1);
           return;
         }
         const current = pending.get(key);
-        if (!current || current.count <= 1) pending.delete(key);
+        if (!current || current.count <= 1) { pending.delete(key); notifyDrained(); }
         else current.count -= 1;
       };
     },
@@ -824,6 +840,11 @@ export interface TelegramBridgeApiRuntimeDeps {
   chatActionMaxGates?: number;
 }
 
+/** Typing issuance guard is local authority, never Bot API body or IPC data. */
+export interface TelegramTypingActionOptions extends Pick<TelegramApiCallOptions, "assertAuthority"> {
+  message_thread_id?: number;
+}
+
 export interface TelegramBridgeApiRuntime extends Pick<
   TelegramApiClient,
   "call" | "callMultipart"
@@ -849,7 +870,7 @@ export interface TelegramBridgeApiRuntime extends Pick<
   ) => Promise<boolean>;
   sendTypingAction: (
     chatId: number,
-    options?: { message_thread_id?: number },
+    options?: TelegramTypingActionOptions,
   ) => Promise<unknown>;
   sendRecordVoiceAction: (
     chatId: number,
@@ -1874,12 +1895,12 @@ export function createTelegramChatActionSender<TAction extends string>(
   sendChatAction: (
     chatId: number,
     action: TAction,
-    options?: { message_thread_id?: number },
+    options?: TelegramTypingActionOptions,
   ) => Promise<unknown>,
   action: TAction,
 ): (
   chatId: number,
-  options?: { message_thread_id?: number },
+  options?: TelegramTypingActionOptions,
 ) => Promise<unknown> {
   return (chatId, options) => sendChatAction(chatId, action, options);
 }
@@ -1958,6 +1979,7 @@ export type TelegramWorkspaceThreadDeletionTransport = (
 export function createDefaultTelegramBridgeApiRuntime(deps: {
   getBotToken: () => string | undefined;
   getBotScope?: () => string | undefined;
+  isThreadedMode?: () => boolean;
   recordRuntimeEvent: TelegramBridgeApiRuntimeDeps["recordRuntimeEvent"];
   captureRequestErrorHandler?: TelegramBridgeApiRuntimeDeps["captureRequestErrorHandler"];
   targetActivity?: TelegramApiTargetActivityRuntime;
@@ -1969,6 +1991,7 @@ export function createDefaultTelegramBridgeApiRuntime(deps: {
 } {
   const client = createTelegramApiClient(deps.getBotToken, {
     recordRuntimeEvent: deps.recordRuntimeEvent,
+    isThreadedMode: deps.isThreadedMode,
   });
   const admittedClient = deps.workspaceAdmission
     ? createTelegramApiWorkspaceAdmissionClient(
@@ -2114,6 +2137,8 @@ export function createTelegramBridgeApiRuntime(
         .then(() =>
           deps.client.call<TResponse>(method, body, {
             ...options,
+            // Presence is replaceable, not a queued body to replay after its session/loop owner ends.
+            ...(body.action === "typing" ? { maxAttempts: 1, retrySafety: "non-idempotent" as const } : {}),
             retryRateLimit: false,
           }),
         )
@@ -2270,7 +2295,7 @@ export function createTelegramBridgeApiRuntime(
           ...(options?.message_thread_id !== undefined
             ? { message_thread_id: options.message_thread_id }
             : {}),
-        }),
+        }, { assertAuthority: options?.assertAuthority }),
       "typing",
     ),
     sendRecordVoiceAction: createTelegramChatActionSender(
@@ -2405,10 +2430,34 @@ export function createTelegramBridgeApiRuntime(
  */
 export function createTelegramApiClient(
   getBotToken: () => string | undefined,
-  options: TelegramAnswerCallbackQueryOptions & { now?: () => number } = {},
+  options: TelegramAnswerCallbackQueryOptions & { now?: () => number; isThreadedMode?: () => boolean } = {},
 ): TelegramApiClient {
   const now = options.now ?? Date.now;
   const recordRuntimeEvent = options.recordRuntimeEvent;
+  const isThreadedMode = options.isThreadedMode;
+  const fenceOutput = (
+    method: string,
+    body: Record<string, unknown>,
+    callOptions?: TelegramApiCallOptions,
+  ): TelegramApiCallOptions | undefined => {
+    if (!isThreadedMode || !/^(send[A-Z]|copyMessages?$|forwardMessages?$)/.test(method)) return callOptions;
+    const assertAuthority = () => {
+      const chatId = typeof body.chat_id === "number" || typeof body.chat_id === "string"
+        ? Number(body.chat_id) : undefined;
+      const thread = body.message_thread_id;
+      const threadId = typeof thread === "number" || (typeof thread === "string" && /^[1-9][0-9]*$/.test(thread))
+        ? Number(thread) : undefined;
+      // Business connections and channels are distinct from the bot's private-chat All namespace.
+      if (
+        isThreadedMode() && chatId !== undefined && Number.isSafeInteger(chatId) && chatId > 0 &&
+        !(typeof body.business_connection_id === "string" && body.business_connection_id.length > 0) &&
+        (threadId === undefined || !Number.isSafeInteger(threadId) || threadId <= 0)
+      ) throw new Error("Telegram All is input-only in Threaded Mode; an explicit Thread target is required.");
+      callOptions?.assertAuthority?.();
+    };
+    assertAuthority();
+    return { ...callOptions, assertAuthority };
+  };
   const draftRetryNotBeforeByTarget = new Map<string, number>();
   return {
     call: async <TResponse>(
@@ -2416,6 +2465,8 @@ export function createTelegramApiClient(
       body: Record<string, unknown>,
       options?: TelegramApiCallOptions,
     ): Promise<TResponse> => {
+      body = { ...body };
+      options = fenceOutput(method, body, options);
       const token = getBotToken();
       // Cooldown keys retain only the public bot-id prefix, not the credential.
       const botId = token?.match(/^(\d+):/)?.[1];
@@ -2486,6 +2537,8 @@ export function createTelegramApiClient(
       fileName,
       options,
     ) => {
+      fields = { ...fields };
+      options = fenceOutput(method, fields, options);
       return callTelegramMultipart(
         getBotToken(),
         method,

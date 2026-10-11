@@ -12,8 +12,10 @@ import { TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_SELE
 import type { TelegramConfigStore, TelegramThreadDisplayMode } from "./config.ts";
 import { type TelegramUpdateJournalStoreOptions } from "./journal.ts";
 import { type TelegramLockEntry, type TelegramLockState } from "./locks.ts";
+import * as Machine from "./machine.ts";
 import type { TelegramQueueHandoffStageResult } from "./queue.ts";
 import { type TelegramTarget } from "./target.ts";
+import { type TelegramApiCallOptions } from "./telegram-api.ts";
 import * as Threads from "./threads.ts";
 import { type TelegramWorkspaceAdmissionLedger } from "./workspace-admission.ts";
 export declare const TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS = 8000;
@@ -343,7 +345,9 @@ export declare function createTelegramBusFollowerWorkspaceRestoreHandler<TContex
         expectedTarget?: TelegramTarget & {
             threadId: number;
         };
-        release?: (canRelease: () => boolean) => void;
+        release?: (canRelease: () => boolean, target: TelegramTarget & {
+            threadId: number;
+        }) => void;
         observeWork?: (oldTarget: TelegramTarget & {
             threadId: number;
         }) => void;
@@ -362,7 +366,7 @@ export declare function createTelegramBusFollowerWorkspaceRestoreHandler<TContex
 };
 export declare function createTelegramBusFollowerClientRuntime<TContext, TReactionUpdate, TCallbackQuery, TMessage = unknown>(deps: TelegramBusFollowerClientRuntimeDeps<TMessage>): {
     createRequestId: () => string;
-    callApi: (method: string, args: unknown[]) => Promise<unknown>;
+    callApi: (method: string, args: unknown[], localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown>;
     agentMessages: {
         resolveTarget: (selector: TelegramBusAgentTargetSelector) => Promise<TelegramTarget & {
             threadId: number;
@@ -414,7 +418,7 @@ export declare function createTelegramBusFollowerSelectedMenuCaller<TContext>(de
     effect: TelegramBusSelectedMenuTextEffect;
     assertAuthority: () => void;
 }) => Promise<TelegramBusSelectedMenuDeliveryObservation>;
-export declare function createTelegramBusFollowerApiCaller(deps: TelegramBusFollowerApiCallerDeps): (method: string, args: unknown[]) => Promise<unknown>;
+export declare function createTelegramBusFollowerApiCaller(deps: TelegramBusFollowerApiCallerDeps): (method: string, args: unknown[], localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown>;
 export declare function createTelegramBusFollowerSessionReplacementSuspender(deps: TelegramBusFollowerSessionReplacementSuspenderDeps): (preserveTarget?: boolean) => Promise<void>;
 export declare function createTelegramBusFollowerSessionRefreshHook<TContext>(deps: TelegramBusFollowerSessionRefreshHookDeps<TContext>): (_event: unknown, ctx: TContext) => Promise<void>;
 export declare function createTelegramBusFollowerControlState(): TelegramBusFollowerControlState;
@@ -426,6 +430,48 @@ export type TelegramBusFollowerHeartbeatRecoveryHandler<TContext> = ((error: unk
     halt: () => void;
     resume: () => void;
 };
+/** The whole recovery lifecycle state; only `transitionTelegramBusFollowerRecovery` produces a new one. */
+export interface TelegramBusFollowerRecoveryState {
+    /** Bumped by halt and resume, so a recovery or retry from before an operator stop or connect is inert. */
+    readonly epoch: number;
+    readonly halted: boolean;
+    /** One recovery runs at a time; it belongs to the epoch it started in. */
+    readonly recovering: boolean;
+    readonly retryId: number | null;
+    readonly nextRetryId: number;
+}
+export type TelegramBusFollowerRecoveryEvent = {
+    type: "recoverRequested";
+} | {
+    type: "recoverySettled";
+    epoch: number;
+} | {
+    type: "retryRequested";
+    epoch: number;
+} | {
+    type: "retryFired";
+    retryId: number;
+} | {
+    type: "halted";
+} | {
+    type: "resumed";
+};
+export type TelegramBusFollowerRecoveryEffect = {
+    type: "runRecovery";
+    epoch: number;
+} | {
+    type: "armRetry";
+    retryId: number;
+} | {
+    type: "cancelRetry";
+    retryId: number;
+};
+export declare function createTelegramBusFollowerRecoveryState(): TelegramBusFollowerRecoveryState;
+/**
+ * Pure follower-recovery lifecycle. An operator stop halts it and a connect resumes it, each in a new epoch: work
+ * from the old epoch, a recovery still awaiting or a retry still armed, can no longer register or promote.
+ */
+export declare function transitionTelegramBusFollowerRecovery(state: TelegramBusFollowerRecoveryState, event: TelegramBusFollowerRecoveryEvent): Machine.TelegramMachineStep<TelegramBusFollowerRecoveryState, TelegramBusFollowerRecoveryEffect>;
 export declare function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(deps: TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext>): TelegramBusFollowerHeartbeatRecoveryHandler<TContext>;
 export declare function createTelegramBusFollowerRegistrationRuntime<TContext extends {
     cwd?: string;

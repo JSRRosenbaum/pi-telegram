@@ -349,6 +349,10 @@ export type TelegramWorkspaceLiveRebindIntent = Pick<
   | "updatedAtMs"
 > & {
   kind: "live-rebind";
+  /** Versioned native input gate: terminal cleanup does not itself authorize or settle input. */
+  inputRelease?: "held" | "issued" | "accepted";
+  /** A session-replacing producer must not drop earlier old-target protection or carry its delete grant forward. */
+  oldTargetProtected?: true;
   recipient: TelegramWorkspaceRestoreRecipient;
 } & (
     | { phase: "rebound"; cleanup?: never }
@@ -418,6 +422,7 @@ export interface TelegramWorkspaceRestore {
     request: TelegramWorkspaceRestoreRequest,
     recipient: TelegramWorkspaceRestoreRecipient,
     authority: TelegramWorkspaceRestoreAuthority,
+    options?: { holdInput: true },
   ): Promise<TelegramWorkspaceLiveRebindIntent | undefined>;
   /** Caller proves local apply for release or current live clearance for cleanup; unknown issuance never repeats. */
   advanceLiveRebind(
@@ -425,6 +430,9 @@ export interface TelegramWorkspaceRestore {
     step:
       | "release"
       | "issue-cleanup"
+      | "issue-input"
+      | "accept-input"
+      | "protect-old-target"
       | Extract<
           TelegramWorkspaceLiveRebindIntent,
           { phase: "finished" }
@@ -501,11 +509,15 @@ export interface TelegramWorkspaceRestore {
     expected: TelegramTemporaryThreadEntry,
     authority: TelegramWorkspaceRestoreAuthority,
   ): boolean;
-  /** Publishes `creating` before the caller's single creation request; an existing source entry is returned, never recreated. */
+  /**
+   * Publishes `creating` before the caller's single creation request; an existing source entry is returned, never
+   * recreated. `group` records an album as the tab's one creating input; it must start at the source update.
+   */
   reserveTemporaryThread(
     source: TelegramTemporaryThreadEntry["source"],
     token: string,
     authority: TelegramWorkspaceRestoreAuthority,
+    group?: TelegramTemporaryThreadInput,
   ): { reserved: boolean; entry: TelegramTemporaryThreadEntry } | undefined;
   /** Caller proves a fresh owner-authenticated implicit Telegram creation and exact live source under profile admission.
    * Registers that observed unbound target without issuing or fabricating a Bot API creation. */
@@ -745,6 +757,8 @@ export interface TelegramTopicTargetStore {
     ) => undefined,
   ) => void;
   /** Current live-origin ownership veto; effect callers still require Workspace admission. False is not work/recipient/deletion authority. */
+  hasPreDispatchRebindEvidence: () => boolean;
+  listProtectedLiveRebindTargets: () => TelegramTarget[];
   isWorkspaceLiveRebindCleanupTargetProtected: (
     expected: TelegramWorkspaceLiveRebindIntent,
   ) => boolean;
@@ -948,6 +962,7 @@ export function createTelegramCleanupTargetProtection(
         | "listPendingProvisions"
         | "listPendingCleanups"
         | "listTemporaryThreadTargets"
+        | "listProtectedLiveRebindTargets"
       >
     >,
   departingRecord?: TelegramTopicTargetRecord,
@@ -966,6 +981,9 @@ export function createTelegramCleanupTargetProtection(
       JSON.parse(JSON.stringify(right)),
     );
   return (target, action) => {
+    try {
+      if (store.listProtectedLiveRebindTargets?.().some(candidate => targetMatches(candidate, target))) return true;
+    } catch { return true; }
     // A source-bound temporary tab is removed only by its own Forward/Cancel, never by generic reconciliation.
     if (store.listTemporaryThreadTargets) {
       try {
@@ -2366,6 +2384,8 @@ function isWorkspaceLiveRebindIntent(
       "recipient",
       "phase",
       "cleanup",
+      "inputRelease",
+      "oldTargetProtected",
     ]) ||
     value.kind !== "live-rebind" ||
     !isTelegramWorkspaceRestoreRequest(value.request) ||
@@ -2383,6 +2403,11 @@ function isWorkspaceLiveRebindIntent(
       (value.request.owner.owner?.kind === "leader" ? "leader" : "follower")
   )
     return false;
+  if (value.inputRelease !== undefined &&
+    (!["held", "issued", "accepted"].includes(value.inputRelease as string) ||
+      (value.inputRelease !== "held" && !["released", "finished"].includes(value.phase as string)))) return false;
+  if (value.oldTargetProtected !== undefined &&
+    (value.oldTargetProtected !== true || value.inputRelease === undefined || value.phase !== "finished" || value.cleanup !== "not-issued")) return false;
   if (value.phase === "rebound") return value.cleanup === undefined;
   if (value.phase === "released")
     return value.cleanup === undefined || value.cleanup === "issued";
@@ -2675,13 +2700,37 @@ function conflictsWithWorkspaceRestoreProvision(
   );
 }
 
+/** Canonical issuance is distinct from cleanup completion, source disposition and peer dispatch readiness. */
+export function isTelegramLiveRebindInputAuthorized(value: TelegramWorkspaceLiveRebindIntent): boolean {
+  return value.inputRelease === undefined
+    ? value.phase === "released" && value.cleanup === undefined
+    : ["issued", "accepted"].includes(value.inputRelease) &&
+      ["released", "finished"].includes(value.phase) && value.cleanup !== "issued";
+}
+function liveRebindInputPending(value: TelegramWorkspaceLiveRebindIntent): boolean {
+  return value.inputRelease !== undefined && value.inputRelease !== "accepted";
+}
+function liveRebindActive(value: TelegramWorkspaceLiveRebindIntent): boolean {
+  return value.phase !== "finished" || liveRebindInputPending(value);
+}
+function liveRebindOldTargetUnknown(value: TelegramWorkspaceLiveRebindIntent): boolean {
+  return value.phase === "finished" && value.cleanup === "unknown" && value.inputRelease !== undefined;
+}
+function retainLiveRebind(value: TelegramWorkspaceLiveRebindIntent): boolean {
+  return liveRebindActive(value) || liveRebindOldTargetUnknown(value) || value.oldTargetProtected === true;
+}
+function protectedLiveRebindOldTargets(snapshot: TelegramWorkspaceRestoreSnapshot | undefined): TelegramTarget[] {
+  return (snapshot?.liveRebindings ?? []).filter(value =>
+    value.oldTargetProtected === true || liveRebindOldTargetUnknown(value) || value.inputRelease !== undefined && value.cleanup === "issued",
+  ).map(value => ({ ...value.request.binding.target }));
+}
 function pendingWorkspaceRelocationRequests(
   snapshot: TelegramWorkspaceRestoreSnapshot | undefined,
 ): TelegramWorkspaceRestoreRequest[] {
   return [
     ...(snapshot?.operations ?? []).map((value) => value.request),
     ...(snapshot?.liveRebindings ?? [])
-      .filter((value) => value.phase !== "finished")
+      .filter(liveRebindActive)
       .map((value) => value.request),
   ];
 }
@@ -2749,7 +2798,7 @@ function assertWorkspaceRestoreBindingProtection(
     );
     const live = file.workspaceRestore?.liveRebindings?.some(
       (value) =>
-        value.phase !== "finished" &&
+        liveRebindActive(value) &&
         value.request.operationId === request.operationId,
     );
     if (
@@ -2767,6 +2816,13 @@ function assertWorkspaceRestoreBindingProtection(
     ) {
       throw new Error("Protected Workspace Restore owner target changed.");
     }
+  }
+  for (const old of protectedLiveRebindOldTargets(file.workspaceRestore)) {
+    if (file.workspaceBindings?.some(value => targetMatches(value.target, old)) ||
+      file.threads?.some(value => targetMatches(value.target, old) && ["active", "starting", "pending", "probe-required"].includes(value.status)) ||
+      file.pendingProvisions?.some(value => !value.target || targetMatches(value.target, old)) ||
+      file.reservations?.some(value => targetMatches(value.target, old)))
+      throw new Error("Unknown live cleanup target remains protected.");
   }
   const operations = [
     ...(file.workspaceRestore?.operations ?? []),
@@ -2875,14 +2931,14 @@ function parseWorkspaceRestore(
           .some(
             (other) =>
               operation.request.operationId === other.request.operationId ||
-              (operation.phase !== "finished" &&
-                other.phase !== "finished" &&
+              (liveRebindActive(operation) &&
+                liveRebindActive(other) &&
                 workspaceRestoresConflict(operation.request, other.request)),
           ) ||
         snapshot.operations.some(
           (other) =>
             operation.request.operationId === other.request.operationId ||
-            (operation.phase !== "finished" &&
+            (liveRebindActive(operation) &&
               workspaceRestoresConflict(operation.request, other.request)),
         ),
     )
@@ -2915,7 +2971,7 @@ function parseWorkspaceRestore(
         !!entry.target &&
         [
           ...snapshot.operations,
-          ...liveOperations.filter((value) => value.phase !== "finished"),
+          ...liveOperations.filter(liveRebindActive),
         ].some(
           ({ request }) =>
             targetMatches(request.binding.target, entry.target!) ||
@@ -4424,9 +4480,7 @@ export function createTelegramTopicTargetStore(
                 ) ||
                 !isDeepStrictEqual(
                   transition.restore.liveRebindings?.slice(0, -1),
-                  (workspaceRestore?.liveRebindings ?? []).filter(
-                    (value) => value.phase !== "finished",
-                  ),
+                  (workspaceRestore?.liveRebindings ?? []).filter(retainLiveRebind),
                 ))
           )
             return false;
@@ -5006,6 +5060,14 @@ export function createTelegramTopicTargetStore(
       )
         throw new Error("Workspace live-rebind observation changed.");
     },
+    hasPreDispatchRebindEvidence() {
+      const file = parseTopicTargetFile(readStoreSnapshot(getPath(), false) ?? { version: 1, records: [] });
+      return file.workspaceRestore?.liveRebindings?.some(value => value.inputRelease !== undefined) === true;
+    },
+    listProtectedLiveRebindTargets() {
+      const file = parseTopicTargetFile(readStoreSnapshot(getPath(), false) ?? { version: 1, records: [] });
+      return protectedLiveRebindOldTargets(file.workspaceRestore);
+    },
     isWorkspaceLiveRebindCleanupTargetProtected(input) {
       try {
         const expected = structuredClone(input),
@@ -5130,8 +5192,8 @@ export function createTelegramTopicTargetStore(
           file.workspaceRestore!.liveRebindings?.some(
             (other) =>
               other.request.operationId !== request.operationId &&
-              other.phase !== "finished" &&
-              touchesOld(other),
+              (liveRebindActive(other) && touchesOld(other) ||
+                (liveRebindOldTargetUnknown(other) || other.oldTargetProtected) && targetMatches(other.request.binding.target, old)),
           )
         )
           return true;
@@ -5357,6 +5419,8 @@ export function createTelegramTopicTargetStore(
           )
             return false;
           const state = read().state;
+          if (protectedLiveRebindOldTargets(state).some(old => targetMatches(old, intent.request.binding.target) || targetMatches(old, intent.request.target)))
+            return false;
           if (
             pendingWorkspaceRelocationRequests(state).some((request) =>
               workspaceRestoresConflict(request, intent.request),
@@ -5369,9 +5433,7 @@ export function createTelegramTopicTargetStore(
             return false;
           if (state.revision === Number.MAX_SAFE_INTEGER)
             throw new Error("Workspace Restore revision exhausted.");
-          const pendingLive = (state.liveRebindings ?? []).filter(
-            (value) => value.phase !== "finished",
-          );
+          const pendingLive = (state.liveRebindings ?? []).filter(retainLiveRebind);
           if ((live ? pendingLive.length : state.operations.length) >= 26)
             throw new Error("Workspace Restore operation capacity reached.");
           const restore: TelegramWorkspaceRestoreSnapshot = {
@@ -5694,7 +5756,7 @@ export function createTelegramTopicTargetStore(
         list: () => structuredClone(storage.read().operations),
         listLiveRebindings: () =>
           structuredClone(storage.read().liveRebindings ?? []),
-        async commitLiveRebind(requestInput, recipientInput, authority) {
+        async commitLiveRebind(requestInput, recipientInput, authority, options) {
           const request = structuredClone(requestInput),
             recipient = structuredClone(recipientInput);
           const executor = structuredClone(authority.executor),
@@ -5715,6 +5777,7 @@ export function createTelegramTopicTargetStore(
             createdAtMs: at,
             updatedAtMs: at,
             phase: "rebound",
+            ...(options?.holdInput ? { inputRelease: "held" as const } : {}),
           };
           if (!current() || !isWorkspaceLiveRebindIntent(intent))
             return undefined;
@@ -5729,7 +5792,8 @@ export function createTelegramTopicTargetStore(
               isDeepStrictEqual(value.request, request) &&
               isDeepStrictEqual(value.recipient, recipient) &&
               isDeepStrictEqual(value.executor, executor) &&
-              value.operatorUserId === operatorUserId
+              value.operatorUserId === operatorUserId &&
+              (value.inputRelease !== undefined) === (options?.holdInput === true)
               ? structuredClone(value)
               : undefined;
           };
@@ -5760,17 +5824,23 @@ export function createTelegramTopicTargetStore(
                 !entry ||
                 !isDeepStrictEqual(entry, expected) ||
                 entry.operatorUserId !== operator ||
-                entry.phase === "finished"
+                (entry.phase === "finished" && step !== "issue-input" && step !== "accept-input")
               )
                 return undefined;
-              const issuing = step === "release" || step === "issue-cleanup";
+              const issuing = step === "release" || step === "issue-cleanup" || step === "issue-input" || step === "accept-input" || step === "protect-old-target";
               if (
                 (issuing || step === "confirmed") &&
                 !isDeepStrictEqual(entry.executor, executor)
               )
                 return undefined;
               let next: TelegramWorkspaceLiveRebindIntent;
-              if (step === "release") {
+              if (step === "issue-input" || step === "accept-input") {
+                if (!["released", "finished"].includes(entry.phase) || entry.cleanup === "issued" || entry.inputRelease !== (step === "issue-input" ? "held" : "issued")) return undefined;
+                next = { ...entry, inputRelease: step === "issue-input" ? "issued" : "accepted" };
+              } else if (step === "protect-old-target") {
+                if (entry.phase !== "released" || entry.cleanup !== undefined || entry.inputRelease !== "held") return undefined;
+                next = { ...entry, phase: "finished", cleanup: "not-issued", oldTargetProtected: true };
+              } else if (step === "release") {
                 if (entry.phase !== "rebound") return undefined;
                 next = { ...entry, phase: "released" };
               } else if (step === "issue-cleanup") {
@@ -6086,8 +6156,20 @@ export function createTelegramTopicTargetStore(
         },
         listTemporaryThreads: () =>
           structuredClone(storage.read().temporaryThreads ?? []),
-        reserveTemporaryThread(sourceInput, token, authority) {
+        reserveTemporaryThread(sourceInput, token, authority, groupInput) {
           const source = structuredClone(sourceInput);
+          const group: TelegramTemporaryThreadInput = groupInput
+            ? structuredClone(groupInput)
+            : {
+                journalBindingKey: source.journalBindingKey,
+                updateIds: [source.updateId],
+              };
+          if (
+            !isTemporaryThreadInput(group) ||
+            group.journalBindingKey !== source.journalBindingKey ||
+            Math.min(...group.updateIds) !== source.updateId
+          )
+            return undefined;
           let reserved = false;
           const entry = mutate<TelegramTemporaryThreadEntry>(
             authority,
@@ -6108,12 +6190,7 @@ export function createTelegramTopicTargetStore(
                 throw new Error("Invalid Workspace Restore clock.");
               const next: TelegramTemporaryThreadEntry = {
                 source,
-                inputs: [
-                  {
-                    journalBindingKey: source.journalBindingKey,
-                    updateIds: [source.updateId],
-                  },
-                ],
+                inputs: [group],
                 operatorUserId: operator,
                 executor,
                 token,
@@ -6131,7 +6208,9 @@ export function createTelegramTopicTargetStore(
                     getTelegramTemporaryThreadInputs(value).some(
                       (input) =>
                         input.journalBindingKey === source.journalBindingKey &&
-                        input.updateIds.includes(source.updateId),
+                        input.updateIds.some((id) =>
+                          group.updateIds.includes(id),
+                        ),
                     ),
                 )
               )
@@ -6659,7 +6738,8 @@ export function createTelegramTopicTargetStore(
         pendingWorkspaceRelocationRequests(workspaceRestore).some((request) =>
           conflictsWithWorkspaceRestoreProvision(request, reservation),
         ) ||
-        conflictsWithTemporaryThread(workspaceRestore, reservation.target)
+        conflictsWithTemporaryThread(workspaceRestore, reservation.target) ||
+        protectedLiveRebindOldTargets(workspaceRestore).some(old => targetMatches(old, reservation.target))
       ) {
         throw new Error("Protected Workspace Restore provisioning conflict.");
       }
@@ -6677,7 +6757,8 @@ export function createTelegramTopicTargetStore(
         pendingWorkspaceRelocationRequests(workspaceRestore).some((request) =>
           conflictsWithWorkspaceRestoreProvision(request, provision),
         ) ||
-        conflictsWithTemporaryThread(workspaceRestore, provision.target)
+        conflictsWithTemporaryThread(workspaceRestore, provision.target) ||
+        protectedLiveRebindOldTargets(workspaceRestore).some(old => !provision.target || targetMatches(old, provision.target))
       ) {
         throw new Error("Protected Workspace Restore provisioning conflict.");
       }
@@ -7692,7 +7773,7 @@ export function createTelegramTopicTargetStore(
       if (workspaceRetirementCommitInFlight) return undefined;
       const next = normalizeWorkspaceBindingRecord(binding);
       if (next && hasWorkspaceRetirementConflict(next)) return undefined;
-      if (!next) return undefined;
+      if (!next || protectedLiveRebindOldTargets(workspaceRestore).some(old => targetMatches(old, next.target))) return undefined;
       const nextMapKey = getWorkspaceBindingMapKey(next);
       let claim = workspaceClaims.get(nextMapKey);
       const replacedTargetBinding = Array.from(workspaceBindings.values()).find(
@@ -7762,18 +7843,21 @@ export function createTelegramTopicTargetStore(
       if (previous?.manualThreadName && !next.manualThreadName) {
         next.manualThreadName = previous.manualThreadName;
       }
-      if (previous) {
+      if (previous || replacedTargetBinding) {
         const journalBindingKeys = Array.from(
           new Set([
-            ...(previous.journalBindingKeys ?? []),
+            ...(previous?.journalBindingKeys ?? []),
+            ...(replacedTargetBinding?.journalBindingKeys ?? []),
             ...(next.journalBindingKeys ?? []),
           ]),
         );
-        if (journalBindingKeys.length || previous.journalBindingsComplete)
+        const retainedComplete =
+          (!previous || previous.journalBindingsComplete === true) &&
+          (!replacedTargetBinding || replacedTargetBinding.journalBindingsComplete === true);
+        if (journalBindingKeys.length || retainedComplete)
           next.journalBindingKeys = journalBindingKeys;
         else delete next.journalBindingKeys;
-        if (previous.journalBindingsComplete)
-          next.journalBindingsComplete = true;
+        if (retainedComplete) next.journalBindingsComplete = true;
         else delete next.journalBindingsComplete;
       }
       if (previous && !targetMatches(previous.target, next.target)) {
