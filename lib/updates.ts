@@ -374,6 +374,8 @@ export interface TelegramForeignOwnedUpdateForwarder<
     message: TMessage;
     ownership: TelegramTargetOwnershipView;
     ctx: TContext;
+    /** Local issuance/ACK fence; implementations must not serialize it into payloads. */
+    assertAuthority?: () => void;
   }) =>
     | Promise<TelegramBusForeignUpdateSettlement>
     | TelegramBusForeignUpdateSettlement;

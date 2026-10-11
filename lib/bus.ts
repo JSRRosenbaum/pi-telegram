@@ -1926,6 +1926,8 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
     message: TMessage;
     ownership: TelegramBusForwardOwnership;
     ctx: TContext;
+    /** Process-local source/recipient lifetime; never part of the wire envelope. */
+    assertAuthority?: () => void;
   }) => Promise<TelegramBusForeignUpdateSettlement>;
   forwardEditedMessage: (input: {
     message: TMessage;
@@ -2057,6 +2059,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
   const send = async (
     envelope: TelegramBusDurableForwardEnvelope,
     ownership: TelegramBusForwardOwnership,
+    assertAuthority?: () => void,
   ): Promise<TelegramBusForeignUpdateSettlement> => {
     if (
       deps.validateForwardOwnership &&
@@ -2078,10 +2081,15 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         socketPath,
         envelope,
         timeoutMs: deps.timeoutMs ?? TELEGRAM_BUS_FOLLOWER_CONTROL_TIMEOUT_MS,
-        retry: getTelegramBusTransportRetryPolicy({
+        retry: assertAuthority ? { attempts: 1, delayMs: 0 } : getTelegramBusTransportRetryPolicy({
           endpoint: socketPath,
           operation: "operation",
         }),
+        ...(assertAuthority || deps.validateForwardOwnership ? { assertAuthority() {
+          assertAuthority?.();
+          if (deps.validateForwardOwnership && !deps.validateForwardOwnership(ownership))
+            throw new Error("Telegram follower forwarding ownership changed.");
+        } } : {}),
       });
     } catch (error) {
       return reject({
@@ -2178,6 +2186,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
       base: ForwardBase,
       sentAtMs: number,
     ) => TelegramBusDurableForwardEnvelope,
+    assertAuthority?: () => void,
   ): Promise<TelegramBusForeignUpdateSettlement> => {
     const prepared = prepare(kind, value, ownership);
     if ("settlement" in prepared) return Promise.resolve(prepared.settlement);
@@ -2192,6 +2201,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
         ? { kind: "leader.wakeInputCustody", ...base, sentAtMs: getNowMs() }
         : build(base, getNowMs()),
       ownership,
+      assertAuthority,
     );
   };
   return {
@@ -2214,7 +2224,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
           sentAtMs,
         }),
       ),
-    forwardMessage: ({ message, ownership }) =>
+    forwardMessage: ({ message, ownership, assertAuthority }) =>
       forward("leader.forwardMessage", message, ownership, (base, sentAtMs) => {
         const forwardCommentBatchPosition =
           deps.getForwardCommentBatchPosition?.(message);
@@ -2227,7 +2237,7 @@ export function createTelegramBusForeignOwnedUpdateForwarder<
             : {}),
           sentAtMs,
         };
-      }),
+      }, assertAuthority),
     forwardEditedMessage: ({ message, ownership }) =>
       forward(
         "leader.forwardEditedMessage",

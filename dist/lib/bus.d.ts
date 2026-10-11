@@ -670,6 +670,8 @@ export declare function createTelegramBusForeignOwnedUpdateForwarder<TContext, T
         message: TMessage;
         ownership: TelegramBusForwardOwnership;
         ctx: TContext;
+        /** Process-local source/recipient lifetime; never part of the wire envelope. */
+        assertAuthority?: () => void;
     }) => Promise<TelegramBusForeignUpdateSettlement>;
     forwardEditedMessage: (input: {
         message: TMessage;

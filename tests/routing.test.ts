@@ -37,6 +37,7 @@ import * as Model from "../lib/model.ts";
 import * as Ownership from "../lib/ownership.ts";
 import * as Paths from "../lib/paths.ts";
 import * as ThreadDisplay from "../lib/thread-display.ts";
+import * as Turns from "../lib/turns.ts";
 import * as Queue from "../lib/queue.ts";
 import * as Routing from "../lib/routing.ts";
 import { advanceTelegramWorkspaceRestore } from "../lib/routing.ts";
@@ -7684,7 +7685,8 @@ const ALL_COMMAND_SCENARIOS = {
     "restore-queue-after", "restore-queue-no-proof", "restore-queue-cold",
   ],
 } as const;
-type AllCommandScenario = (typeof ALL_COMMAND_SCENARIOS)[keyof typeof ALL_COMMAND_SCENARIOS][number];
+type AllCommandScenario = (typeof ALL_COMMAND_SCENARIOS)[keyof typeof ALL_COMMAND_SCENARIOS][number] |
+  "visibility-local" | "visibility-follower-ipc-worker" | "visibility-follower-ipc-worker-lost-reply";
 
 function createAllCommandFixture(scenario: AllCommandScenario,
   { threads, open, path }: Parameters<Parameters<typeof fixture>[0]>[0], journalPath = `${path}.all`, expiryClock?: () => number) {
@@ -7709,13 +7711,13 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     withSourceSerialization: Journal.createTelegramJournalSourceSerialization(() => join(dirname(path), "journals.transaction")) });
   const journal = resolve()!.journal;
   if (expiryClock) journal.routingInputs = Journal.createTelegramUpdateJournalStore(options).routingInputs;
-  const queuedCommand = scenario.startsWith("restore-queue-") || scenario.startsWith("restore-sibling-from-prompt") ||
+  const queuedCommand = scenario === "visibility-local" || scenario.startsWith("restore-queue-") || scenario.startsWith("restore-sibling-from-prompt") ||
     scenario === "membership-media-group" || scenario === "membership-text-real-gate";
   const queueOwnedRestore = queuedCommand || scenario === "restore-sibling-after-forward";
   const selectedRestoreUpdateId = scenario.startsWith("restore-sibling-from-prompt") || scenario === "restore-sibling-after-forward" ? 150 : 123;
   const expired = scenario.startsWith("expired");
   // Cancel needs fresh-cancellation evidence: the command must arrive after the worker's first snapshot.
-  const arrivesLive = !!expiryClock || scenario.startsWith("cancel") || scenario.startsWith("cleanup-") || scenario.endsWith("-retry") || scenario.endsWith("-restart") || scenario.startsWith("restore-sibling-from-prompt") ||
+  const arrivesLive = !!expiryClock || scenario.startsWith("visibility") || scenario.startsWith("cancel") || scenario.startsWith("cleanup-") || scenario.endsWith("-retry") || scenario.endsWith("-restart") || scenario.startsWith("restore-sibling-from-prompt") ||
     scenario === "membership-media-group" || scenario === "membership-text-real-gate" || scenario === "forward-prompt-then-cancel";
   const appendOriginal = () => journal.appendBatch([{ update_id: 123, message: { message_id: 12,
     date: Math.floor(Date.now() / 1000) - (expired ? 7200 : 0), chat: { id: 7, type: "private" },
@@ -7799,15 +7801,25 @@ function createAllCommandFixture(scenario: AllCommandScenario,
   const ipcStore = Threads.createTelegramTopicTargetStore({ path, canPersist: () => false });
   const ipcRestore = ipcStore.workspaceRestore({ profileName: "default", tokenSha256: "a".repeat(64) });
   const followerExecutions: number[] = [], admittedIds: number[] = [];
+  let onFollowerAdmitted: (() => void) | undefined;
   let releaseDeliveryReply: (() => void) | undefined;
   const deliveryReplyGate = new Promise<void>(resolve => { releaseDeliveryReply = resolve; });
   const followerHarness = drainRecipient ? createRouteHarness({ threadStore: ipcStore, instanceId: "old",
+    getAdmissionJournalBinding: () => Journal.createTelegramUpdateJournalBindingKey({ ...options, path: `${path}.recipient` }),
     isContextActive: () => followerAuthorityCurrent,
+    ...(scenario.startsWith("visibility") ? { async downloadFile(_fileId: string, fileName: string) {
+      const target = `${path}.${fileName}${fileName.endsWith(".jpg") ? ".png" : ""}`;
+      await writeFile(target, fileName.endsWith(".jpg") ?
+        Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=", "base64") : "fixture content");
+      return target;
+    } } : {}),
     configStore: { get: () => ({} as never), getAllowedUserId: () => 7, persistAllowedUserId: async () => true, persist: async () => undefined } }) : undefined;
   const followerWorker = followerHarness ? Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
     journal: recipientJournal, hasAuthority: () => followerAuthorityCurrent,
     isContextCurrent: ctx => ctx === ipcCtx && followerAuthorityCurrent,
     getJournalBindingKey: () => Journal.createTelegramUpdateJournalBindingKey({ ...options, path: `${path}.recipient` }),
+    getQueueOwnerIdentity: () => ({ instanceId: "old", processId: process.pid,
+      processBirthId: `${process.pid}:visibility-follower`, sessionGeneration: 1 }),
     async defaultHandle(update, ctx, execution) {
       if (update.message) followerExecutions.push(update.update_id);
       await followerHarness.routeRuntime.handleUpdate(update, ctx, execution);
@@ -7837,6 +7849,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
       const accepted = await ipcAdmission.admit(envelope, context);
       if (envelope.kind === "leader.forwardMessage") {
         admittedIds.push(accepted.sourceUpdateId);
+        onFollowerAdmitted?.();
         if (loseDeliveryReply) await deliveryReplyGate;
       }
       return accepted;
@@ -7927,9 +7940,12 @@ function createAllCommandFixture(scenario: AllCommandScenario,
       }
       apiCalls.push({ method, body: body as Record<string, unknown> });
       if (method === "deleteForumTopic" && (scenario === "cancel-delete-fails" || scenario === "cleanup-delete-fails")) throw new Error("fixture deletion failed");
-      if (method === "forwardMessage") return (forwardFails ? true : { message_id: 900 }) as never;
+      if (method === "forwardMessage")
+        return (forwardFails && body.message_thread_id !== 10 ? true :
+          { message_id: body.message_thread_id === 10 ? 1000 : 900 }) as never;
       if (method === "forwardMessages")
-        return (forwardFails ? [] : (body.message_ids as number[]).map((_, index) => ({ message_id: 900 + index }))) as never;
+        return (forwardFails && body.message_thread_id !== 10 ? [] :
+          (body.message_ids as number[]).map((_, index) => ({ message_id: (body.message_thread_id === 10 ? 1000 : 900) + index }))) as never;
       if (method !== "createForumTopic") return true as never;
       creations.push(body);
       if (scenario === "create-error") throw new Error("fixture creation reply lost");
@@ -7996,6 +8012,17 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     harness.telegramQueueStore.setQueuedItems(items.filter(value => value !== item));
     await worker.waitForDrain(); await harness.routeRuntime.waitForRestoreSettlement();
   };
+  const handOffFollowerQueuedInput = async () => {
+    assert.ok(followerHarness && followerWorker);
+    const items = followerHarness.telegramQueueStore.getQueuedItems();
+    assert.equal(items.length, 1);
+    const receipts = items[0]!.admissionReceipts!;
+    assert.ok(receipts.every(receipt => followerWorker.isQueueReceiptCommitted(receipt)));
+    assert.equal(followerWorker.completeQueueReceipts({ receipts, ctx: ipcCtx, reason: "prompt-handoff" }), true,
+      "Recipient disposition uses its exact native receipt owner, not donor ACK or answer completion");
+    followerHarness.telegramQueueStore.setQueuedItems([]);
+    await followerWorker.waitForDrain();
+  };
   const assertLostDeliveryProtection = async () => {
     assert.deepEqual(admittedIds, [123], "the real receiver accepted exactly the selected message before the IPC reply was lost");
     if (drainRecipient) assertFollowerExecution();
@@ -8030,7 +8057,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
   return {
     admittedIds, apiCalls, assertFollowerExecution, assertLostDeliveryProtection, bindingKey, cancelOf, choosers,
     click, completedHints, createHarness, createWorker, creations, deletions, drainRecipient, edits,
-    followerRegistration, followerRegistry, forwardedIds, fullSlots, handOffQueuedInput, journal, liveTargets, loseDeliveryReply, open,
+    followerHarness, followerWorker, followerRegistration, followerRegistry, forwardedIds, fullSlots, handOffQueuedInput, handOffFollowerQueuedInput, journal, liveTargets, loseDeliveryReply, open,
     options, path, queueAdmission, queuedCommand, recipientJournal, resolve, restoreModes, restoreReplyBoundary,
     routeOf, sleep, store, threads, typeInTab,
     set forwardFails(value: boolean) { forwardFails = value; },
@@ -8056,6 +8083,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
       assert.ok(gate, "the exact Restore RPC boundary was held");
       gate.release(); await gate.finished; restoreReplyGates.delete(mode);
     },
+    set onFollowerAdmitted(value: typeof onFollowerAdmitted) { onFollowerAdmitted = value; },
     get acceptancePublications() { return acceptancePublications; },
     get callbackId() { return callbackId; },
     set callbackId(value: typeof callbackId) { callbackId = value; },
@@ -8074,13 +8102,15 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     set temporaryAuthority(value: typeof temporaryAuthority) { temporaryAuthority = value; },
     get worker() { return worker; },
     set worker(value: typeof worker) { worker = value; },
-    async start() {
+    async start(source?: readonly Journal.TelegramUpdateJournalInput[]) {
       followerWorker?.start(ipcCtx); await followerWorker?.waitForDrain();
       if (!scenario.endsWith("-down")) await ipcReceiver?.start();
       worker.start({ cwd: "/repo" }); await worker.waitForDrain();
-      if (arrivesLive) { appendOriginal(); worker.signal(); await worker.waitForDrain(); }
+      if (source) { journal.appendBatch(source); worker.signal(); await worker.waitForDrain(); }
+      else if (arrivesLive) { appendOriginal(); worker.signal(); await worker.waitForDrain(); }
     },
     async stop() {
+      temporaryAuthority = false;
       releaseDeliveryReply?.(); for (const gate of restoreReplyGates.values()) gate.release();
       await worker.stop(); await ipcReceiver?.stop(); await followerWorker?.stop();
     },
@@ -8803,7 +8833,7 @@ async function assertForwardScenario(scenario: AllCommandScenario, f: AllCommand
       }
       return;
     }
-    assert.deepEqual(f.forwardedIds(), [123], "only the selected input is forwarded to the follower");
+    assert.deepEqual(f.forwardedIds(), [123], `only the selected input is forwarded to the follower: ${f.diagnose()}`);
     f.assertFollowerExecution();
     if (f.drainRecipient) {
       await f.click(f.routeOf(0), 501);
@@ -9188,6 +9218,157 @@ test("A voice note sent from All opens a routing tab instead of the threaded-mod
   });
 });
 
+for (const ack of [
+  { name: "one positive copy", copies: [900], count: 1, complete: true },
+  { name: "a complete album", copies: [900, 901], count: 2, complete: true },
+  { name: "a skipped album member", copies: [900], count: 2, complete: false },
+  { name: "duplicate album copy IDs", copies: [900, 900], count: 2, complete: false },
+  { name: "an extra album copy", copies: [900, 901, 902], count: 2, complete: false },
+  { name: "a zero copy ID", copies: [0], count: 1, complete: false },
+  { name: "a negative copy ID", copies: [-900], count: 1, complete: false },
+  { name: "an unsafe copy ID", copies: [Number.MAX_SAFE_INTEGER + 1], count: 1, complete: false },
+  { name: "a string copy ID", copies: ["900"], count: 1, complete: false },
+  { name: "a missing copy ID", copies: [undefined], count: 1, complete: false },
+]) {
+  test(`All source move requires exact positive copy ACK (${ack.name})`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("cancel", frame);
+      const forwardOptions: Array<Parameters<NonNullable<RouteHarnessOptions["callApi"]>>[2]> = [];
+      f.harness = f.createHarness({ async callApi(method, body, options) {
+        f.apiCalls.push({ method, body: body as Record<string, unknown> });
+        if (method === "createForumTopic") return { message_thread_id: 55 } as never;
+        if (method === "forwardMessage" || method === "forwardMessages") {
+          forwardOptions.push(options);
+          return (method === "forwardMessage" ? { message_id: ack.copies[0] } :
+            ack.copies.map(message_id => ({ message_id }))) as never;
+        }
+        return true as never;
+      } });
+      f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+      try {
+        const updates = Array.from({ length: ack.count }, (_, index) => ({ update_id: 121 + index,
+          message: { message_id: 10 + index, date: Math.floor(Date.now() / 1000),
+            chat: { id: 7, type: "private" as const }, from: { id: 7, is_bot: false },
+            ...(ack.count === 1 ? { text: "retain the original prompt" } : { media_group_id: "copy-ack",
+              photo: [{ file_id: `p${index}`, file_unique_id: `p${index}`, width: 1, height: 1 }] }) } }));
+        f.journal.appendBatch(updates); f.worker.signal(); await f.worker.waitForDrain();
+        if (ack.count > 1) { await f.sleep(1250); await f.worker.waitForDrain(); }
+        assert.equal(f.choosers.length, 1);
+        assert.equal(f.choosers[0]!.replyTo, ack.complete ? 900 : undefined);
+        for (const { update_id, message } of updates) {
+          assert.equal(f.harness.events.includes(`delete-message:7:${message.message_id}`), ack.complete,
+            "Only a complete set of distinct positive copy IDs permits removal of the All originals");
+          assert.deepEqual(f.journal.read().entries.find(entry => entry.updateId === update_id)?.update.message, message,
+            "Copy acknowledgements never rewrite the exact journal originals");
+        }
+        assert.equal(forwardOptions.length, 1, "One source move, including skipped or malformed acknowledgements");
+        assert.equal(forwardOptions[0]?.maxAttempts, 1);
+        assert.equal(forwardOptions[0]?.retrySafety, "non-idempotent");
+        assert.equal(typeof forwardOptions[0]?.assertAuthority, "function");
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+      } finally { await f.stop(); }
+    });
+  });
+}
+
+for (const boundary of ["issuance", "acknowledgement"] as const) {
+  test(`All source move refuses stale generation at ${boundary}`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("cancel", frame);
+      let generation = 1, issued = 0;
+      f.harness = f.createHarness({ getSessionGeneration: () => generation,
+        async callApi(method, _body, options) {
+          if (method === "createForumTopic") return { message_thread_id: 55 } as never;
+          if (method === "forwardMessage") {
+            if (boundary === "issuance") generation++;
+            options?.assertAuthority?.();
+            issued++;
+            if (boundary === "acknowledgement") generation++;
+            return { message_id: 900 } as never;
+          }
+          return true as never;
+        } });
+      f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+      try {
+        f.journal.appendBatch([{ update_id: 121, message: { message_id: 10, date: Math.floor(Date.now() / 1000),
+          chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "old source lifetime" } }]);
+        f.worker.signal(); await f.worker.waitForDrain();
+        assert.equal(issued, boundary === "issuance" ? 0 : 1,
+          "Ended authority cannot issue a new forward, but cannot unsend an already issued request");
+        assert.equal(f.harness.events.includes("delete-message:7:10"), false);
+        assert.equal(f.choosers.length, 0, "A stale response cannot publish a chooser for the ended source lifetime");
+        assert.ok(f.journal.read().entries.some(entry => entry.updateId === 121));
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+      } finally { await f.stop(); }
+    });
+  });
+}
+
+test("All source move stops remaining original deletions after generation loss", async () => {
+  await fixture(async frame => {
+    const f = createAllCommandFixture("cancel", frame);
+    let generation = 1;
+    const deleted: number[] = [];
+    f.harness = f.createHarness({ getSessionGeneration: () => generation,
+      async deleteMessage(_chat, messageId) { deleted.push(messageId); generation++; } });
+    f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+    try {
+      f.journal.appendBatch([121, 122].map((update_id, index) => ({ update_id, message: { message_id: 10 + index,
+        date: Math.floor(Date.now() / 1000), chat: { id: 7, type: "private" as const }, from: { id: 7, is_bot: false },
+        media_group_id: "stopped-original-removal",
+        photo: [{ file_id: `p${index}`, file_unique_id: `p${index}`, width: 1, height: 1 }] } })));
+      f.worker.signal(); await f.worker.waitForDrain(); await f.sleep(1250); await f.worker.waitForDrain();
+      assert.deepEqual(deleted, [10], "An already issued deletion is not undone; the next original is not delegated");
+      assert.equal(f.choosers.length, 0);
+      assert.deepEqual(f.journal.read().entries.map(entry => entry.updateId), [121, 122]);
+      assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+    } finally { await f.stop(); }
+  });
+});
+
+for (const outcome of ["http-500", "http-429", "network", "late-success"] as const) {
+  test(`All source move keeps one native HTTP attempt (${outcome})`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("cancel", frame);
+      const originalFetch = globalThis.fetch;
+      const requests: Record<string, unknown>[] = [];
+      let generation = 1;
+      globalThis.fetch = async (url, init) => {
+        assert.ok(String(url).endsWith("/forwardMessage"), "No live or unrelated Bot API operation");
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (outcome === "network") throw Object.assign(new Error("fixture socket reset"), { code: "ECONNRESET" });
+        if (outcome === "late-success") {
+          generation++;
+          return new Response(JSON.stringify({ ok: true, result: { message_id: 900 } }), { status: 200 });
+        }
+        const status = outcome === "http-429" ? 429 : 500;
+        return new Response(JSON.stringify({ ok: false, error_code: status, description: "fixture HTTP failure",
+          ...(status === 429 ? { parameters: { retry_after: 0 } } : {}) }), { status });
+      };
+      const api = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture",
+        isThreadedMode: () => true, recordRuntimeEvent() {} });
+      f.harness = f.createHarness({ getSessionGeneration: () => generation,
+        async callApi(method, body, options) {
+          if (method === "createForumTopic") return { message_thread_id: 55 } as never;
+          assert.equal(method, "forwardMessage");
+          return api.call(method, body, options);
+        } });
+      try {
+        f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+        f.journal.appendBatch([{ update_id: 121, message: { message_id: 10, date: Math.floor(Date.now() / 1000),
+          chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "native source move" } }]);
+        f.worker.signal(); await f.worker.waitForDrain();
+        assert.deepEqual(requests, [{ chat_id: 7, message_thread_id: 55, from_chat_id: 7,
+          disable_notification: true, message_id: 10 }], "The guard stays local; failure never grants HTTP/family replay");
+        assert.equal(f.harness.events.includes("delete-message:7:10"), false);
+        assert.equal(f.choosers.length, outcome === "late-success" ? 0 : 1);
+        assert.ok(f.journal.read().entries.some(entry => entry.updateId === 121));
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+      } finally { globalThis.fetch = originalFetch; await f.stop(); }
+    });
+  });
+}
+
 test("An album sent from All opens one routing tab holding the whole album", async () => {
   await fixture(async frame => {
     const f = await createAllCommandFixture("cancel", frame);
@@ -9427,6 +9608,487 @@ test("Menu-created and natively opened temporary tabs are both named for routing
     } finally { await f.stop(); }
   });
 });
+
+for (const proof of [
+  { name: "warm routing copies", native: false, restart: false, failedMove: false, allowed: true },
+  { name: "warm retained All originals", native: false, restart: false, failedMove: true, allowed: true },
+  { name: "cold All after a successful move", native: false, restart: true, failedMove: false, allowed: false },
+  { name: "cold All after an unconfirmed move", native: false, restart: true, failedMove: true, allowed: false },
+  { name: "cold All with a warm target projection", native: false, restart: true, failedMove: false, allowed: false, fault: "warm-target" },
+  { name: "warm native originals", native: true, restart: false, failedMove: false, allowed: true },
+  { name: "cold native originals", native: true, restart: true, failedMove: false, allowed: true },
+  { name: "unavailable source reader", native: false, restart: false, failedMove: false, allowed: false, fault: "missing" },
+  { name: "changed source message ID", native: false, restart: false, failedMove: false, allowed: false, fault: "id" },
+  { name: "synthetic zero native message ID", native: true, restart: false, failedMove: false, allowed: false, fault: "zero" },
+  { name: "foreign source chat", native: false, restart: false, failedMove: false, allowed: false, fault: "chat" },
+  { name: "foreign source binding", native: false, restart: false, failedMove: false, allowed: false, fault: "binding" },
+  { name: "foreign source sender", native: false, restart: false, failedMove: false, allowed: false, fault: "sender" },
+  { name: "compound source namespace", native: false, restart: false, failedMove: false, allowed: false, fault: "compound" },
+] as const) {
+  test(`Temporary Reroute requires proven forward sources (${proof.name})`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("cancel", frame, undefined, () => Date.now());
+      const revived: Array<{ id: number; markup: string }> = [];
+      const createHarness = () => f.createHarness({ async editInteractiveMessage(_chat, id, _text, _mode, markup) {
+        revived.push({ id, markup: JSON.stringify(markup) });
+      } });
+      f.harness = createHarness(); f.forwardFails = proof.failedMove;
+      try {
+        f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+        if (proof.native) {
+          f.journal.appendBatch([{ update_id: 120, message: { message_id: 9, message_thread_id: 55,
+            chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+            forum_topic_created: { name: "New Chat", is_name_implicit: true } } }]);
+          f.worker.signal(); await f.worker.waitForDrain();
+          await f.typeInTab(123, "/status", 12);
+        } else {
+          f.journal.appendBatch([{ update_id: 123, message: { message_id: 12, date: Math.floor(Date.now() / 1000),
+            chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "/status" } }]);
+          f.worker.signal(); await f.worker.waitForDrain();
+        }
+        assert.equal(f.choosers.length, 1);
+        assert.equal(f.harness.events.includes("delete-message:7:12"), !proof.native && !proof.failedMove);
+        if (proof.restart) {
+          await f.worker.stop();
+          f.harness = createHarness(); f.worker = f.createWorker(true);
+          if ("fault" in proof && proof.fault === "warm-target") {
+            const handle = f.harness.routeRuntime.handleUpdate;
+            f.harness.routeRuntime.handleUpdate = (update, ctx, execution) => handle(update.message ? {
+              ...update, message: Updates.carryTelegramUpdateExecutionFence(update.message,
+                { ...update.message, message_id: 0, message_thread_id: 55 }),
+            } : update, ctx, execution);
+          }
+          f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+          assert.ok(revived.some(view => view.id === 501 && view.markup.includes("reroutemenu:")),
+            "Cold provenance refusal is not permission to discard the waiting chooser");
+        }
+        if ("fault" in proof && proof.fault !== "warm-target") {
+          const inspect = f.worker.inspectDeferredSourceSnapshot!;
+          f.worker.inspectDeferredSourceSnapshot = input => {
+            const snapshot = inspect(input);
+            if (!snapshot || proof.fault === "missing") return undefined;
+            if (proof.fault === "binding")
+              return { ...snapshot, source: { ...snapshot.source, journalBindingKey: "foreign" } };
+            if (proof.fault === "compound")
+              return { ...snapshot, update: { ...snapshot.update, edited_message: snapshot.update.message } };
+            const message = snapshot.update.message as Record<string, unknown>;
+            return { ...snapshot, update: { ...snapshot.update, message: { ...message,
+              ...(proof.fault === "id" || proof.fault === "zero" ? { message_id: proof.fault === "zero" ? 0 : 999 } : proof.fault === "chat" ?
+                { chat: { id: 8, type: "private" } } : { from: { id: 8, is_bot: false } }) } } };
+          };
+        }
+        const apiBefore = f.apiCalls.length;
+        await f.click(f.routeOf(0));
+        assert.equal(f.harness.events.filter(event => event === "status-menu").length, proof.allowed ? 1 : 0);
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+        if (!proof.allowed) {
+          assert.equal(f.apiCalls.length, apiBefore, "Unknown copy provenance issues neither forward nor delete");
+          assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.routingInput?.phase, "waiting",
+            "Refusal precedes selection, so the exact unclaimed source remains cancellable");
+          assert.equal(f.store.listTemporaryThreads()[0]?.forwardedInputs?.length ?? 0, 0);
+          assert.ok(f.harness.events.includes("answer:Source copy unavailable; not routing"), JSON.stringify(f.harness.events));
+          await f.click(f.cancelOf(0));
+          assert.ok(f.journal.inspectAbandonedPending(123), "Fail-closed Reroute keeps the existing exact Cancel capability");
+        }
+      } finally { await f.stop(); }
+    });
+  });
+}
+
+test("Temporary Reroute refuses an album with one unavailable original source", async () => {
+  await fixture(async frame => {
+    const f = createAllCommandFixture("cancel", frame, undefined, () => Date.now());
+    try {
+      f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+      f.journal.appendBatch([{ update_id: 120, message: { message_id: 9, message_thread_id: 55,
+        chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false },
+        forum_topic_created: { name: "New Chat", is_name_implicit: true } } }]);
+      f.worker.signal(); await f.worker.waitForDrain();
+      f.journal.appendBatch([121, 122].map((update_id, index) => ({ update_id, message: { message_id: 10 + index,
+        message_thread_id: 55, date: Math.floor(Date.now() / 1000), chat: { id: 7, type: "private" as const },
+        from: { id: 7, is_bot: false }, media_group_id: "missing-original",
+        photo: [{ file_id: `p${index}`, file_unique_id: `p${index}`, width: 1, height: 1 }] } })));
+      f.worker.signal(); await f.worker.waitForDrain(); await f.sleep(1250); await f.worker.waitForDrain();
+      assert.equal(f.choosers.length, 1);
+      const inspect = f.worker.inspectDeferredSourceSnapshot!;
+      f.worker.inspectDeferredSourceSnapshot = input => input.updateId === 122 ? undefined : inspect(input);
+      const apiBefore = f.apiCalls.length;
+      await f.click(f.routeOf(0));
+      assert.equal(f.apiCalls.length, apiBefore);
+      assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+      assert.equal(f.store.listTemporaryThreads()[0]?.forwardedInputs?.length ?? 0, 0);
+      assert.deepEqual(f.journal.read().entries.filter(entry => entry.updateId < 200)
+        .map(entry => [entry.updateId, entry.routingInput?.phase]), [[121, "waiting"], [122, "waiting"]]);
+      await f.click(f.cancelOf(0));
+      assert.ok(f.journal.inspectAbandonedPending(121) && f.journal.inspectAbandonedPending(122));
+    } finally { await f.stop(); }
+  });
+});
+
+function visibilityUpdates(kind: "text" | "voice" | "file" | "album"): Array<TestUpdate & Journal.TelegramJournaledUpdate> {
+  return Array.from({ length: kind === "album" ? 2 : 1 }, (_, index) => ({ update_id: 123 + index,
+    message: { message_id: 12 + index, date: Math.floor(Date.now() / 1000), chat: { id: 7, type: "private" as const },
+      from: { id: 7, is_bot: false }, ...(kind === "text" ? { text: "a visible rerouted prompt" } :
+        kind === "voice" ? { voice: { file_id: "visibility-voice", file_unique_id: "voice", duration: 1 } } :
+        kind === "file" ? { document: { file_id: "visibility-file", file_unique_id: "file", file_name: "input.txt", mime_type: "text/plain" } } :
+        { media_group_id: "visibility-album", photo: [{ file_id: `visibility-photo-${index}`, file_unique_id: `photo-${index}`, width: 1, height: 1 }] }) } }));
+}
+
+for (const role of ["local", "follower"] as const) for (const kind of ["text", "voice", "file", "album"] as const) {
+  test(`Temporary Reroute publishes native ${kind} before ${role} admission`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture(role === "local" ? "visibility-local" : "visibility-follower-ipc-worker", frame);
+      const source = visibilityUpdates(kind);
+      const downloads: string[] = [];
+      if (role === "local") f.harness = f.createHarness({ async downloadFile(fileId, fileName) {
+        downloads.push(fileId);
+        const path = `${frame.path}.${fileName}${kind === "album" ? ".png" : ""}`;
+        await writeFile(path, kind === "album" ? Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=", "base64") : "fixture content");
+        return path;
+      } });
+      try {
+        await f.start(source);
+        if (kind === "album") { await f.sleep(1250); await f.worker.waitForDrain(); }
+        assert.equal(f.choosers.length, 1);
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+        await f.click(f.routeOf(0));
+        const publication = f.apiCalls.filter(call => ["forwardMessage", "forwardMessages"].includes(call.method) && call.body.message_thread_id === 10);
+        assert.deepEqual(publication, [{ method: kind === "album" ? "forwardMessages" : "forwardMessage", body: {
+          chat_id: 7, message_thread_id: 10, from_chat_id: 7, disable_notification: true,
+          ...(kind === "album" ? { message_ids: [900, 901] } : { message_id: 900 }) } }]);
+        const queue = role === "local" ? f.harness.telegramQueueStore : f.followerHarness!.telegramQueueStore;
+        await f.settleUntil(() => queue.getQueuedItems().length === 1);
+        const turn = queue.getQueuedItems()[0];
+        assert.ok(turn, f.diagnose());
+        assert.equal(turn.kind, "prompt");
+        assert.ok(turn.kind === "prompt");
+        assert.deepEqual(turn.target, { chatId: 7, threadId: 10 });
+        assert.equal(turn.replyToMessageId, 1000, "The answer quotes the confirmed destination copy, never the former tab");
+        assert.deepEqual(turn.sourceMessageIds, kind === "album" ? [1000, 1001] : [1000]);
+        assert.deepEqual(turn.admissionReceipts?.flatMap(receipt => receipt.sourceUpdateIds), source.map(update => update.update_id));
+        if (role === "local") assert.deepEqual(f.deletions(), [], "Local queued custody still owns the donor originals");
+        else if (f.deletions().length) {
+          assert.equal(f.journal.read().entries.some(entry => source.some(update => update.update_id === entry.updateId)), false,
+            "Follower cleanup follows exact whole-group donor removal ACK, never merely visible copies");
+          const publicationIndex = f.apiCalls.indexOf(publication[0]!);
+          assert.ok(f.apiCalls.indexOf(f.deletions()[0]!) > publicationIndex);
+        }
+        for (const update of source) {
+          const retained = role === "local" ? f.journal.read().entries.find(entry => entry.updateId === update.update_id) :
+            f.recipientJournal.read().entries.find(entry => entry.updateId === update.update_id);
+          assert.equal(retained?.state, "queued");
+          if (role === "local") assert.deepEqual(retained?.update, update, "Bot copies never rewrite donor journal originals");
+          else {
+            const message = retained?.update.message as TestMessage;
+            assert.equal(message.message_id, 1000 + source.indexOf(update));
+            assert.equal(message.message_thread_id, 10);
+            assert.equal(message.voice?.file_id, update.message?.voice?.file_id);
+            assert.equal(message.document?.file_id, update.message?.document?.file_id);
+            assert.deepEqual(message.photo, update.message?.photo);
+          }
+        }
+        if (role === "local" && kind !== "text") assert.equal(downloads.length, source.length);
+        await f.click(f.routeOf(0));
+        assert.equal(queue.getQueuedItems().length, 1);
+        assert.equal(f.apiCalls.filter(call => ["forwardMessage", "forwardMessages"].includes(call.method) && call.body.message_thread_id === 10).length, 1);
+        if (role === "local") await f.handOffQueuedInput(123);
+      } finally { await f.stop(); }
+    }, role === "follower" ? "follower" : "leader");
+  });
+}
+
+for (const outcome of ["drained", "drain-wakeup", "replacement-drain", "album", "authority-lost", "live-target-added", "new-input", "uncertain-delete", "unverifiable"] as const) {
+  test(`Temporary follower cleanup reobserves recipient protection after source ACK (${outcome})`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("visibility-follower-ipc-worker", frame);
+      let censusReads = 0, unverifiable = false, generation = 1;
+      const base = f.harness.routingDeps;
+      const createHarness = () => f.createHarness({ getSessionGeneration: () => generation, inspectTemporaryThreadSources(...args) {
+        censusReads++;
+        if (unverifiable) return undefined;
+        const recipient = f.recipientJournal.read().entries;
+        return recipient.length ? recipient.map(entry => entry.updateId) : base.inspectTemporaryThreadSources!(...args);
+      }, async callApi(method, body, options) {
+        const result = await base.callApi!(method, body, options);
+        return (method === "deleteForumTopic" && outcome === "uncertain-delete" ? false : result) as never;
+      } });
+      f.harness = createHarness();
+      try {
+        await f.start(visibilityUpdates(outcome === "album" ? "album" : "voice"));
+        if (outcome === "album") { await f.sleep(1250); await f.worker.waitForDrain(); }
+        await f.click(f.routeOf(0));
+        await f.settleUntil(() => censusReads > 0 && f.store.listTemporaryThreads()[0]?.completedInputs?.length === 1);
+        assert.deepEqual(f.journal.read().entries, [], "Whole donor source ACK precedes recipient receipt disposal");
+        await f.settleUntil(() => f.recipientJournal.read().entries.every(entry => entry.state === "queued") &&
+          f.followerHarness!.telegramQueueStore.getQueuedItems().length === 1);
+        assert.deepEqual(f.deletions(), [], "The first protected check issues no destructive grant");
+        assert.notEqual(f.store.listTemporaryThreads()[0]?.cleanupIssued, true);
+        if (outcome === "authority-lost") f.temporaryAuthority = false;
+        if (outcome === "live-target-added") f.liveTargets.push({ chatId: 7, threadId: 55 });
+        if (outcome === "new-input") await f.typeInTab(150, "/status");
+        if (outcome === "unverifiable") unverifiable = true;
+        await f.handOffFollowerQueuedInput();
+        assert.deepEqual(f.recipientJournal.read().entries, []);
+        const clean = ["drained", "drain-wakeup", "replacement-drain", "album"].includes(outcome);
+        const deletes = clean || outcome === "uncertain-delete";
+        if (outcome === "drain-wakeup" || outcome === "replacement-drain") {
+          if (outcome === "replacement-drain") { generation++; f.harness = createHarness(); }
+          f.harness.routeRuntime.onDeliverySettled({ cwd: "/repo" });
+          await f.harness.routeRuntime.waitForRestoreSettlement();
+          assert.equal(f.deletions().length, 1, "The existing drain wake repairs retained metadata without source-body replay");
+        }
+        if (deletes) await f.settleUntil(() => f.deletions().length === 1);
+        else await f.sleep(1250);
+        await f.harness.routeRuntime.waitForRestoreSettlement();
+        assert.equal(f.deletions().length, deletes ? 1 : 0, f.diagnose());
+        assert.equal(f.store.listTemporaryThreads().length, clean ? 0 : 1);
+        if (outcome === "uncertain-delete") {
+          assert.equal(f.store.listTemporaryThreads()[0]?.cleanupIssued, true);
+          await f.sleep(1250);
+          assert.equal(f.deletions().length, 1, "An issued/unknown deletion never becomes a retry grant");
+        }
+        assert.equal(f.apiCalls.filter(call => ["forwardMessage", "forwardMessages"].includes(call.method) && call.body.message_thread_id === 10).length, 1);
+        assert.equal(f.admittedIds.length, outcome === "album" ? 2 : 1);
+        if (outcome === "new-input") assert.equal(f.journal.read().entries.find(entry => entry.updateId === 150)?.state, "pending");
+      } finally { await f.stop(); }
+    }, "follower");
+  });
+}
+
+test("Temporary Reroute waits for destination publication before local queue admission", async () => {
+  await fixture(async frame => {
+    const f = createAllCommandFixture("visibility-local", frame);
+    const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+    f.harness = f.createHarness({ async callApi(method, body, options) {
+      f.apiCalls.push({ method, body: body as Record<string, unknown> });
+      if (method === "createForumTopic") return { message_thread_id: 55 } as never;
+      if (method === "forwardMessage") {
+        if (body.message_thread_id === 55) return { message_id: 900 } as never;
+        assert.deepEqual(f.store.listTemporaryThreads()[0]?.forwardedInputs,
+          [{ journalBindingKey: f.bindingKey, updateIds: [123] }], "Durable one-shot authority precedes physical publication");
+        assert.equal(options?.maxAttempts, 1); assert.equal(options?.retrySafety, "non-idempotent");
+        entered.resolve(); await finish.promise; options?.assertAuthority?.();
+        return { message_id: 1000 } as never;
+      }
+      return true as never;
+    } });
+    try {
+      f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+      f.journal.appendBatch(visibilityUpdates("text")); f.worker.signal(); await f.worker.waitForDrain();
+      const routing = f.click(f.routeOf(0)); await entered.promise;
+      assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+      assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.state, "pending");
+      assert.deepEqual(f.deletions(), []);
+      finish.resolve(); await routing;
+      assert.equal(f.harness.telegramQueueStore.getQueuedItems()[0]?.replyToMessageId, 1000);
+    } finally { finish.resolve(); await f.stop(); }
+  });
+});
+
+for (const fault of ["missing-id", "zero-id", "partial-album", "duplicate-album", "error", "generation-before-issue",
+  "generation-after-issue", "binding-change", "recipient-change"] as const) {
+  test(`Temporary Reroute never admits or replays an uncertain destination publication (${fault})`, async () => {
+    await fixture(async frame => {
+      const remote = fault === "recipient-change";
+      const f = createAllCommandFixture(remote ? "visibility-follower-ipc-worker" : "visibility-local", frame);
+      let generation = 1, issued = 0;
+      const album = fault === "partial-album" || fault === "duplicate-album";
+      f.harness = f.createHarness({ getSessionGeneration: () => generation,
+        async callApi(method, body, options) {
+          f.apiCalls.push({ method, body: body as Record<string, unknown> });
+          if (method === "createForumTopic") return { message_thread_id: 55 } as never;
+          if (method === "forwardMessage" || method === "forwardMessages") {
+            if (body.message_thread_id === 55) return (method === "forwardMessage" ? { message_id: 900 } :
+              (body.message_ids as number[]).map((_, index) => ({ message_id: 900 + index }))) as never;
+            if (fault === "generation-before-issue") generation++;
+            options?.assertAuthority?.(); issued++;
+            if (fault === "generation-after-issue") generation++;
+            if (fault === "binding-change") f.threads.upsertWorkspaceBinding({ ...f.threads.listWorkspaceBindings()[0]!,
+              target: { chatId: 7, threadId: 11 } });
+            if (fault === "recipient-change") f.followerRegistry.register({ ...f.followerRegistry.get("old")!, registrationGeneration: "next" });
+            if (fault === "error") throw new Error("fixture destination outcome unknown");
+            return (fault === "missing-id" ? {} : fault === "zero-id" ? { message_id: 0 } :
+              fault === "partial-album" ? [{ message_id: 1000 }] : fault === "duplicate-album" ?
+                [{ message_id: 1000 }, { message_id: 1000 }] : { message_id: 1000 }) as never;
+          }
+          return true as never;
+        } });
+      try {
+        const source = visibilityUpdates(album ? "album" : "text");
+        await f.start(source);
+        if (album) { await f.sleep(1250); await f.worker.waitForDrain(); }
+        await f.click(f.routeOf(0));
+        assert.equal(issued, fault === "generation-before-issue" ? 0 : 1);
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+        assert.equal(f.followerHarness?.telegramQueueStore.getQueuedItems().length ?? 0, 0);
+        assert.deepEqual(f.admittedIds, []);
+        assert.deepEqual(f.deletions(), []);
+        assert.deepEqual(f.store.listTemporaryThreads()[0]?.forwardedInputs,
+          [{ journalBindingKey: f.bindingKey, updateIds: source.map(update => update.update_id) }]);
+        for (const update of source) assert.deepEqual(f.journal.read().entries.find(entry => entry.updateId === update.update_id)?.update, update);
+        await f.click(f.routeOf(0));
+        assert.equal(issued, fault === "generation-before-issue" ? 0 : 1, "A lost/partial response never permits another publication");
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+        assert.deepEqual(f.admittedIds, []);
+        if (fault === "error") {
+          await f.worker.stop(); f.harness = f.createHarness(); f.worker = f.createWorker(true);
+          f.worker.start({ cwd: "/repo" }); await f.worker.waitForDrain();
+          const count = f.apiCalls.length;
+          await f.click(f.routeOf(0));
+          assert.equal(f.apiCalls.length, count, "Cold selected sources cannot recreate the publication grant");
+          assert.ok(f.journal.read().entries.some(entry => entry.updateId === 123));
+        }
+      } finally { await f.stop(); }
+    }, fault === "recipient-change" ? "follower" : "leader");
+  });
+}
+
+test("Temporary Reroute associates destination album IDs by original source UID", async () => {
+  await fixture(async frame => {
+    const f = createAllCommandFixture("visibility-local", frame);
+    f.harness = f.createHarness({ async downloadFile(_fileId, fileName) {
+      const target = `${frame.path}.${fileName}.png`;
+      await writeFile(target, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=", "base64"));
+      return target;
+    }, async callApi(method, body) {
+      f.apiCalls.push({ method, body: body as Record<string, unknown> });
+      if (method === "createForumTopic") return { message_thread_id: 55 } as never;
+      if (method === "forwardMessages") return (body.message_thread_id === 55 ?
+        [{ message_id: 901 }, { message_id: 900 }] : [{ message_id: 1000 }, { message_id: 1001 }]) as never;
+      return true as never;
+    } });
+    try {
+      await f.start(visibilityUpdates("album")); await f.sleep(1250); await f.worker.waitForDrain();
+      await f.click(f.routeOf(0));
+      const turn = f.harness.telegramQueueStore.getQueuedItems()[0]!;
+      assert.equal(turn.replyToMessageId, 1001, "The first original is not confused with the first sorted routing copy");
+      assert.ok(turn.kind === "prompt");
+      assert.deepEqual(turn.sourceMessageIds, [1001, 1000]);
+      assert.deepEqual(f.apiCalls.filter(call => call.method === "forwardMessages").map(call => call.body.message_ids),
+        [[12, 13], [900, 901]], "Every Bot API group is sorted while source-to-copy identity remains exact");
+    } finally { await f.stop(); }
+  });
+});
+
+test("Temporary Reroute uses immutable native source IDs and replaces old reply suppression", async () => {
+  await fixture(async frame => {
+    const f = createAllCommandFixture("visibility-local", frame);
+    const handle = f.harness.routeRuntime.handleUpdate;
+    f.harness.routeRuntime.handleUpdate = (update, ctx, execution) => handle(update.message && update.update_id === 123 ? {
+      ...update, message: Updates.carryTelegramUpdateExecutionFence(update.message,
+        Turns.withoutTelegramTurnReplyAnchor({ ...update.message, message_id: 0 })),
+    } : update, ctx, execution);
+    try {
+      await f.start([]);
+      f.journal.appendBatch([{ update_id: 120, message: { message_id: 9, message_thread_id: 55,
+        chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, forum_topic_created: { name: "New Chat", is_name_implicit: true } } }]);
+      f.worker.signal(); await f.worker.waitForDrain(); await f.typeInTab(123, "native projected input", 12);
+      await f.click(f.routeOf(0));
+      assert.deepEqual(f.apiCalls.filter(call => call.method === "forwardMessage").map(call => call.body),
+        [{ chat_id: 7, message_thread_id: 10, from_chat_id: 7, disable_notification: true, message_id: 12 }]);
+      assert.equal(f.harness.telegramQueueStore.getQueuedItems()[0]?.replyToMessageId, 1000);
+      assert.equal((f.journal.read().entries.find(entry => entry.updateId === 123)?.update.message as TestMessage).message_id, 12);
+    } finally { await f.stop(); }
+  });
+});
+
+test("Temporary Reroute retains visible copies and donor authority after a lost native IPC ACK", async () => {
+  await fixture(async frame => {
+    const f = createAllCommandFixture("visibility-follower-ipc-worker-lost-reply", frame);
+    try {
+      await f.start(visibilityUpdates("text")); await f.click(f.routeOf(0));
+      await f.settleUntil(() => f.followerHarness!.telegramQueueStore.getQueuedItems().length === 1);
+      assert.equal(f.followerHarness!.telegramQueueStore.getQueuedItems()[0]?.replyToMessageId, 1000);
+      assert.deepEqual(f.admittedIds, [123]);
+      assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.state, "pending");
+      assert.deepEqual(f.deletions(), []);
+      await f.click(f.routeOf(0));
+      assert.equal(f.apiCalls.filter(call => call.method === "forwardMessage" && call.body.message_thread_id === 10).length, 1);
+      assert.deepEqual(f.admittedIds, [123]);
+      assert.equal(f.followerHarness!.telegramQueueStore.getQueuedItems().length, 1);
+    } finally { await f.stop(); }
+  }, "follower");
+});
+
+for (const outcome of ["http-500", "http-429", "network", "late-success"] as const) {
+  test(`Temporary Reroute destination uses one native HTTP attempt (${outcome})`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("visibility-local", frame);
+      const originalFetch = globalThis.fetch;
+      const requests: Record<string, unknown>[] = [];
+      let generation = 1;
+      globalThis.fetch = async (url, init) => {
+        assert.ok(String(url).endsWith("/forwardMessage"));
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        if (outcome === "network") throw Object.assign(new Error("fixture socket reset"), { code: "ECONNRESET" });
+        if (outcome === "late-success") {
+          generation++;
+          return new Response(JSON.stringify({ ok: true, result: { message_id: 1000 } }), { status: 200 });
+        }
+        const status = outcome === "http-429" ? 429 : 500;
+        return new Response(JSON.stringify({ ok: false, error_code: status, description: "fixture refusal",
+          ...(status === 429 ? { parameters: { retry_after: 0 } } : {}) }), { status });
+      };
+      const api = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", isThreadedMode: () => true,
+        recordRuntimeEvent() {} });
+      f.harness = f.createHarness({ getSessionGeneration: () => generation, async callApi(method, body, options) {
+        if (method === "createForumTopic") return { message_thread_id: 55 } as never;
+        if (method === "forwardMessage" && body.message_thread_id === 55) return { message_id: 900 } as never;
+        assert.equal(method, "forwardMessage");
+        return api.call(method, body, options);
+      } });
+      try {
+        await f.start(visibilityUpdates("text")); await f.click(f.routeOf(0));
+        assert.deepEqual(requests, [{ chat_id: 7, message_thread_id: 10, from_chat_id: 7, disable_notification: true, message_id: 900 }]);
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+        assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.state, "pending");
+        await f.click(f.routeOf(0));
+        assert.equal(requests.length, 1, "No API retry, fallback, UI resend or native admission follows uncertainty");
+        assert.equal(f.harness.telegramQueueStore.getQueuedItems().length, 0);
+      } finally { globalThis.fetch = originalFetch; await f.stop(); }
+    });
+  });
+}
+
+for (const loss of ["source-before-connect", "recipient-before-connect", "source-after-write", "recipient-after-write"] as const) {
+  test(`Temporary Reroute carries its authority into native IPC (${loss})`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("visibility-follower-ipc-worker", frame);
+      let generation = 1;
+      const forwarding = f.harness.routingDeps.foreignOwnedUpdateForwarder!;
+      const invalidate = () => {
+        if (loss.startsWith("source")) generation++;
+        else f.followerRegistry.register({ ...f.followerRegistry.get("old")!, registrationGeneration: "next" });
+      };
+      const afterWrite = loss.endsWith("after-write");
+      if (afterWrite) f.onFollowerAdmitted = invalidate;
+      f.harness = f.createHarness({ getSessionGeneration: () => generation,
+        foreignOwnedUpdateForwarder: { ...forwarding, forwardMessage(input) {
+          assert.equal(typeof input.assertAuthority, "function", "Reroute supplies a local guard, not just an after-ACK check");
+          const pending = forwarding.forwardMessage!(input);
+          if (!afterWrite) queueMicrotask(invalidate);
+          return pending;
+        } } });
+      try {
+        await f.start(visibilityUpdates("text")); await f.click(f.routeOf(0));
+        assert.deepEqual(f.admittedIds, afterWrite ? [123] : [],
+          "No envelope is issued after pre-connect loss; already accepted recipient custody is not undone");
+        if (afterWrite) {
+          await f.settleUntil(() => f.followerHarness!.telegramQueueStore.getQueuedItems().length === 1);
+          assert.equal(f.followerHarness!.telegramQueueStore.getQueuedItems()[0]?.replyToMessageId, 1000);
+          assert.equal(f.recipientJournal.read().entries.find(entry => entry.updateId === 123)?.state, "queued");
+        } else assert.equal(f.followerHarness!.telegramQueueStore.getQueuedItems().length, 0);
+        assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.state, "pending",
+          "A stale ACK never supplies donor removal authority");
+        assert.deepEqual(f.deletions(), []);
+        assert.equal(f.apiCalls.filter(call => call.method === "forwardMessage" && call.body.message_thread_id === 10).length, 1);
+        await f.click(f.routeOf(0));
+        assert.deepEqual(f.admittedIds, afterWrite ? [123] : []);
+        assert.equal(f.apiCalls.filter(call => call.method === "forwardMessage" && call.body.message_thread_id === 10).length, 1);
+      } finally { await f.stop(); }
+    }, "follower");
+  });
+}
 
 // A restart keeps the saved deadline: a still-waiting chooser comes back to life in place; anything else stays held.
 for (const restart of ["revive", "expired"] as const) {
