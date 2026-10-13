@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.56.1: Windows control fixture timing
+
+- `Windows validation`: Selected-follower control fixtures now use fresh registration timestamps and the production Live Restore RPC deadline, rather than a stale synthetic owner and a one-second override. A delayed native apply regression crosses the prune tick while retaining exact command, receipt and donor-ACK assertions; failures include source/recipient phase evidence. Runtime authority and retry policy are unchanged.
+
 ## 0.56.0: Steer from Telegram
 
 - `Thread recovery`: A startup Telegram API timeout can leave the owner without a local bus despite retained Threaded Mode. A fresh positive capability probe now starts that owner's Threaded transport instead of treating the unchanged saved mode as readiness. Healthy buses stay running and followers cannot acquire leadership through this recovery.

@@ -13945,9 +13945,9 @@ for (const mode of ["registration", "process", "executor", "reply-loss", "old-ta
 
 for (const name of ["abort", "stop", "next", "continue", "selected_template"] as const) for (const scenario of ["idle", "busy", "unavailable", "missing-cap", "pre-dispatch",
   ...(name === "continue" || name === "selected_template" ? ["queue-ack-lost", "scope-lost"] as const : ["reply-lost"] as const),
-  ...(name === "selected_template" ? ["template-drift"] as const : []), ...(name === "stop" ? ["discard-refused" as const] : [])] as const) {
+  ...(name === "selected_template" ? ["template-drift"] as const : []), ...(name === "stop" ? ["discard-refused", "slow-apply"] as const : [])] as const) {
   test(`Selected follower control registry holds the saved original, completes semantics and uses only restricted recipient replies (${name}/${scenario})`, async () => {
-    const prelaunch = scenario === "pre-dispatch", fault = prelaunch ? "idle" : scenario;
+    const prelaunch = scenario === "pre-dispatch", fault = prelaunch ? "idle" : scenario === "slow-apply" ? "busy" : scenario;
     await fixture(async f => {
       f.request.source.updateIds = [100];
       const caller = Journal.createTelegramUpdateJournalStore({ path: `${f.path}.caller`, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "abort-caller" }) });
@@ -14012,7 +14012,7 @@ for (const name of ["abort", "stop", "next", "continue", "selected_template"] as
       const registry = Bus.createTelegramBusFollowerRegistry();
       registry.register({ instanceId: "old", sessionId: "session", registrationGeneration: generation, target: f.request.binding.target, slot: "A", cwd: "/repo",
         profileKey: f.request.owner.profileKey, busSocketPath: Bus.getTelegramBusFollowerSocketPath("old", dirname(f.path)), protocol, pid: process.pid,
-        processBirthId: `${process.pid}:abort`, sessionGeneration: 1, connectedAtMs: 1 });
+        processBirthId: `${process.pid}:abort`, sessionGeneration: 1, connectedAtMs: Date.now() });
       const ledger = createTelegramWorkspaceAdmissionLedger({ path: `${f.path}.caller-admission`, profileKey: "scope",
         owner: { processId: process.pid, processBirthId: `${process.pid}:abort-caller` }, getProcessLiveness: () => "alive" });
       const operations = createTelegramWorkspaceOperationRuntime({ getWorkspaceAdmission: () => ledger });
@@ -14047,14 +14047,19 @@ for (const name of ["abort", "stop", "next", "continue", "selected_template"] as
         getLiveRebindJournalBindingKey: () => recipientKey, getSessionId: () => "session", getContext: () => ctx, getLeaderProtocol: () => protocol,
         getLocalProtocol: () => protocol, isLiveRebindSaveEnabled: () => true, isLiveRebindApplyEnabled: () => true, isLiveRebindSettleEnabled: () => true,
         isLiveRebindCommandSetEnabled: () => true,
-        handleLiveRebindSave: peer.save, handleLiveRebindApply: peer.apply,
+        handleLiveRebindSave: peer.save,
+        async handleLiveRebindApply(envelope, context, available) {
+          // Exercise a legitimate response slower than the generic one-second local-RPC deadline.
+          if (envelope.mode === "apply" && scenario === "slow-apply") await new Promise(resolve => setTimeout(resolve, 1100));
+          return peer.apply(envelope, context, available);
+        },
         async handleLiveRebindSettle(envelope, context, available) {
           if (envelope.mode === "release" && fault === "template-drift") writeFileSync(templatePath, "Changed template");
           if (envelope.mode === "observe-command") await worker.waitForDrain();
           return peer.settle(envelope, context, available);
         }, durableAdmission: { async admit() { assert.fail("No generic forwarding"); } } });
       const control = Bus.createTelegramBusLiveRebindController({ getFollower: registry.get, localProtocolIdentity: protocol, getAuthSecret: () => "secret",
-        createRequestId: () => `abort-${++nonce}`, timeoutMs: 1000 });
+        createRequestId: () => `abort-${++nonce}` });
       const liveFollower = { getJournalBindingKey: () => recipientKey, run: control, isSelectedCommandAvailable: () => fault !== "unavailable" };
       const selectedDelivery = BusLeader.createTelegramBusSelectedMenuDeliveryHandler({ followerRegistry: registry, protocolIdentity: protocol,
         workspace: { getScopeKey: ledger.getProfileKey, captureAuthority: () => ({ ...f.auth, executor: { ...f.auth.executor, leaderEpoch: epoch }, isCurrent: () => current }),
@@ -14157,7 +14162,11 @@ for (const name of ["abort", "stop", "next", "continue", "selected_template"] as
         if (willReply) await Promise.race([delivered.promise, new Promise(resolve => setTimeout(resolve, 2000))]);
         for (let i = 0; i < 20 && publication.hasPending(); i++) await new Promise(resolve => setTimeout(resolve, 10));
         assert.equal(getters, 1); assert.equal(prepares, 1); assert.equal(defaults, 0);
-        assert.equal(aborts, fault === "busy" ? 1 : 0, "Control semantics run exactly once on the recipient");
+        assert.equal(aborts, fault === "busy" ? 1 : 0, `Control semantics run exactly once on the recipient: ${JSON.stringify({
+          events: harness.events, rebindings: f.store.listLiveRebindings().map(row => ({ phase: row.phase, inputRelease: row.inputRelease })),
+          donor: caller.read().entries.map(entry => ({ id: entry.updateId, state: entry.state })),
+          recipient: targetJournal.read().entries.map(entry => ({ id: entry.updateId, state: entry.state })),
+        })}`);
         assert.equal(clears, name === "stop" ? 1 : 0);
         assert.equal(nextNotices, name === "next" && fault === "busy" ? 1 : 0);
         assert.equal(activeNotices, name === "next" && fault === "busy" ? 1 : 0);
