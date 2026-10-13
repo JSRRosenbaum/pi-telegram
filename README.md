@@ -61,6 +61,8 @@ The connected Pi instance owns Telegram polling. Use `/telegram-connect <profile
 
 `/telegram-connect` keeps working when the shared runtime `state.json` is damaged. If it is malformed, foreign or contains invalid evidence, the connecting leader replaces it with a fresh empty state and continues. Every profile then forgets old Thread bindings, slots, unfinished Restore/temporary work and polling continuity; `telegram.json`, Pi history and the released `tmp/telegram` are untouched. Permission errors still stop connection. See [Damaged-State Reset](./docs/architecture.md#damaged-state-reset-operator-approved).
 
+If Thread creation was interrupted, an explicit `/telegram-connect` can reset that unfinished attempt and try a fresh connection without clearing queued prompts or taking over a live leader. A lost Telegram response may leave an extra tab behind; known tabs are reused rather than blindly recreated. Both peers need connection-recovery support. See [Connection Recovery](./docs/architecture.md#explicit-connection-recovery).
+
 The prompt queue is session-local. Before a reload or restart, let it drain or knowingly accept losing waiting work and re-send what still matters afterwards; nothing is replayed automatically.
 
 Ordinary network or admission failures use exponential retry pauses capped at 30 seconds, without permanently stopping after an arbitrary attempt count. The poller recovers when the outage clears. Explicit `/telegram-disconnect` still attempts to stop its captured local transport if Thread cleanup is unavailable; it reports unconfirmed cleanup rather than successful deletion, and an old disconnect cannot stop a new connection. Incomplete stop/release remains visible; check `/telegram-status --debug` and keep Pi open.

@@ -1266,6 +1266,14 @@ async function waitForEventLoopCondition(
   throw new Error("Timed out waiting for event-loop condition");
 }
 
+// Runtime integration checks are semantic, not latency benchmarks. Share the test's deadline and always drain teardown.
+async function waitForRuntimeState(context: TestContext, description: string, predicate: () => boolean): Promise<void> {
+  while (!predicate()) {
+    if (context.signal.aborted) throw new Error(`Runtime test ended while waiting for ${description}`);
+    await waitForTimeout(10, undefined, { signal: context.signal });
+  }
+}
+
 async function waitForCondition(
   predicate: () => boolean,
   timeoutMs = 2000,
@@ -3527,6 +3535,7 @@ for (const peer of ["legacy", "capable", "status", "abort", "stop", "next", "con
   const agentDir = await realpath(await mkdtemp(join(tmpdir(), "pt-live-ports-")));
   const protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "prepared-peer", capabilities: [
     Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+    Bus.TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY,
     ...(peer !== "legacy" ? [Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE, Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY,
       Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE, Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
       Bus.TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY] : [])] });
@@ -3540,7 +3549,10 @@ for (const peer of ["legacy", "capable", "status", "abort", "stop", "next", "con
   const target = { chatId: 77, threadId: 43 };
   const server = Bus.createTelegramBusLocalServer({ socketPath: leaderSocket,
     handleEnvelope: BusLeader.createTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry, protocolIdentity: protocol,
-      authSecret: "fixture-secret", provisionFollowerTarget: () => ({ ...target, slot: "A" }),
+      authSecret: "fixture-secret", provisionFollowerTarget: (_registration, options) => {
+        assert.equal(options?.recoverConnection, true, "The public connect command carries explicit recovery intent");
+        return { ...target, slot: "A" };
+      },
       callApi(method) { return method === "getMe" ? { id: 123, has_topics_enabled: true } : true; },
     }) });
   const restoreFetch = setRuntimeTestFetch(async input => {
@@ -8546,12 +8558,13 @@ test("Extension runtime skips proactive local result without Telegram lock owner
 });
 
 for (const draftPreviews of [false, true]) {
-test(`Extension runtime delivers anchored Telegram commentary once before final with preview ${draftPreviews ? "on" : "off"}`, async () => {
+test(`Extension runtime delivers anchored Telegram commentary once before final with preview ${draftPreviews ? "on" : "off"}`, async (t) => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   const deliveredMarkdown: string[] = [];
   const replyAnchors: unknown[] = [];
   let dispatched = false;
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined;
   const { handlers, commands, pi } = createRuntimePiHarness({
     sendUserMessage: (content) => {
       sentMessages.push(content);
@@ -8618,13 +8631,14 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
     await writeRuntimeTelegramLocks({});
     (await getRuntimeTelegramExtension())(pi);
     const idleCtx = createRuntimeExtensionContext();
+    shutdownContext = idleCtx;
     const activeCtx = createRuntimeExtensionContext({
       sessionManager: idleCtx.sessionManager,
       isIdle: () => false,
     });
     await handlers.get("session_start")?.({}, idleCtx);
     await commands.get("telegram-connect")?.handler("", idleCtx);
-    await waitForCondition(() => dispatched);
+    await waitForRuntimeState(t, "initial prompt dispatch", () => dispatched);
     assert.match(
       getRuntimeHarnessTextBlock(sentMessages[0]).text ?? "",
       /^\[telegram\] show checkpoints/,
@@ -8659,7 +8673,7 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       activeCtx,
     );
     await handlers.get("message_end")?.({ message: { ...checkpointMessage, stopReason: "toolUse" } }, activeCtx);
-    await waitForCondition(() => deliveredMarkdown.length === 1);
+    await waitForRuntimeState(t, "anchored commentary", () => deliveredMarkdown.length === 1);
     const finalMessage = {
       role: "assistant",
       content: [{ type: "text", text: "Final **answer**" }],
@@ -8688,12 +8702,12 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       },
       activeCtx,
     );
-    await waitForCondition(() => deliveredMarkdown.length === 2);
+    await waitForRuntimeState(t, "final Markdown delivery", () => deliveredMarkdown.length === 2);
     await Promise.all([
       handlers.get("agent_end")?.({ messages: [finalMessage] }, activeCtx),
       handlers.get("agent_end")?.({ messages: [finalMessage] }, activeCtx),
     ]);
-    await waitForCondition(() => deliveredMarkdown.length >= 2);
+    await waitForRuntimeState(t, "settled final delivery", () => deliveredMarkdown.length >= 2);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(deliveredMarkdown.length, 2, "One active Telegram turn may publish its final answer only once");
     assert.deepEqual(deliveredMarkdown, [
@@ -8705,21 +8719,26 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       { message_id: 10, allow_sending_without_reply: true },
       undefined,
     ]);
-    await handlers.get("session_shutdown")?.({}, idleCtx);
   } finally {
-    restoreFetch();
-    await telegramConfig.restore();
+    try {
+      if (shutdownContext) await handlers.get("session_shutdown")?.({}, shutdownContext);
+    } finally {
+      restoreFetch();
+      await telegramConfig.restore();
+    }
   }
-});
+}, 20_000);
 
 }
 
-test("Extension runtime preserves both busy Next notices through follower queue admission", async () => {
+test("Extension runtime preserves both busy Next notices through follower queue admission", async (t) => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   const secondUpdates = createRuntimeDeferredResponse();
   const thirdUpdates = createRuntimeDeferredResponse();
   const fourthUpdates = createRuntimeDeferredResponse();
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined;
+  let waitingQueue = "";
   let idle = true;
   let abortCount = 0;
   const { handlers, commands, pi } = createRuntimePiHarness({
@@ -8779,13 +8798,17 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     (await getRuntimeTelegramExtension())(pi);
     const ctx = createRuntimeExtensionContext({
       isIdle: () => idle,
-      abort: () => {
-        abortCount += 1;
+      abort: () => { abortCount += 1; },
+      ui: {
+        theme: { fg: (_token: string, text: string) => text },
+        setStatus: (_key: string, text: string) => { waitingQueue = text; },
+        notify: () => {},
       },
     });
+    shutdownContext = ctx;
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("telegram-connect")?.handler("", ctx);
-    await waitForCondition(() => sentMessages.length === 1);
+    await waitForRuntimeState(t, "initial prompt dispatch", () => sentMessages.length === 1);
     idle = false;
     await handlers.get("agent_start")?.({}, ctx);
     secondUpdates.resolve(
@@ -8802,8 +8825,7 @@ test("Extension runtime preserves both busy Next notices through follower queue 
         },
       ]),
     );
-    await waitForCondition(() => getUpdatesCalls >= 3);
-    await waitForTimeout(1_200);
+    await waitForRuntimeState(t, "follow-up poll and queue admission", () => getUpdatesCalls >= 3 && /\+1\b/.test(waitingQueue));
     thirdUpdates.resolve(
       createRuntimeTelegramApiResponse([
         {
@@ -8818,7 +8840,7 @@ test("Extension runtime preserves both busy Next notices through follower queue 
         },
       ]),
     );
-    await waitForCondition(() => abortCount === 1);
+    await waitForRuntimeState(t, "busy Next abort", () => abortCount === 1);
     idle = true;
     const abortedMessage = {
       role: "assistant",
@@ -8827,8 +8849,8 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     };
     await handlers.get("agent_end")?.({ messages: [abortedMessage] }, ctx);
     await handlers.get("agent_settled")?.({}, ctx);
-    await waitForCondition(() => sentMessages.length === 2);
-    await waitForCondition(() =>
+    await waitForRuntimeState(t, "next prompt dispatch", () => sentMessages.length === 2);
+    await waitForRuntimeState(t, "abort notice", () =>
       sendTexts.includes("<b>⏹️ This operation was aborted.</b>")
     );
     const lifecycleNotices = sendTexts.filter((text) =>
@@ -8852,7 +8874,7 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     await handlers.get("message_end")?.({ message: completedMessage }, ctx);
     await handlers.get("agent_end")?.({ messages: [completedMessage] }, ctx);
     await handlers.get("agent_settled")?.({}, ctx);
-    await waitForCondition(() => sendTexts.includes("follow-up answer"));
+    await waitForRuntimeState(t, "follow-up answer", () => sendTexts.includes("follow-up answer"));
     const dispatchBody = sendBodies.find((body) =>
       getRuntimeTelegramApiText(body) ===
         "<b>⏩ Dispatching next queued turn.</b>"
@@ -8867,12 +8889,18 @@ test("Extension runtime preserves both busy Next notices through follower queue 
     });
     assert.equal(finalBody?.reply_parameters, undefined);
     fourthUpdates.resolve(createRuntimeTelegramApiResponse([]));
-    await handlers.get("session_shutdown")?.({}, ctx);
   } finally {
-    restoreFetch();
-    await telegramConfig.restore();
+    secondUpdates.resolve(createRuntimeTelegramApiResponse([]));
+    thirdUpdates.resolve(createRuntimeTelegramApiResponse([]));
+    fourthUpdates.resolve(createRuntimeTelegramApiResponse([]));
+    try {
+      if (shutdownContext) await handlers.get("session_shutdown")?.({}, shutdownContext);
+    } finally {
+      restoreFetch();
+      await telegramConfig.restore();
+    }
   }
-});
+}, 20_000);
 
 test("Extension runtime keeps rapid ordinary messages as distinct queued turns", async () => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();

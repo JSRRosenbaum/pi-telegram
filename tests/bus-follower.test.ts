@@ -137,6 +137,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
   TELEGRAM_BUS_CAPABILITY_QUEUE_STEER,
+  TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
@@ -2828,6 +2829,36 @@ test("Bus follower registration state tracks successful registration and stop", 
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("Native registration carries explicit connect recovery but never adds it to restore-only or automatic registration", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-connect-recovery-wire-"));
+  const socketPath = join(dir, "bus.sock"), flags: boolean[] = [];
+  const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "recovery",
+    capabilities: [...TEST_BUS_PROTOCOL_IDENTITY.capabilities, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY] });
+  const registry = createTelegramBusFollowerRegistry();
+  const server = createTelegramBusLocalServer({ socketPath,
+    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({ followerRegistry: registry,
+      protocolIdentity: protocol, authSecret: "secret",
+      provisionFollowerTarget(_registration, options) {
+        flags.push(options?.recoverConnection === true);
+        return { chatId: 7, threadId: 42, slot: "A" };
+      },
+    }),
+  });
+  let request = 0;
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "follower", createRequestId: () => `register-${++request}`, protocolIdentity: protocol,
+    registrationState: createTelegramBusFollowerRegistrationState(),
+  });
+  try {
+    await server.start();
+    const ctx = { cwd: "/repo" }, leader = { busSocketPath: socketPath, busSecret: "secret" };
+    assert.equal(await follower.registerWithLeader(ctx, leader), true);
+    assert.equal(await follower.registerWithLeader(ctx, leader, { recoverConnection: true }), true);
+    assert.equal(await follower.registerWithLeader(ctx, leader, { restoreWorkspace: true, recoverConnection: true }), true);
+    assert.deepEqual(flags, [false, true, false]);
+  } finally { follower.stop(); await server.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("Bus follower restore-only registration exits quietly without a remembered Workspace", async () => {

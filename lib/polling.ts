@@ -757,6 +757,7 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
   registerFollowerWithOwner: (
     ctx: TContext,
     owner: TOwner,
+    options?: { recoverConnection?: boolean },
   ) => Promise<boolean | undefined>;
   restoreFollowerWithOwner: (
     ctx: TContext,
@@ -776,6 +777,7 @@ export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
   registerFollowerWithLeader: (
     ctx: TContext,
     owner: TOwner,
+    options?: { recoverConnection?: boolean },
   ) => Promise<boolean | undefined>;
   restoreFollowerWithLeader?: (
     ctx: TContext,
@@ -1180,9 +1182,10 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
   const registerFollowerWithOwner = async (
     ctx: TContext,
     owner: TOwner,
+    options?: { recoverConnection?: boolean },
   ): Promise<boolean | undefined> => {
     if (!(await refreshFollowerState())) return undefined;
-    return deps.registerFollowerWithLeader(ctx, owner);
+    return deps.registerFollowerWithLeader(ctx, owner, options);
   };
   const restoreFollowerWithOwner = async (
     ctx: TContext,

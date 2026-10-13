@@ -52,6 +52,7 @@ export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION = "durable-follo
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF = "queue-handoff-v1";
 /** Unspent Steer lane codec; independent from baseline receipt handoff support. */
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_STEER = "queue-steer-v1";
+export const TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY = "explicit-connect-recovery-v1";
 export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE = "input-custody-reference-v1";
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME = "workspace-thread-rename-v1";
 export const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE = "thread-display-mode-v1";
@@ -2144,8 +2145,13 @@ async function handleTelegramBusSocketLine(line, socket, handleEnvelope, recordT
     }
 }
 function parseRegisterEnvelope(value, requestId, kind) {
+    if (value.recoverConnection !== undefined &&
+        (kind !== "follower.register" || value.recoverConnection !== true))
+        return undefined;
     const registration = parseRegistration(value.registration);
-    return registration ? { kind, requestId, registration } : undefined;
+    return registration ? { kind, requestId, registration,
+        ...(kind === "follower.register" && value.recoverConnection === true ? { recoverConnection: true } : {}),
+    } : undefined;
 }
 function parseFollowerPresenceEnvelope(value, requestId, kind) {
     return typeof value.instanceId === "string" &&

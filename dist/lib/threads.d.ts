@@ -495,6 +495,7 @@ export interface TelegramTopicTargetStore {
     } | undefined;
     listReservations: () => TelegramThreadReservation[];
     listPendingProvisions: () => TelegramThreadPendingProvision[];
+    resetPendingProvisionForConnect: (expected: TelegramThreadPendingProvision, isCurrent: () => boolean) => Promise<boolean>;
     listPendingCleanups: () => TelegramThreadCleanupIntent[];
     listSyncObservations: () => TelegramTopicSyncObservation[];
     reserveThread: (reservation: TelegramThreadReservation) => void;
@@ -559,6 +560,7 @@ export interface TelegramTopicTargetStore {
     claimWorkspaceIdentity: (cwd: string, instanceId: string, previousInstanceId?: string, options?: {
         existingBindingOnly?: boolean;
         sessionId?: string;
+        provisionProfileKey?: string;
         onCapacityUnavailable?: () => void;
     }) => TelegramWorkspaceBindingIdentity | undefined;
     releaseWorkspaceClaim: (instanceId: string) => boolean;
@@ -957,4 +959,13 @@ export declare function getTelegramTargetFromApiBody(body: unknown): (TelegramTa
 export declare function isTelegramTopicTargetStaleError(error: unknown): boolean;
 export declare function isTelegramTopicModeUnavailableError(error: unknown): boolean;
 export declare function createTelegramTopicTargetRenamer(deps: TelegramTopicTargetRenamerDeps): (request: TelegramTopicTargetRenameRequest) => Promise<TelegramTopicTargetRecord | undefined>;
+/** Caller holds profile Workspace admission; only an explicit connect grants a fresh creation attempt. */
+export declare function resetTelegramConnectionProvisioning(input: {
+    store: TelegramTopicTargetStore;
+    owner: TelegramThreadPendingProvision["owner"];
+    instanceId: string;
+    profileKey: string;
+    isCurrent: () => boolean;
+    recordEvent: (category: string, message: unknown, details?: Record<string, unknown>) => void;
+}): Promise<void>;
 export declare function createTelegramTopicTargetProvisioner(deps: TelegramTopicTargetProvisionerDeps): (request: TelegramTopicTargetProvisionRequest) => Promise<TelegramTopicTargetProvisionResult>;

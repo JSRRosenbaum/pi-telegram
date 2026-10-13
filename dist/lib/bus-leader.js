@@ -6,7 +6,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.js";
-import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, hasTelegramBusSteerQueueHandoffCapability, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, } from "./bus.js";
+import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY, hasTelegramBusSteerQueueHandoffCapability, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, } from "./bus.js";
 import { escapeHtml } from "./rendering.js";
 import * as Sync from "./sync.js";
 import { parseTelegramIntegerId as asInteger, } from "./target.js";
@@ -881,6 +881,16 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
         if (typeof chatId !== "number")
             return registration.target;
         await deps.topicTargetStore.load();
+        if (options?.recoverConnection && !options.existingWorkspaceBindingOnly) {
+            const epoch = deps.getCurrentLeaderEpoch?.();
+            await Threads.resetTelegramConnectionProvisioning({
+                store: deps.topicTargetStore, owner: "manual-follower", instanceId: registration.instanceId,
+                profileKey: registration.profileKey ?? `manual:${registration.instanceId}`,
+                isCurrent: () => !deps.getCurrentLeaderEpoch ||
+                    (epoch !== undefined && deps.getCurrentLeaderEpoch() === epoch),
+                recordEvent: deps.recordRuntimeEvent,
+            });
+        }
         let restoredPredecessor;
         if (options?.existingWorkspaceBindingOnly && registration.cwd && registration.sessionId &&
             !registration.previousInstanceId && deps.getLiveFollowers && deps.isFollowerProcessAlive) {
@@ -917,6 +927,7 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
             ? deps.topicTargetStore.claimWorkspaceIdentity(registration.cwd, registration.instanceId, registration.previousInstanceId ?? restoredPredecessor?.instanceId, {
                 existingBindingOnly: options?.existingWorkspaceBindingOnly === true,
                 sessionId: registration.sessionId,
+                provisionProfileKey: registration.profileKey ?? `manual:${registration.instanceId}`,
                 onCapacityUnavailable() {
                     capacityUnavailable = true;
                 },
@@ -2261,6 +2272,9 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                     (hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE) &&
                         hasTelegramBusCapability(envelope.registration.protocol, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE));
                 const restoringWorkspace = envelope.kind === "follower.restoreWorkspace";
+                const recoverConnection = envelope.kind === "follower.register" && envelope.recoverConnection === true;
+                const supportsConnectionRecovery = [deps.protocolIdentity, envelope.registration.protocol]
+                    .every(identity => hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY));
                 const supportsWorkspaceAutoConnect = hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT) &&
                     hasTelegramBusCapability(envelope.registration.protocol, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT);
                 if (!compatibility.compatible ||
@@ -2268,7 +2282,8 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                     !readerCompatible() ||
                     (envelope.registration.cwd !== undefined &&
                         envelope.registration.sessionId === undefined) ||
-                    (restoringWorkspace && !supportsWorkspaceAutoConnect)) {
+                    (restoringWorkspace && !supportsWorkspaceAutoConnect) ||
+                    (recoverConnection && !supportsConnectionRecovery)) {
                     return {
                         kind: "bus.ack",
                         requestId: envelope.requestId,
@@ -2309,7 +2324,7 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                         if (hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE) &&
                             !deps.commitFollowerRegistration)
                             throw new Error("Workspace Restore registration publication protection is unavailable.");
-                        const target = await deps.provisionFollowerTarget?.(envelope.registration, { existingWorkspaceBindingOnly: restoringWorkspace });
+                        const target = await deps.provisionFollowerTarget?.(envelope.registration, { existingWorkspaceBindingOnly: restoringWorkspace, ...(recoverConnection ? { recoverConnection: true } : {}) });
                         if (restoringWorkspace && !target) {
                             return {
                                 kind: "bus.ack",

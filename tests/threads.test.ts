@@ -24,6 +24,7 @@ import {
   createTelegramLeaderThreadStateRuntime,
   createTelegramThreadStatusProjectionRuntime,
   createTelegramTopicTargetProvisioner,
+  resetTelegramConnectionProvisioning,
   createTelegramTopicTargetRenamer,
   createTelegramWorkspaceBindingIdentity,
   createTelegramWorkspaceRestoreResolver,
@@ -5554,7 +5555,7 @@ test("Thread provisioner persists pending provision while creating a fresh topic
         assert.deepEqual(body, { chat_id: -1001, name: "Atlas" });
         assert.deepEqual(store.listPendingProvisions(), [
           {
-            id: "provision:inst-a:A:2000",
+            id: store.listPendingProvisions()[0]!.id,
             owner: "manual-follower",
             instanceId: "inst-a",
             profileKey: "manual:inst-a",
@@ -5614,7 +5615,7 @@ test("Thread provisioner preserves ambiguous creation intent and blocks successo
     );
     assert.deepEqual(store.listPendingProvisions(), [
       {
-        id: "provision:inst-a:A:2000",
+        id: store.listPendingProvisions()[0]!.id,
         owner: "manual-follower",
         instanceId: "inst-a",
         profileKey: "manual:inst-a",
@@ -5649,6 +5650,119 @@ test("Thread provisioner preserves ambiguous creation intent and blocks successo
   } finally {
     await rm(dir, { force: true, recursive: true });
   }
+});
+
+test("Explicit connection reset drops only matching unknown creation and preserves targeted recovery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-connect-reset-"));
+  const path = join(dir, "state.json");
+  const store = createTelegramTopicTargetStore({ path });
+  const pending = { id: "unknown", owner: "manual-follower" as const, instanceId: "old",
+    profileKey: "manual:stable", workspaceBindingKey: "old-session-key", status: "ambiguous" as const,
+    slot: "A", startedAtMs: 1 };
+  try {
+    store.upsertPendingProvision(pending);
+    store.upsertPendingProvision({ ...pending, id: "other", profileKey: "manual:other", instanceId: "other", slot: "B" });
+    store.upsertPendingProvision({ ...pending, id: "targeted", target: { chatId: 7, threadId: 42 }, slot: "C" });
+    store.upsertPendingProvision({ ...pending, id: "sidecar", slot: "D" });
+    await store.persist();
+    await store.recordPendingProvisionTargetRecovery({ ...pending, id: "sidecar", slot: "D" }, { chatId: 7, threadId: 43 });
+    const beforeBindings = store.listWorkspaceBindings(), beforeRecords = store.list();
+    const events: unknown[] = [];
+    const input = { store, owner: "manual-follower" as const, instanceId: "new", profileKey: "manual:stable",
+      isCurrent: () => true, recordEvent: (_category: string, message: unknown) => { events.push(message); } };
+    await assert.rejects(resetTelegramConnectionProvisioning({ ...input, isCurrent: () => false }), /authority changed/);
+    assert.equal(store.listPendingProvisions().length, 4);
+    await resetTelegramConnectionProvisioning(input);
+    assert.deepEqual(store.listPendingProvisions().map(p => p.id).sort(), ["other", "sidecar", "targeted"]);
+    assert.deepEqual(store.listWorkspaceBindings(), beforeBindings);
+    assert.deepEqual(store.list(), beforeRecords);
+    assert.equal(events.length, 1);
+    const reopened = createTelegramTopicTargetStore({ path }); await reopened.load();
+    assert.deepEqual(reopened.listPendingProvisions().map(p => p.id).sort(), ["other", "sidecar", "targeted"]);
+    await resetTelegramConnectionProvisioning(input);
+    assert.equal(events.length, 1, "No additional reset when only known targets remain");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Fresh connect creation IDs cannot alias a late old response under a fixed clock", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-connect-attempt-id-"));
+  const path = join(dir, "state.json"), store = createTelegramTopicTargetStore({ path, getNowMs: () => 1 });
+  const provision = createTelegramTopicTargetProvisioner({ topicChatId: 7, store, getNowMs: () => 1,
+    async callApi() { throw new TelegramApiCommitUnknownError("createForumTopic", new Error("lost")); } });
+  try {
+    const request = { instanceId: "owner", profileKey: "manual:stable" };
+    await assert.rejects(provision(request), isTelegramApiCommitUnknownError);
+    const old = store.listPendingProvisions()[0]!;
+    await resetTelegramConnectionProvisioning({ store, owner: "manual-follower", ...request,
+      isCurrent: () => true, recordEvent() {} });
+    await assert.rejects(provision(request), isTelegramApiCommitUnknownError);
+    const fresh = store.listPendingProvisions()[0]!;
+    assert.notEqual(fresh.id, old.id);
+    assert.equal(await store.recordPendingProvisionTargetRecovery(old, { chatId: 7, threadId: 44 }), false);
+    assert.equal(store.listPendingProvisions()[0]?.target, undefined);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Late connection reset completion cannot restore abandoned metadata into a successor", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-connect-reset-generation-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  const pending = { id: "old", owner: "leader" as const, instanceId: "old", profileKey: "cwd:/repo",
+    status: "ambiguous" as const, startedAtMs: 1 };
+  const replacement = { ...pending, id: "new", instanceId: "new" };
+  let current = true;
+  try {
+    store.upsertPendingProvision(pending); await store.persist();
+    await assert.rejects(resetTelegramConnectionProvisioning({
+      store: { ...store, async resetPendingProvisionForConnect(expected, isCurrent) {
+        const result = await store.resetPendingProvisionForConnect(expected, isCurrent);
+        current = false;
+        store.upsertPendingProvision(replacement);
+        return result;
+      } },
+      owner: "leader", instanceId: "old", profileKey: "cwd:/repo", isCurrent: () => current,
+      recordEvent() { assert.fail("No obsolete success notice"); },
+    }), /authority changed/);
+    assert.deepEqual(store.listPendingProvisions(), [replacement]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Connection reset superseded before publication keeps the original in-memory and durable hold", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-connect-reset-before-publication-"));
+  const path = join(dir, "state.json"), store = createTelegramTopicTargetStore({ path });
+  const pending = { id: "old", owner: "leader" as const, instanceId: "old", profileKey: "cwd:/repo",
+    status: "ambiguous" as const, startedAtMs: 1 };
+  let current = true;
+  try {
+    store.upsertPendingProvision(pending); await store.persist();
+    await assert.rejects(resetTelegramConnectionProvisioning({
+      store: { ...store, async resetPendingProvisionForConnect(expected, isCurrent) {
+        const publication = store.resetPendingProvisionForConnect(expected, isCurrent);
+        current = false;
+        return publication;
+      } },
+      owner: "leader", instanceId: "old", profileKey: "cwd:/repo", isCurrent: () => current,
+      recordEvent() { assert.fail("No obsolete success notice"); },
+    }), /authority/);
+    assert.deepEqual(store.listPendingProvisions(), [pending]);
+    const reopened = createTelegramTopicTargetStore({ path }); await reopened.load();
+    assert.deepEqual(reopened.listPendingProvisions(), [pending]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Connection reset publication refusal retains the creation hold", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-connect-reset-refused-"));
+  let mayPersist = true;
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), canPersist: () => mayPersist });
+  const pending = { id: "unknown", owner: "leader" as const, instanceId: "old", profileKey: "cwd:/repo",
+    status: "ambiguous" as const, startedAtMs: 1 };
+  try {
+    store.upsertPendingProvision(pending); await store.persist();
+    mayPersist = false;
+    await assert.rejects(resetTelegramConnectionProvisioning({ store, owner: "leader", instanceId: "new",
+      profileKey: "cwd:/repo", isCurrent: () => true, recordEvent() { assert.fail("No success notice"); } }),
+      /publication authority/);
+    assert.deepEqual(store.listPendingProvisions(), [pending]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("Thread provisioner treats a malformed successful create as commit-unknown", async () => {
@@ -5730,7 +5844,7 @@ test("Thread provisioner preserves its intent and stops binding after create los
     assert.deepEqual(store.list(), []);
     assert.deepEqual(store.listPendingProvisions(), [
       {
-        id: "provision:inst-a:A:2000",
+        id: store.listPendingProvisions()[0]!.id,
         owner: "manual-follower",
         instanceId: "inst-a",
         profileKey: "manual:inst-a",
@@ -5804,7 +5918,7 @@ test("Post-create recovery preserves the acknowledged title with or without a st
       const restored = createTelegramTopicTargetStore({ path, getNowMs: () => 3000 });
       await restored.load();
       assert.deepEqual(restored.listPendingProvisions(), [{
-        id: "provision:inst-a:A:2000", owner: "manual-follower", instanceId: "inst-a",
+        id: store.listPendingProvisions()[0]!.id, owner: "manual-follower", instanceId: "inst-a",
         profileKey: "manual:inst-a", workspaceBindingKey: identity.bindingKey,
         threadName: "Atlas", displayTitle: "extensions",
         slot: "A", target: { chatId: -1001, threadId: 88 }, startedAtMs: 2000,

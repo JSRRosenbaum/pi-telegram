@@ -38,6 +38,7 @@ export declare const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION: "durabl
 export declare const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF: "queue-handoff-v1";
 /** Unspent Steer lane codec; independent from baseline receipt handoff support. */
 export declare const TELEGRAM_BUS_CAPABILITY_QUEUE_STEER: "queue-steer-v1";
+export declare const TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY: "explicit-connect-recovery-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE: "input-custody-reference-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME: "workspace-thread-rename-v1";
 export declare const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE: "thread-display-mode-v1";
@@ -327,6 +328,7 @@ export declare function createTelegramBusFollowerSourceReferenceDeliveryIdentity
 export type TelegramBusEnvelope = ({
     kind: "follower.register";
     requestId: string;
+    recoverConnection?: true;
     registration: TelegramBusInstanceRegistration;
 } | {
     kind: "follower.restoreWorkspace";
