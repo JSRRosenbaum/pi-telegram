@@ -23,10 +23,6 @@ export declare const TELEGRAM_PRIORITY_REACTIONS: readonly [{
     readonly name: "like";
     readonly emoji: "👍";
 }, {
-    readonly id: 11;
-    readonly name: "lightning";
-    readonly emoji: "⚡";
-}, {
     readonly id: 12;
     readonly name: "heart";
     readonly emoji: "❤";
@@ -34,7 +30,8 @@ export declare const TELEGRAM_PRIORITY_REACTIONS: readonly [{
     readonly id: 13;
     readonly name: "dove";
     readonly emoji: "🕊";
-}, {
+}];
+export declare const TELEGRAM_STEER_REACTIONS: readonly [{
     readonly id: 14;
     readonly name: "fire";
     readonly emoji: "🔥";
@@ -60,7 +57,7 @@ export declare const TELEGRAM_REMOVAL_REACTIONS: readonly [{
     readonly name: "wastebasket";
     readonly emoji: "🗑";
 }];
-export declare const TELEGRAM_PRIORITY_REACTION_EMOJIS: ("👍" | "⚡" | "❤" | "🕊" | "🔥")[];
+export declare const TELEGRAM_PRIORITY_REACTION_EMOJIS: ("👍" | "❤" | "🕊")[];
 export declare const TELEGRAM_REMOVAL_REACTION_EMOJIS: ("👎" | "👻" | "💔" | "💩" | "🗑")[];
 export interface TelegramUpdateDeletion {
     deleted_business_messages?: {
@@ -1319,6 +1316,7 @@ export interface TelegramQueueHandoffControlExecutionDeps<TContext> {
 export declare function createTelegramQueueHandoffControlExecutionFactory<TContext>(deps: TelegramQueueHandoffControlExecutionDeps<TContext>): (payload: TelegramControlQueueHandoffPayload) => PendingTelegramControlItem<TContext>["execute"];
 export interface TelegramQueueHandoffCoordinatorInput<TContext> {
     item: TelegramQueueItem<TContext>;
+    steerSupported?: boolean;
     expectedOwner: TelegramUpdateJournalQueueOwner;
     recipientOwner: TelegramUpdateJournalQueueOwnerIdentity;
     handoffToken: string;
@@ -1358,6 +1356,8 @@ export declare function createTelegramQueueHandoffRecipientRuntime<TContext>(dep
     kind: "leader.offerQueueHandoff";
 }>, ctx: TContext) => Promise<TelegramQueueHandoffStageResult>;
 export interface TelegramQueueHandoffReconcilerDeps<TContext> {
+    canHandoffSteerWithRecipient?: (recipient: TelegramBusFollowerView) => boolean;
+    hasPendingDispatch?: () => boolean;
     ownsDirect: () => boolean;
     isFollowerRegistered: () => boolean;
     isBusEnabled: () => boolean;
@@ -1382,6 +1382,8 @@ export interface TelegramQueueHandoffReconcilerDeps<TContext> {
     recordFailure?: (error: unknown, details: Record<string, unknown>) => void;
 }
 export interface TelegramQueueHandoffReconciliationRuntimeAssemblyDeps<TContext> {
+    canHandoffSteerWithRecipient?: (recipient: TelegramBusFollowerView) => boolean;
+    hasPendingDispatch?: () => boolean;
     ownsDirect: () => boolean;
     isFollowerRegistered: () => boolean;
     isBusEnabled: () => boolean;

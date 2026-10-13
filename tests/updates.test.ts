@@ -1,6 +1,7 @@
 /**
  * Regression tests for the Telegram updates domain
  * Covers extraction, authorization, flow planning, runtime execution, public handlers, and durable worker ownership
+ * Zones: telegram, durable admission
  */
 
 import assert from "node:assert/strict";
@@ -12,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { TelegramBusForeignUpdateSettlement } from "../lib/bus.ts";
+import * as Queue from "../lib/queue.ts";
 import {
   abandonTelegramDeferredUpdate,
   acquireTelegramUpdateRouting,
@@ -67,6 +69,7 @@ import {
   TELEGRAM_INTERNAL_AGENT_MESSAGE,
   TELEGRAM_PRIORITY_REACTION_EMOJIS,
   TELEGRAM_PRIORITY_REACTIONS,
+  TELEGRAM_STEER_REACTIONS,
   TELEGRAM_REMOVAL_REACTION_EMOJIS,
   TELEGRAM_REMOVAL_REACTIONS,
   type TelegramQueueAdmissionItemLike,
@@ -368,10 +371,8 @@ test("Update helpers normalize emoji reactions and collect emoji-only entries", 
     ]),
     [
       [10, "like", "👍"],
-      [11, "lightning", "⚡"],
       [12, "heart", "❤"],
       [13, "dove", "🕊"],
-      [14, "fire", "🔥"],
     ],
   );
   assert.deepEqual(
@@ -380,11 +381,10 @@ test("Update helpers normalize emoji reactions and collect emoji-only entries", 
   );
   assert.deepEqual(TELEGRAM_PRIORITY_REACTION_EMOJIS, [
     "👍",
-    "⚡",
     "❤",
     "🕊",
-    "🔥",
   ]);
+  assert.deepEqual(TELEGRAM_STEER_REACTIONS, [{ id: 14, name: "fire", emoji: "🔥" }]);
   assert.deepEqual(TELEGRAM_REMOVAL_REACTION_EMOJIS, [
     "👎",
     "👻",
@@ -1147,6 +1147,38 @@ test("Update runtime answers guest query with access denied for unauthorized use
   ]);
 });
 
+test("Steer reactions use effective intent, fire dominance, and independent suppression", async () => {
+  const store = Queue.createTelegramQueueStore<string>();
+  store.setQueuedItems([{ kind: "prompt", chatId: 7, replyToMessageId: 10, queueOrder: 1, queueLane: "default", laneOrder: 1,
+    sourceMessageIds: [10], queuedAttachments: [], content: [{ type: "text", text: "steer" }], historyText: "", statusSummary: "steer" }]);
+  let order = 20, calls = 0;
+  const mutation = Queue.createTelegramQueueMutationController({ ...store, allocateLaneOrder: () => ++order, updateStatus: () => {} });
+  const react = (old: string[], next: string[], userId = 7) => handleAuthorizedTelegramReactionUpdate({
+    chat: { id: 7, type: "private" }, user: { id: userId, is_bot: false }, message_id: 10,
+    old_reaction: old.map(emoji => ({ type: "emoji", emoji })), new_reaction: next.map(emoji => ({ type: "emoji", emoji })),
+  }, { allowedUserId: 7, ctx: TEST_CONTEXT, applyQueuedTelegramTurnReactionByMessageId: (id, disposition, ctx, scope) => {
+    calls += 1; return mutation.applyReactionByMessageId(id, disposition, ctx, scope);
+  } });
+  await react([], ["👍"]); assert.equal(store.getQueuedItems()[0]!.queueLane, "priority");
+  await react(["👍"], ["👍", "🔥️"]); assert.equal(store.getQueuedItems()[0]!.queueLane, "steer");
+  const steer = store.getQueuedItems()[0]; const count = calls;
+  await react(["👍", "🔥"], ["🔥"]); await react(["🔥"], ["🔥", "👍", "🎉"]);
+  assert.equal(calls, count); assert.equal(store.getQueuedItems()[0], steer);
+  await react(["🔥", "👍"], ["🔥", "👍", "👎"]);
+  const skipped = store.getQueuedItems()[0] as Queue.PendingTelegramTurn;
+  assert.equal(skipped.queueLane, "steer"); assert.equal(skipped.laneOrder, steer!.laneOrder);
+  assert.equal(skipped.reactionSuppressionEmoji, "👎");
+  await react(["🔥", "👍", "👎"], ["👍", "👎"]);
+  assert.equal(store.getQueuedItems()[0]!.queueLane, "priority");
+  await react(["👍", "👎"], ["👎"]); assert.equal(store.getQueuedItems()[0]!.queueLane, "default");
+  await react(["👎"], []);
+  const plain = store.getQueuedItems()[0]; const plainCalls = calls;
+  await react([], ["⚡", "🎉"]); assert.equal(calls, plainCalls); assert.equal(store.getQueuedItems()[0], plain);
+  await react([], ["🔥"], 8); assert.equal(calls, plainCalls);
+  if (plain?.kind === "prompt") plain.steerAttempted = true;
+  await react([], ["🔥"]); assert.equal(store.getQueuedItems()[0], plain, "Late fire never reissues protected work");
+});
+
 test("Update runtime preserves both flags from complete reaction sets with removal precedence", async () => {
   const events: string[] = [];
   const deps = {
@@ -1330,7 +1362,6 @@ test("Update runtime preserves both flags from complete reaction sets with remov
     "apply:10:reaction-transition:p:👍;s:=",
     "apply:11:reaction-transition:p:-;s:=",
     "apply:12:reaction-transition:p:=;s:👎",
-    "apply:13:reaction-transition:p:⚡;s:=",
     "apply:14:reaction-transition:p:❤;s:=",
     "apply:15:reaction-transition:p:🕊;s:=",
     "apply:16:reaction-transition:p:🔥;s:=",
@@ -6120,6 +6151,49 @@ test("Queue handoff coordinator surfaces post-acceptance donor removal failure",
     }),
     /donor item .* disappeared after acceptance/u,
   );
+});
+
+test("Steer handoff reconciler gates custody before offer and rechecks negotiation before staging", async () => {
+  for (const mode of ["compatible", "legacy", "capability-lost", "frozen", "pending", "offered"] as const) {
+    const receipt = Queue.createTelegramQueueAdmissionReceipt({ queueKind: "prompt", sourceUpdateIds: [1, 2],
+      scope: JSON.stringify({ version: 1, path: "/donor-journal", receiptScope: "donor" }) })!;
+    const owner = { instanceId: "donor", processId: 10, processBirthId: "10:start:donor", sessionGeneration: 1,
+      acquisitionId: "acquired", acquiredAtMs: 100 };
+    const item: Queue.PendingTelegramTurn = { kind: "prompt", chatId: 7, target: { chatId: 7, threadId: 20 },
+      replyToMessageId: 10, queueOrder: 1, queueLane: "steer", laneOrder: 1, statusSummary: "steer",
+      admissionReceipts: [receipt], sourceMessageIds: [10, 11], queuedAttachments: [], content: [{ type: "text", text: "whole" }],
+      historyText: "whole", ...(mode === "frozen" ? { steerAttempted: true } : {}),
+    };
+    const recipient = { instanceId: "recipient", pid: 20, processBirthId: "20:start:recipient", sessionGeneration: 2,
+      profileKey: "recipient", registrationGeneration: "registration", target: item.target, connectedAtMs: 1, lastHeartbeatMs: 1 };
+    const events: string[] = []; let capReads = 0;
+    const reconcile = createTelegramQueueHandoffReconciler<string>({
+      ownsDirect: () => true, isFollowerRegistered: () => false, isBusEnabled: () => true,
+      canHandoffSteerWithRecipient: () => { capReads += 1; return mode !== "legacy" && (mode !== "capability-lost" || capReads === 1); },
+      hasPendingDispatch: () => mode === "pending", listFollowers: () => [recipient],
+      getQueuedItems: () => [item], createRecipientJournalBindingKey: () => "recipient-journal",
+      getReceiptOwner: () => {
+        assert.ok(!["legacy", "frozen", "pending"].includes(mode), "Unsupported/protected items never inspect or mutate custody");
+        return mode === "offered" ? undefined : owner;
+      },
+      getLifecycleForReceipt: () => ({ offerQueueReceiptHandoff: () => { events.push("offer"); },
+        cancelQueueReceiptHandoff: () => { events.push("cancel"); } }) as never,
+      createHandoffToken: () => "x".repeat(32), createRequestId: () => "handoff", donorInstanceId: "donor",
+      stageThroughFollower: () => assert.fail("Direct donor uses leader routing"),
+      routeThroughLeader: async input => {
+        events.push("stage"); assert.equal(input.payload.queueLane, "steer");
+        assert.deepEqual(input.payload.admissionReceipts[0]!.sourceUpdateIds, [1, 2]);
+        return { kind: "bus.ack", requestId: input.requestId, ok: true, result: { status: "staged", receiptId: receipt.receiptId,
+          sourceUpdateIds: [1, 2], queueOwner: { ...owner, instanceId: "recipient", processId: 20,
+            processBirthId: "20:start:recipient", sessionGeneration: 2 } } };
+      },
+      removeDonorItem: exact => { assert.deepEqual(exact.sourceUpdateIds, [1, 2]); events.push("remove"); return true; },
+    });
+    await reconcile("ctx");
+    assert.deepEqual(events, mode === "compatible" ? ["offer", "stage", "remove"] :
+      mode === "capability-lost" ? ["offer", "cancel"] : []);
+    assert.equal(item.queueLane, "steer"); assert.equal(item.queueOrder, 1);
+  }
 });
 
 test("Queue handoff reconciler routes only exact target owners and removes accepted donor work", async () => {

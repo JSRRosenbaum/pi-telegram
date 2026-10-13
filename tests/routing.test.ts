@@ -1,6 +1,7 @@
 /**
  * Regression tests for inbound Telegram route composition
  * Covers route-level wiring from paired updates into prompt queueing
+ * Zones: telegram, pi agent, shared utils
  */
 
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -9788,6 +9789,31 @@ for (const role of ["local", "follower"] as const) for (const kind of ["text", "
           }
         }
         if (role === "local" && kind !== "text") assert.equal(downloads.length, source.length);
+        const ownerHarness = role === "local" ? f.harness : f.followerHarness!;
+        const ownerWorker = role === "local" ? f.worker : f.followerWorker!;
+        const ownerJournal = role === "local" ? f.journal : f.recipientJournal;
+        const retainedBeforeLaneChange = ownerJournal.read();
+        const receipts = turn.admissionReceipts, content = turn.content, attachments = turn.queuedAttachments;
+        assert.equal(ownerHarness.routingDeps.queueMutationRuntime.applyReactionByMessageId(1000,
+          { kind: "reaction-transition", promptLane: "steer", priorityEmoji: "🔥" }, { cwd: "/repo" },
+          { chatId: 7, threadId: 10 }), true);
+        const steer = queue.getQueuedItems()[0]!;
+        assert.ok(steer.kind === "prompt");
+        assert.equal(steer.queueLane, "steer");
+        assert.equal(steer.queueOrder, turn.queueOrder);
+        assert.equal(steer.admissionReceipts, receipts, "Lane selection retains the exact grouped receipt objects");
+        assert.equal(steer.content, content); assert.equal(steer.queuedAttachments, attachments);
+        const packet = Queue.planTelegramSteerPacket(queue.getQueuedItems(), { blocked: false,
+          isItemReady: item => item.admissionReceipts!.every(receipt => ownerWorker.isQueueReceiptCommitted(receipt)),
+          canAppend: (_prefix, item) => Queue.isTelegramSteerItemWithinIdleCapacity(item) });
+        assert.equal(packet.kind, "packet");
+        if (packet.kind === "packet") {
+          assert.equal(packet.items.length, 1, "A media group is one indivisible Queue item");
+          assert.equal(packet.items[0], steer);
+          assert.deepEqual(packet.items[0]!.target, { chatId: 7, threadId: 10 }, "No All output or former-tab anchor is manufactured");
+          assert.equal(packet.items[0]!.replyToMessageId, 1000);
+        }
+        assert.deepEqual(ownerJournal.read(), retainedBeforeLaneChange, "Planning is not custody settlement or model-use proof");
         await f.click(f.routeOf(0));
         assert.equal(queue.getQueuedItems().length, 1);
         assert.equal(f.apiCalls.filter(call => ["forwardMessage", "forwardMessages"].includes(call.method) && call.body.message_thread_id === 10).length, 1);
@@ -11973,8 +11999,10 @@ for (const role of ["leader", "follower"] as const) {
           }
         };
         const independentTurn: Queue.PendingTelegramTurn = { kind: "prompt", chatId: 7, target: oldTarget, replyToMessageId: 0,
-          queueOrder: 0, queueLane: "default", laneOrder: 0, statusSummary: "Independent work", historyText: "Independent work",
-          sourceMessageIds: [], queuedAttachments: [], content: [{ type: "text", text: "Independent work" }] };
+          queueOrder: 0, queueLane: delivery === "queued-before" || delivery === "queued-during" ? "steer" : "default",
+          laneOrder: 0, statusSummary: "Independent work", historyText: "Independent work",
+          sourceMessageIds: [], queuedAttachments: [], content: [{ type: "text", text: "Independent work" }],
+          ...(delivery === "queued-during" ? { steerAttempted: true } : {}) };
         let observations = 0;
         let settlementUnavailable = delivery === "settlement-publication-interrupted";
         let interruptedPublications = 0;
@@ -12971,6 +12999,11 @@ for (const role of ["leader", "follower"] as const) {
             assert.deepEqual(delivery === "active-before" ? activeTurnRuntime.get() :
               telegramQueueStore.getQueuedItems().find(value => value === independentTurn), independentTurn,
               "independent accepted work remains untouched");
+            if (delivery !== "active-before") {
+              assert.equal(independentTurn.queueLane, "steer");
+              assert.equal(Queue.countExecutableTelegramQueueItems([independentTurn]), delivery === "queued-during" ? 0 : 1,
+                "Frozen Steer is non-executable but remains accepted target work for Restore protection");
+            }
             if (delivery === "queued-during") telegramQueueStore.setQueuedItems(telegramQueueStore.getQueuedItems().filter(value => value !== independentTurn));
             assert.ok(repeatAck); repeatAck(); await routeRuntime.waitForRestoreSettlement();
             assert.deepEqual(store.list(), retained, "protection is not deletion evidence or permission to retry an issued grant");

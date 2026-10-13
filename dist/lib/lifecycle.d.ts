@@ -5,7 +5,7 @@
  * Transport authority, durable bindings, and queue custody remain with their owners.
  */
 import * as BusFollower from "./bus-follower.ts";
-import type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionCompactFailedEvent, SessionShutdownEvent, SessionStartEvent, ToolExecutionEndEvent, ToolExecutionStartEvent, ToolExecutionUpdateEvent, UIPromptEndEvent, UIPromptStartEvent } from "./pi.ts";
+import type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionCompactFailedEvent, SessionShutdownEvent, SessionStartEvent, ToolExecutionEndEvent, ToolExecutionStartEvent, ToolExecutionUpdateEvent, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent } from "./pi.ts";
 import * as Machine from "./machine.ts";
 import * as Queue from "./queue.ts";
 export declare function createAgentStartDedupHook(inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>, resetReplyDedup: () => void, schedulePublication?: (task: () => Promise<void>) => void): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>;
@@ -30,6 +30,7 @@ export interface TelegramLifecycleRegistrationDeps {
     onModelSelect: (event: {
         model: TelegramLifecycleModel;
     }, ctx: ExtensionContext) => Promise<void> | void;
+    onTurnEnd?: (event: TurnEndEvent, ctx: ExtensionContext) => TurnEndEventResult | undefined;
     onAgentStart: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>;
     onToolExecutionStart: (event: ToolExecutionStartEvent, ctx: ExtensionContext) => Promise<void> | void;
     onToolExecutionUpdate?: (event: ToolExecutionUpdateEvent, ctx: ExtensionContext) => Promise<void> | void;

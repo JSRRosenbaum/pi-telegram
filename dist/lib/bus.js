@@ -50,6 +50,8 @@ export function createTelegramBusAuthSecret() {
 const TELEGRAM_BUS_PROTOCOL_VERSION = 3;
 export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION = "durable-follower-admission-v1";
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF = "queue-handoff-v1";
+/** Unspent Steer lane codec; independent from baseline receipt handoff support. */
+export const TELEGRAM_BUS_CAPABILITY_QUEUE_STEER = "queue-steer-v1";
 export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE = "input-custody-reference-v1";
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME = "workspace-thread-rename-v1";
 export const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE = "thread-display-mode-v1";
@@ -172,6 +174,10 @@ export function createTelegramCurrentBusProtocolIdentity(capabilities = []) {
 }
 export function hasTelegramBusCapability(identity, capability) {
     return identity?.capabilities.includes(capability) ?? false;
+}
+export function hasTelegramBusSteerQueueHandoffCapability(identity) {
+    return hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF) &&
+        hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER);
 }
 export function getTelegramInputCustodyPeerReadiness(followers) {
     return followers.map((follower) => {

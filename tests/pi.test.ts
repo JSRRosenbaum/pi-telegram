@@ -1,6 +1,7 @@
 /**
  * Regression tests for the pi SDK adapter boundary
  * Covers narrow bridge-facing helpers over concrete pi context contracts
+ * Zones: pi agent sdk boundary, shared adapters
  */
 
 import assert from "node:assert/strict";
@@ -19,6 +20,7 @@ import {
   getExtensionContextModel,
   hasExtensionContextPendingMessages,
   isExtensionContextIdle,
+  isExtensionContextAbortRequested,
   isExtensionContextPassiveRunMode,
   normalizeSettingsManager,
 } from "../lib/pi.ts";
@@ -55,6 +57,15 @@ test("Pi context mode helpers feature-detect passive run modes", () => {
     formatPollingStartBlockedByRunMode({ mode: "json" }),
     "Telegram polling is unavailable in Pi json mode. Use /telegram-connect from a long-lived Pi session.",
   );
+});
+
+test("Pi abort adapter reads the current public signal without inventing one", () => {
+  const abort = new AbortController();
+  const ctx = { signal: abort.signal } as ExtensionContext;
+  assert.equal(isExtensionContextAbortRequested(ctx), false);
+  abort.abort();
+  assert.equal(isExtensionContextAbortRequested(ctx), true);
+  assert.equal(isExtensionContextAbortRequested({} as ExtensionContext), false);
 });
 
 test("Pi session identity adapter is lifecycle-alias agnostic", () => {

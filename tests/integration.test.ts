@@ -1,6 +1,7 @@
 /**
  * Cross-domain integration tests for the Telegram extension
  * Exercises extension-level polling, queue/lifecycle wiring, previews, reactions, compaction, and model switching
+ * Zones: telegram, pi agent, shared utils
  */
 
 import assert from "node:assert/strict";
@@ -4853,10 +4854,14 @@ test("Extension runtime polls, pairs, and dispatches an inbound Telegram turn in
   }
 });
 
-for (const outcome of ["unchanged", "offered", "transferred", "discarded", "cancelled",
-  "offered-without-wake", "observation-failed", "prompt-unchanged", "prompt-race",
-  "prompt-completion-lost-ack", "discard-completion-lost-ack"] as const) {
-strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome})`, async () => {
+for (const delivery of ["ordinary", "idle-steer", "active-steer"] as const) {
+const outcomes = delivery === "ordinary"
+  ? ["unchanged", "offered", "transferred", "discarded", "cancelled", "offered-without-wake",
+    "observation-failed", "prompt-unchanged", "prompt-race", "prompt-completion-lost-ack", "discard-completion-lost-ack"] as const
+  : ["prompt-unchanged", "offered-without-wake", "transferred", "cancelled", "discarded",
+    "prompt-completion-lost-ack", "prompt-generation-loss"] as const;
+for (const outcome of outcomes) {
+strictFileTest(`Prepared donor receipt projection gates Queue issuance (${delivery}/${outcome})`, async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-donor-projection-")));
   const configPath = join(dir, "telegram.json");
   const botToken = "123:fixture-donor-projection";
@@ -4884,7 +4889,7 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       getInputContext: () => ({ owner, recipientBindingKey: "workspace:donor" }),
     };
     const source = Journal.createTelegramInputJournalStore(options);
-    const isPrompt = outcome.startsWith("prompt-");
+    const isPrompt = delivery !== "ordinary" || outcome.startsWith("prompt-");
     source.appendBatch([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], 3);
     const input = source.acquireInput({ updateId: 1, recipientBindingKey: "workspace:donor" });
     source.startInput(input.receipt);
@@ -4906,6 +4911,7 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       },
       completeQueued(receipts) {
         const result = source.completeQueued(receipts);
+        if (outcome === "prompt-generation-loss") deferredDispatch.bind("ctx");
         if (outcome.endsWith("completion-lost-ack")) throw new Error("fixture completion ACK lost");
         return result;
       },
@@ -4936,7 +4942,8 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
     const binding = Bindings.createTelegramQueueBindingRuntime({ store, admission, deferredDispatch,
       queue: { allocateItemOrder: () => 1 }, activeTurn: { has: () => false },
       lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => false },
-      transportStamp: { isActive: () => true }, isIdle: () => true, hasPendingMessages: () => false,
+      transportStamp: { isActive: () => true }, isIdle: () => delivery !== "active-steer", hasPendingMessages: () => false,
+      isContextCurrent: ctx => ctx === "ctx", isContextAborted: () => false,
       updateStatus: () => {}, sendTextReply: async () => undefined,
       sendUserMessage: () => { effects.push("prompt"); },
       promptDispatch: { startTypingLoop: () => {}, onPromptDispatchFailure: () => {},
@@ -4947,7 +4954,7 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
     const base = { chatId: 7, replyToMessageId: 1, queueOrder: 1, laneOrder: 1,
       statusSummary: "retained work", admissionReceipts: [{ ...queued, journalBindingKey }] };
     const item: Queue.TelegramQueueItem<string> = isPrompt
-      ? { ...base, kind: "prompt", queueLane: "default", sourceMessageIds: [1], queuedAttachments: [],
+      ? { ...base, kind: "prompt", queueLane: delivery === "ordinary" ? "default" : "steer", sourceMessageIds: [1, 3], queuedAttachments: [],
         content: [{ type: "text", text: "retained prompt" }], historyText: "" }
       : { ...base, kind: "control", controlType: "status", queueLane: "control",
         async execute() { effects.push("control"); } };
@@ -4988,29 +4995,45 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       assert.equal(settlement.isItemReady(item), true);
     }
     const before = source.read();
+    const issue = () => {
+      if (delivery !== "active-steer") return binding.dispatchNext("ctx");
+      const proposal = binding.onTurnEnd({ turnIndex: 1, outcome: "completed" }, "ctx");
+      if (proposal) {
+        assert.equal(proposal.continue, true);
+        assert.equal(proposal.entries?.length, 1);
+        effects.push("proposal");
+      }
+    };
     if (outcome === "discard-completion-lost-ack") {
       assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
-    } else binding.dispatchNext("ctx");
+    } else issue();
     await new Promise<void>(done => setImmediate(done));
     const executable = outcome === "unchanged" || outcome === "cancelled" ||
       outcome === "observation-failed" || outcome === "prompt-unchanged";
-    assert.deepEqual(effects, executable ? [isPrompt ? "prompt" : "control"] : [],
+    const promptEffect = delivery === "active-steer" ? "proposal" : "prompt";
+    assert.deepEqual(effects, executable ? [isPrompt ? promptEffect : "control"] : [],
       "Durable revocation or missing completion ACK must precede effects");
     if (!executable) {
       assert.equal(store.getQueuedItems().length, 1);
       assert.equal(settlement.isItemReady(item), false);
       assert.equal(settlement.getQueueReceiptOwner(item.admissionReceipts![0]!), undefined);
       if (outcome === "prompt-race") assert.ok(source.read().entries[0]!.queueHandoff);
-      else if (outcome.endsWith("completion-lost-ack")) {
+      else if (outcome.endsWith("completion-lost-ack") || outcome === "prompt-generation-loss") {
         assert.deepEqual(source.read().entries.map(entry => entry.updateId), [2]);
       } else assert.deepEqual(source.read(), before);
       const retained = source.read();
-      assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
-      assert.equal(store.getQueuedItems().length, 1);
+      issue();
+      assert.deepEqual(effects, [], "Protected attempts or revoked/offered receipts cannot replay");
+      if (outcome === "prompt-generation-loss") {
+        assert.equal(binding.mutation.clear("ctx"), 1, "Exact ACK permits disposal only, never publication into the reused context");
+      } else {
+        assert.throws(() => binding.mutation.clear("ctx"), /could not be discarded durably/);
+        assert.equal(store.getQueuedItems().length, 1);
+      }
       assert.deepEqual(source.read(), retained);
     } else assert.deepEqual(source.read().entries.map(entry => entry.updateId), [2]);
     assert.equal(settlement.isItemReady({ admissionReceipts: [{ ...unrelated, journalBindingKey }] }), true);
-    if (outcome === "prompt-unchanged") {
+    if (outcome === "prompt-unchanged" && delivery !== "active-steer") {
       const receipt = item.admissionReceipts![0]!;
       const ids = receipt.sourceUpdateIds;
       receipt.sourceUpdateIds = [1];
@@ -5023,14 +5046,15 @@ strictFileTest(`Prepared donor receipt projection gates real dispatch (${outcome
       const retained = source.read();
       await assembly.leader.onTransportChanged("ctx");
       await new Promise<void>(done => setImmediate(done));
-      binding.dispatchNext("ctx");
-      assert.deepEqual(effects, ["prompt"]);
+      issue();
+      assert.deepEqual(effects, [promptEffect]);
       assert.equal(binding.mutation.clear("ctx"), 1);
       assert.deepEqual(source.read(), retained);
     }
     assert.deepEqual(ledger.read().leases, []);
   } finally { await shutdown?.(); await rm(dir, { recursive: true, force: true }); }
 });
+}
 }
 
 for (const outcome of ["accepted", "rejected", "lost-ack"] as const) {

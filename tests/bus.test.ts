@@ -66,6 +66,8 @@ import {
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  TELEGRAM_BUS_CAPABILITY_QUEUE_STEER,
+  hasTelegramBusSteerQueueHandoffCapability,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
@@ -386,6 +388,14 @@ test("Bus envelopes classify bootstrap, fenced traffic, and responses", () => {
     }),
     "response",
   );
+});
+
+test("Steer wire capability requires independent base handoff support", () => {
+  for (const caps of [[], [TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF], [TELEGRAM_BUS_CAPABILITY_QUEUE_STEER],
+    [TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER]]) {
+    assert.equal(hasTelegramBusSteerQueueHandoffCapability(createTelegramBusProtocolIdentity({ runtimeBuild: "fixture", capabilities: caps })), caps.length === 2);
+  }
+  assert.equal(hasTelegramBusSteerQueueHandoffCapability(undefined), false);
 });
 
 test("Bus protocol capabilities are explicit and independently negotiable", () => {

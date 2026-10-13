@@ -209,6 +209,10 @@ export interface TelegramQueueBindingRuntime<TContext> {
   requestNextDispatchAnnouncement: () => void;
   cancelNextDispatchAnnouncement: () => void;
   watchdog: Queue.TelegramQueueDispatchWatchdogRuntime<TContext>;
+  onTurnEnd: (
+    event: Pick<Pi.TurnEndEvent, "turnIndex" | "outcome">,
+    ctx: TContext,
+  ) => Pi.TurnEndEventResult | undefined;
 }
 
 export function createTelegramQueueBindingRuntime<TContext>(deps: {
@@ -217,8 +221,8 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   lifecycle: Pick<
     Runtime.TelegramBridgeRuntime["lifecycle"],
     "isCompactionInProgress" | "hasDispatchPending"
-  >;
-  activeTurn: Pick<Queue.TelegramActiveTurnStore, "has">;
+  > & Partial<Pick<Runtime.TelegramBridgeRuntime["lifecycle"], "getActiveToolExecutions">>;
+  activeTurn: Pick<Queue.TelegramActiveTurnStore, "has"> & Partial<Pick<Queue.TelegramActiveTurnStore, "get">>;
   admission: {
     getSettlement: () =>
       | {
@@ -228,7 +232,7 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
           ) => boolean;
           isItemReady: (item: Queue.TelegramQueueItem<TContext>) => boolean;
           onPromptHandedOff?: (
-            item: Queue.PendingTelegramTurn,
+            item: Pick<Queue.PendingTelegramTurn, "admissionReceipts">,
             ctx: TContext,
           ) => boolean;
           onControlSettled: (
@@ -249,6 +253,8 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
   promptDispatch: Runtime.TelegramPromptDispatchRuntime<TContext>;
   isIdle: (ctx: TContext) => boolean;
   hasPendingMessages: (ctx: TContext) => boolean;
+  isContextCurrent?: (ctx: TContext) => boolean;
+  isContextAborted?: (ctx: TContext) => boolean;
   updateStatus: (ctx: TContext, error?: string) => void;
   sendTextReply: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendTextReply"];
   sendUserMessage: Queue.TelegramQueueDispatchRuntimeDeps<TContext>["sendUserMessage"];
@@ -268,6 +274,10 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     const settlement = deps.admission.getSettlement();
     if (!settlement) return false;
     return settlement.onItemsDiscarded(durableItems, ctx) === true;
+  };
+  const settlePromptPacket = (items: readonly Queue.PendingTelegramTurn[], ctx: TContext): boolean => {
+    const receipts = items.flatMap(item => item.admissionReceipts ?? []);
+    return receipts.length === 0 || deps.admission.getSettlement()?.onPromptHandedOff?.({ admissionReceipts: receipts }, ctx) === true;
   };
   const mutation = Queue.createTelegramQueueMutationController({
     ...deps.store,
@@ -309,6 +319,13 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
       if (!settlement?.onPromptHandedOff) return false;
       return settlement.onPromptHandedOff(item, ctx) === true;
     },
+    steerDispatch: {
+      commitPacket: settlePromptPacket,
+      isContextCurrent: (ctx: TContext) => deps.isContextCurrent?.(ctx) === true,
+      canSubmit: (ctx: TContext) => deps.isContextAborted?.(ctx) === false &&
+        deps.isIdle(ctx) && !deps.hasPendingMessages(ctx) && !deps.lifecycle.isCompactionInProgress() &&
+        !deps.activeTurn.has() && (deps.lifecycle.getActiveToolExecutions?.() ?? 0) === 0,
+    },
     onControlSettled(item, ctx) {
       deps.admission.getSettlement()?.onControlSettled(item, ctx);
     },
@@ -323,8 +340,32 @@ export function createTelegramQueueBindingRuntime<TContext>(deps: {
     ...deps.promptDispatch,
     sendUserMessage: deps.sendUserMessage,
   });
+  const steer = Queue.createTelegramSteerBoundaryRuntime({
+    ...deps.store,
+    getGeneration: deps.deferredDispatch.getGeneration,
+    isContextCurrent: (ctx: TContext) => deps.isContextCurrent?.(ctx) === true,
+    isBlocked: (ctx: TContext) =>
+      deps.isContextAborted?.(ctx) !== false || !deps.deferredDispatch.isBound() ||
+      deps.isIdle(ctx) || deps.hasPendingMessages(ctx) ||
+      deps.lifecycle.isCompactionInProgress() || deps.lifecycle.hasDispatchPending() ||
+      (deps.lifecycle.getActiveToolExecutions?.() ?? 0) > 0 ||
+      (deps.activeTurn.has() && !deps.activeTurn.get?.()),
+    isItemReady(item: Queue.TelegramQueueItem<TContext>) {
+      return deps.transportStamp.isActive(item.transportStamp) &&
+        !deps.admission.hasPendingQueueMutationForItem(item) &&
+        (deps.admission.getSettlement()?.isItemReady(item) ?? (item.admissionReceipts?.length ?? 0) === 0);
+    },
+    isItemCurrent: (item) => deps.transportStamp.isActive(item.transportStamp) &&
+      !deps.admission.hasPendingQueueMutationForItem(item),
+    getActiveTurn: () => deps.activeTurn.get?.(),
+    commitPacket: settlePromptPacket,
+    discardItem: (item, ctx) => settleDiscardedItems([item], ctx),
+    updateStatus: deps.updateStatus,
+    recordRuntimeEvent: deps.recordRuntimeEvent,
+  });
   return {
     mutation,
+    onTurnEnd: steer.onTurnEnd,
     dispatchNext: dispatch.dispatchNext,
     requestNextDispatchAnnouncement: dispatch.requestNextDispatchAnnouncement,
     cancelNextDispatchAnnouncement: dispatch.cancelNextDispatchAnnouncement,
@@ -1156,6 +1197,7 @@ interface TelegramLifecycleBindingDeps {
   >["sendTextReply"] &
     NonNullable<OutboundHandlers.TelegramVoiceReplySenderDeps["sendTextReply"]>;
   dispatchNextQueuedTelegramTurn: (ctx: Pi.ExtensionContext) => void;
+  onSteerTurnEnd?: TelegramQueueBindingRuntime<Pi.ExtensionContext>["onTurnEnd"];
   onPromptHandedOff?: (
     turn: Queue.PendingTelegramTurn,
     ctx: Pi.ExtensionContext,
@@ -1236,6 +1278,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   sendMarkdownReply,
   sendTextReply,
   dispatchNextQueuedTelegramTurn,
+  onSteerTurnEnd,
   onPromptHandedOff,
   answerGuestQuery,
   deleteMessage,
@@ -1566,6 +1609,12 @@ export function registerTelegramLifecycleRuntimeHooks({
     isSessionActive: isSessionContextActive,
     ...sessionLifecycleRuntime,
     ...agentLifecycleHooks,
+    ...(onSteerTurnEnd ? {
+      onTurnEnd(event: Pi.TurnEndEvent, ctx: Pi.ExtensionContext) {
+        const result = onSteerTurnEnd(event, ctx);
+        return result ? { ...result, entries: [...event.entries, ...(result.entries ?? [])] } : undefined;
+      },
+    } : {}),
     onInput(event) {
       activityRuntime.recordInputSource(event.source ?? "unknown");
     },

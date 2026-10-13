@@ -64,6 +64,7 @@ const telegramBusProtocolIdentity =
   Bus.createTelegramCurrentBusProtocolIdentity([
     Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
     Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+    Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_STEER,
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
     Bus.TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
@@ -717,7 +718,6 @@ export default function (pi: Pi.ExtensionAPI) {
     },
     getQueuedItems: telegramQueueStore.getQueuedItems,
     getQueuedItemCount: Queue.countExecutableTelegramQueueItems,
-    formatQueuedStatus: Queue.formatQueuedTelegramItemsStatus,
     getRecentRuntimeEvents: runtimeEvents.getEvents,
     getRuntimeLockState: lockRuntime.getStatusLabel,
     ...threadStatusProjectionRuntime,
@@ -1026,6 +1026,7 @@ export default function (pi: Pi.ExtensionAPI) {
     requestNextDispatchAnnouncement,
     cancelNextDispatchAnnouncement,
     watchdog: queueDispatchWatchdogRuntime,
+    onTurnEnd: onSteerTurnEnd,
   } = Bindings.createTelegramQueueBindingRuntime({
     store: telegramQueueStore,
     queue,
@@ -1037,6 +1038,8 @@ export default function (pi: Pi.ExtensionAPI) {
     promptDispatch: promptDispatchRuntime,
     isIdle,
     hasPendingMessages,
+    isContextCurrent: telegramSessionContextStore.isCurrent,
+    isContextAborted: Pi.isExtensionContextAbortRequested,
     updateStatus,
     sendTextReply,
     sendUserMessage,
@@ -1123,6 +1126,7 @@ export default function (pi: Pi.ExtensionAPI) {
 
   // --- Queue And Settings Menus ---
   const queueMenuRuntime = MenuQueue.createTelegramQueueMenuRuntime({
+    hasPendingDispatch: lifecycle.hasDispatchPending,
     telegramQueueStore,
     queueMutationRuntime,
     sendInteractiveMessage,
@@ -2331,6 +2335,14 @@ export default function (pi: Pi.ExtensionAPI) {
     });
   queueHandoffReconciliationBinding.set(
     Updates.createTelegramQueueHandoffReconciliationRuntimeAssembly({
+      hasPendingDispatch: lifecycle.hasDispatchPending,
+      canHandoffSteerWithRecipient(recipient) {
+        const live = telegramBusFollowerRegistry.get(recipient.instanceId);
+        return live?.registrationGeneration === recipient.registrationGeneration &&
+          [telegramBusProtocolIdentity, live?.protocol,
+            ...(telegramBusFollowerRegistrationState.isRegistered() ? [telegramBusFollowerRegistrationState.getLeaderProtocol()] : [])]
+            .every(Bus.hasTelegramBusSteerQueueHandoffCapability);
+      },
       ownsDirect: lockRuntime.owns,
       isFollowerRegistered: telegramBusFollowerRegistrationState.isRegistered,
       isBusEnabled: isTelegramBusRuntimeEnabled,
@@ -3046,6 +3058,7 @@ export default function (pi: Pi.ExtensionAPI) {
     sendMarkdownReply,
     sendTextReply,
     dispatchNextQueuedTelegramTurn,
+    onSteerTurnEnd,
     onPromptHandedOff(turn, ctx) {
       updateAdmissionRuntimeBinding
         .getSettlement()

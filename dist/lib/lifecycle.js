@@ -265,36 +265,47 @@ export function createTelegramBridgeSessionLifecycleDeps(ports) {
     };
 }
 export function createTelegramBridgeSessionLifecycleAssembly(deps) {
-    const isSessionActive = deps.contextStore.isCurrent;
     const suspendForReplacement = BusFollower.createTelegramBusFollowerSessionReplacementSuspender({
         registrationState: deps.follower.registrationState,
         instanceId: deps.follower.instanceId,
         suspendPolling: deps.follower.suspendPolling,
         recordRuntimeEvent: deps.follower.recordRuntimeEvent,
     });
-    let preserveTarget = true;
-    const queueLifecycle = Queue.createTelegramSessionLifecycleRuntime({
+    // A reused context can be current for a successor; inner awaits need this invocation's generation too.
+    const queueLifecycle = (ctx, generation, preserveTarget = true) => Queue.createTelegramSessionLifecycleRuntime({
         ...deps.queue,
-        isSessionActive,
+        isSessionActive: () => deps.contextStore.isCurrent(ctx, generation),
         stopPolling: () => suspendForReplacement(preserveTarget),
         clearPendingMediaGroups: deps.services.suspendGroupedInput,
     });
     const servicesLifecycle = {
         async onSessionStart(event, ctx) {
+            const generation = deps.contextStore.getGeneration();
+            const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
             const resumeConnection = deps.services.connection?.prepare(event, ctx);
-            await queueLifecycle.onSessionStart(event, ctx);
-            if (!isSessionActive(ctx))
+            await queueLifecycle(ctx, generation).onSessionStart(event, ctx);
+            if (!isCurrent())
                 return;
             deps.services.resumeGroupedInput(ctx);
             await deps.services.delivery.onSessionStart();
-            if (!isSessionActive(ctx))
+            if (!isCurrent())
                 return;
             if (resumeConnection)
                 resumeConnection();
             else
                 await deps.services.polling.onSessionStart(event, ctx);
+            if (!isCurrent())
+                return;
             deps.services.capabilityMonitor.start(ctx);
             deps.services.queueWatchdog.start(ctx);
+            await BusFollower.createTelegramBusFollowerSessionRefreshHook({
+                registrationState: deps.follower.registrationState,
+                registrationRuntime: deps.follower.registrationRuntime,
+                getLeaderState: deps.follower.getLeaderState,
+                isSessionActive: isCurrent,
+                updateStatus: deps.follower.updateStatus,
+                recordRuntimeEvent: deps.follower.recordRuntimeEvent,
+            })(event, ctx);
         },
         async onSessionShutdown(event, ctx) {
             const generation = deps.contextStore.getGeneration();
@@ -302,7 +313,7 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
             if (!isCurrent())
                 return;
             deps.services.connection?.onSessionShutdown(event, ctx);
-            preserveTarget = event.reason !== "resume";
+            const preserveTarget = event.reason !== "resume";
             let preserveThread;
             if (event.reason === "quit") {
                 try {
@@ -321,7 +332,7 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
                 return;
             deps.services.queueWatchdog.stop();
             deps.services.capabilityMonitor.stop();
-            await queueLifecycle.onSessionShutdown(event, ctx);
+            await queueLifecycle(ctx, generation, preserveTarget).onSessionShutdown(event, ctx);
             if (!isCurrent())
                 return;
             await deps.services.inboundWorker.onSessionShutdown();
@@ -337,17 +348,7 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
             }
         },
     };
-    const followerLifecycle = appendTelegramLifecycleHooks(servicesLifecycle, {
-        onSessionStart: BusFollower.createTelegramBusFollowerSessionRefreshHook({
-            registrationState: deps.follower.registrationState,
-            registrationRuntime: deps.follower.registrationRuntime,
-            getLeaderState: deps.follower.getLeaderState,
-            isSessionActive,
-            updateStatus: deps.follower.updateStatus,
-            recordRuntimeEvent: deps.follower.recordRuntimeEvent,
-        }),
-    }, isSessionActive);
-    return createTelegramSessionGenerationFence(deps.contextStore, followerLifecycle);
+    return createTelegramSessionGenerationFence(deps.contextStore, servicesLifecycle);
 }
 function unrefTelegramLifecycleTimer(timer) {
     if (!timer || typeof timer !== "object")
@@ -605,6 +606,13 @@ export function registerTelegramLifecycleHooks(pi, deps) {
             return;
         await deps.onAgentStart(event, ctx);
     });
+    if (deps.onTurnEnd) {
+        pi.on("turn_end", (event, ctx) => {
+            if (!isActive(ctx))
+                return;
+            return deps.onTurnEnd?.(event, ctx);
+        });
+    }
     pi.on("tool_execution_start", async (event, ctx) => {
         if (!isActive(ctx))
             return;

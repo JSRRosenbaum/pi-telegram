@@ -1303,7 +1303,9 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
         if (threadModeEnabled) consecutiveDisabledProbes = 0;
         const botState = deps.topicTargetStore.getBotState();
         const current = botState.threadMode;
-        if (threadModeEnabled && current === "enabled") return;
+        // Persisted capability is not proof that this owner started its local bus.
+        if (threadModeEnabled && current === "enabled" &&
+            (deps.getPollingStartedWithTelegramBus() || !deps.ownsLock(ctx))) return;
         if (!threadModeEnabled && current === "disabled") {
           if (
             !deps.ownsLock(ctx) ||

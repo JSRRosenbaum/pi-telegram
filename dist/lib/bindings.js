@@ -119,6 +119,10 @@ export function createTelegramQueueBindingRuntime(deps) {
             return false;
         return settlement.onItemsDiscarded(durableItems, ctx) === true;
     };
+    const settlePromptPacket = (items, ctx) => {
+        const receipts = items.flatMap(item => item.admissionReceipts ?? []);
+        return receipts.length === 0 || deps.admission.getSettlement()?.onPromptHandedOff?.({ admissionReceipts: receipts }, ctx) === true;
+    };
     const mutation = Queue.createTelegramQueueMutationController({
         ...deps.store,
         hasPendingDispatch: deps.lifecycle.hasDispatchPending,
@@ -159,6 +163,13 @@ export function createTelegramQueueBindingRuntime(deps) {
                 return false;
             return settlement.onPromptHandedOff(item, ctx) === true;
         },
+        steerDispatch: {
+            commitPacket: settlePromptPacket,
+            isContextCurrent: (ctx) => deps.isContextCurrent?.(ctx) === true,
+            canSubmit: (ctx) => deps.isContextAborted?.(ctx) === false &&
+                deps.isIdle(ctx) && !deps.hasPendingMessages(ctx) && !deps.lifecycle.isCompactionInProgress() &&
+                !deps.activeTurn.has() && (deps.lifecycle.getActiveToolExecutions?.() ?? 0) === 0,
+        },
         onControlSettled(item, ctx) {
             deps.admission.getSettlement()?.onControlSettled(item, ctx);
         },
@@ -172,8 +183,31 @@ export function createTelegramQueueBindingRuntime(deps) {
         ...deps.promptDispatch,
         sendUserMessage: deps.sendUserMessage,
     });
+    const steer = Queue.createTelegramSteerBoundaryRuntime({
+        ...deps.store,
+        getGeneration: deps.deferredDispatch.getGeneration,
+        isContextCurrent: (ctx) => deps.isContextCurrent?.(ctx) === true,
+        isBlocked: (ctx) => deps.isContextAborted?.(ctx) !== false || !deps.deferredDispatch.isBound() ||
+            deps.isIdle(ctx) || deps.hasPendingMessages(ctx) ||
+            deps.lifecycle.isCompactionInProgress() || deps.lifecycle.hasDispatchPending() ||
+            (deps.lifecycle.getActiveToolExecutions?.() ?? 0) > 0 ||
+            (deps.activeTurn.has() && !deps.activeTurn.get?.()),
+        isItemReady(item) {
+            return deps.transportStamp.isActive(item.transportStamp) &&
+                !deps.admission.hasPendingQueueMutationForItem(item) &&
+                (deps.admission.getSettlement()?.isItemReady(item) ?? (item.admissionReceipts?.length ?? 0) === 0);
+        },
+        isItemCurrent: (item) => deps.transportStamp.isActive(item.transportStamp) &&
+            !deps.admission.hasPendingQueueMutationForItem(item),
+        getActiveTurn: () => deps.activeTurn.get?.(),
+        commitPacket: settlePromptPacket,
+        discardItem: (item, ctx) => settleDiscardedItems([item], ctx),
+        updateStatus: deps.updateStatus,
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+    });
     return {
         mutation,
+        onTurnEnd: steer.onTurnEnd,
         dispatchNext: dispatch.dispatchNext,
         requestNextDispatchAnnouncement: dispatch.requestNextDispatchAnnouncement,
         cancelNextDispatchAnnouncement: dispatch.cancelNextDispatchAnnouncement,
@@ -627,7 +661,7 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
         },
     });
 }
-export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onPromptHandedOff, answerGuestQuery, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive = () => true, getSessionGeneration, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }) {
+export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onSteerTurnEnd, onPromptHandedOff, answerGuestQuery, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive = () => true, getSessionGeneration, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }) {
     const agentEndResetter = Runtime.createTelegramAgentEndResetter({
         abort,
         typing,
@@ -877,6 +911,12 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         isSessionActive: isSessionContextActive,
         ...sessionLifecycleRuntime,
         ...agentLifecycleHooks,
+        ...(onSteerTurnEnd ? {
+            onTurnEnd(event, ctx) {
+                const result = onSteerTurnEnd(event, ctx);
+                return result ? { ...result, entries: [...event.entries, ...(result.entries ?? [])] } : undefined;
+            },
+        } : {}),
         onInput(event) {
             activityRuntime.recordInputSource(event.source ?? "unknown");
         },

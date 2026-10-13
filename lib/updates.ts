@@ -108,11 +108,10 @@ export type TelegramReactionType =
 
 export const TELEGRAM_PRIORITY_REACTIONS = [
   { id: 10, name: "like", emoji: "👍" },
-  { id: 11, name: "lightning", emoji: "⚡" },
   { id: 12, name: "heart", emoji: "❤" },
   { id: 13, name: "dove", emoji: "🕊" },
-  { id: 14, name: "fire", emoji: "🔥" },
 ] as const;
+export const TELEGRAM_STEER_REACTIONS = [{ id: 14, name: "fire", emoji: "🔥" }] as const;
 export const TELEGRAM_REMOVAL_REACTIONS = [
   { id: 20, name: "dislike", emoji: "👎" },
   { id: 21, name: "ghost", emoji: "👻" },
@@ -160,14 +159,10 @@ function getTelegramQueueReactionTransition(
 ): TelegramQueueReactionDisposition | undefined {
   const oldEmojis = collectTelegramReactionEmojis(oldReactions);
   const newEmojis = collectTelegramReactionEmojis(newReactions);
-  const oldPriorityEmoji = getTelegramReactionEmoji(
-    oldEmojis,
-    TELEGRAM_PRIORITY_REACTION_EMOJIS,
-  );
-  const newPriorityEmoji = getTelegramReactionEmoji(
-    newEmojis,
-    TELEGRAM_PRIORITY_REACTION_EMOJIS,
-  );
+  // Fire is effective Steer intent; weaker positive aliases under it do not reorder the lane.
+  const steerEmoji = TELEGRAM_STEER_REACTIONS[0].emoji;
+  const oldPriorityEmoji = oldEmojis.has(steerEmoji) ? steerEmoji : getTelegramReactionEmoji(oldEmojis, TELEGRAM_PRIORITY_REACTION_EMOJIS);
+  const newPriorityEmoji = newEmojis.has(steerEmoji) ? steerEmoji : getTelegramReactionEmoji(newEmojis, TELEGRAM_PRIORITY_REACTION_EMOJIS);
   const oldSuppressionEmoji = getTelegramReactionEmoji(
     oldEmojis,
     TELEGRAM_REMOVAL_REACTION_EMOJIS,
@@ -188,6 +183,7 @@ function getTelegramQueueReactionTransition(
   > = { kind: "reaction-transition" };
   if (oldPriorityEmoji !== newPriorityEmoji) {
     transition.priorityEmoji = newPriorityEmoji ?? null;
+    if (newPriorityEmoji === steerEmoji) transition.promptLane = "steer";
   }
   if (oldSuppressionEmoji !== newSuppressionEmoji) {
     transition.suppressionEmoji = newSuppressionEmoji ?? null;
@@ -9322,6 +9318,7 @@ export function createTelegramQueueHandoffControlExecutionFactory<TContext>(
 
 export interface TelegramQueueHandoffCoordinatorInput<TContext> {
   item: TelegramQueueItem<TContext>;
+  steerSupported?: boolean;
   expectedOwner: TelegramUpdateJournalQueueOwner;
   recipientOwner: TelegramUpdateJournalQueueOwnerIdentity;
   handoffToken: string;
@@ -9377,6 +9374,7 @@ export async function coordinateTelegramQueueHandoff<TContext>(
   const handoff = createTelegramQueueHandoff({
     handoffToken: input.handoffToken,
     item: input.item,
+    steerSupported: input.steerSupported,
   });
   const receipt = handoff.payload.admissionReceipts[0];
   if (!receipt || handoff.payload.admissionReceipts.length !== 1) {
@@ -9553,6 +9551,8 @@ export function createTelegramQueueHandoffRecipientRuntime<TContext>(
 }
 
 export interface TelegramQueueHandoffReconcilerDeps<TContext> {
+  canHandoffSteerWithRecipient?: (recipient: TelegramBusFollowerView) => boolean;
+  hasPendingDispatch?: () => boolean;
   ownsDirect: () => boolean;
   isFollowerRegistered: () => boolean;
   isBusEnabled: () => boolean;
@@ -9591,6 +9591,8 @@ export interface TelegramQueueHandoffReconcilerDeps<TContext> {
 export interface TelegramQueueHandoffReconciliationRuntimeAssemblyDeps<
   TContext,
 > {
+  canHandoffSteerWithRecipient?: (recipient: TelegramBusFollowerView) => boolean;
+  hasPendingDispatch?: () => boolean;
   ownsDirect: () => boolean;
   isFollowerRegistered: () => boolean;
   isBusEnabled: () => boolean;
@@ -9630,6 +9632,8 @@ export function createTelegramQueueHandoffReconciliationRuntimeAssembly<
   deps: TelegramQueueHandoffReconciliationRuntimeAssemblyDeps<TContext>,
 ): (ctx: TContext) => Promise<void> {
   return createTelegramQueueHandoffReconciler({
+    canHandoffSteerWithRecipient: deps.canHandoffSteerWithRecipient,
+    hasPendingDispatch: deps.hasPendingDispatch,
     ownsDirect: deps.ownsDirect,
     isFollowerRegistered: deps.isFollowerRegistered,
     isBusEnabled: deps.isBusEnabled,
@@ -9706,6 +9710,8 @@ export function createTelegramQueueHandoffReconciler<TContext>(
       .filter((follower) => follower.instanceId !== deps.donorInstanceId);
     if (followers.length === 0) return;
     for (const item of [...deps.getQueuedItems()]) {
+      if ((deps.hasPendingDispatch?.() && deps.getQueuedItems()[0] === item) ||
+          (item.kind === "prompt" && (item.steerAttempted || item.steerPacketTail !== undefined || item.steerPacketSourceOrders !== undefined))) continue;
       const target = item.target;
       const recipient = target
         ? followers.find(
@@ -9715,6 +9721,8 @@ export function createTelegramQueueHandoffReconciler<TContext>(
           )
         : undefined;
       if (!recipient) continue;
+      const steerSupported = item.queueLane === "steer" && deps.canHandoffSteerWithRecipient?.(recipient) === true;
+      if (item.queueLane === "steer" && !steerSupported) continue;
       const receipt = item.admissionReceipts?.[0];
       if (!receipt || item.admissionReceipts?.length !== 1) continue;
       if (
@@ -9741,6 +9749,7 @@ export function createTelegramQueueHandoffReconciler<TContext>(
       const handoffToken = deps.createHandoffToken();
       const result = await coordinateTelegramQueueHandoff({
         item,
+        steerSupported,
         expectedOwner,
         recipientOwner: {
           instanceId: recipient.instanceId,
@@ -9751,6 +9760,9 @@ export function createTelegramQueueHandoffReconciler<TContext>(
         handoffToken,
         lifecycle,
         stageRemote: async ({ payload: sourcePayload }) => {
+          if (sourcePayload.queueLane === "steer" && deps.canHandoffSteerWithRecipient?.(recipient) !== true) {
+            throw new Error("Steer queue handoff capability changed before staging.");
+          }
           const payload = {
             ...sourcePayload,
             admissionReceipts: [

@@ -6,7 +6,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.js";
-import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, } from "./bus.js";
+import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, hasTelegramBusSteerQueueHandoffCapability, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, } from "./bus.js";
 import { escapeHtml } from "./rendering.js";
 import * as Sync from "./sync.js";
 import { parseTelegramIntegerId as asInteger, } from "./target.js";
@@ -2120,6 +2120,10 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
             !hasTelegramBusCapability(recipient?.protocol, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF)) {
             return rejectTelegramBusRequest(envelope.requestId, "Telegram queue handoff capability was not negotiated.");
         }
+        if (envelope.payload.queueLane === "steer" &&
+            ![deps.protocolIdentity, donor.protocol, recipient?.protocol].every(hasTelegramBusSteerQueueHandoffCapability)) {
+            return rejectTelegramBusRequest(envelope.requestId, "Steer queue handoff capability was not negotiated.");
+        }
         if (!recipient?.registrationGeneration ||
             envelope.recipientRegistrationGeneration !==
                 recipient.registrationGeneration) {
@@ -3025,6 +3029,10 @@ export function createTelegramBusLeaderRuntime(deps) {
         if (!hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF) ||
             !hasTelegramBusCapability(recipient?.protocol, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF)) {
             return rejectTelegramBusRequest(input.requestId, "Telegram queue handoff capability was not negotiated.");
+        }
+        if (input.payload.queueLane === "steer" &&
+            ![deps.protocolIdentity, recipient?.protocol].every(hasTelegramBusSteerQueueHandoffCapability)) {
+            return rejectTelegramBusRequest(input.requestId, "Steer queue handoff capability was not negotiated.");
         }
         if (!recipient?.registrationGeneration ||
             input.recipientRegistrationGeneration !== recipient.registrationGeneration) {

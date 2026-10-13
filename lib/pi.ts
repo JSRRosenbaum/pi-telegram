@@ -20,6 +20,8 @@ import {
   type SessionShutdownEvent,
   type SessionStartEvent,
   type SlashCommandInfo,
+  type TurnEndEvent,
+  type TurnEndEventResult,
   type UIPromptEndEvent,
   type UIPromptStartEvent,
   SettingsManager,
@@ -41,6 +43,8 @@ export type {
   SessionShutdownEvent,
   SessionStartEvent,
   SlashCommandInfo,
+  TurnEndEvent,
+  TurnEndEventResult,
   UIPromptEndEvent,
   UIPromptStartEvent,
 };
@@ -292,6 +296,10 @@ export function getExtensionContextSessionId(
 
 export function isExtensionContextIdle(ctx: ExtensionContext): boolean {
   return ctx.isIdle();
+}
+
+export function isExtensionContextAbortRequested(ctx: ExtensionContext): boolean {
+  return ctx.signal?.aborted === true;
 }
 
 export function hasExtensionContextPendingMessages(

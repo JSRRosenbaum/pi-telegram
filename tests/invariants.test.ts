@@ -1,6 +1,7 @@
 /**
  * Regression tests for project architecture invariants
  * Guards import graph shape, shared-bucket bans, and polling SDK boundary rules
+ * Zones: shared utils, telegram, pi agent
  */
 
 import assert from "node:assert/strict";
@@ -40,6 +41,15 @@ function getProjectTypeScriptFiles(): string[] {
       .map((name) => join("tests", name)),
   ].sort();
 }
+
+test("Local operator design notes stay outside default Git and npm publication", () => {
+  const gitRules = readFileSync(join(PROJECT_ROOT, ".gitignore"), "utf8").split(/\r?\n/);
+  const npmRules = readFileSync(join(PROJECT_ROOT, "docs", ".npmignore"), "utf8").split(/\r?\n/);
+  assert.ok(gitRules.includes("/docs/prompt-overlay-design.md"));
+  assert.ok(npmRules.includes("prompt-overlay-design.md"));
+  assert.ok(!gitRules.some(rule => rule.startsWith("!") && rule.includes("prompt-overlay-design")));
+  assert.ok(!npmRules.some(rule => rule.startsWith("!") && rule.includes("prompt-overlay-design")));
+});
 
 test("Unreleased changelog respects the project release-entry budget", () => {
   const unreleased = changelogSource.match(

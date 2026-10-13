@@ -1,10 +1,13 @@
 /**
  * Regression tests for Telegram lifecycle hook helpers
  * Covers context generations, bounded resume intent, and lifecycle hook composition ordering
+ * Zones: pi agent lifecycle, telegram session
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as Queue from "../lib/queue.ts";
+import { createTelegramQueueBindingRuntime } from "../lib/bindings.ts";
 
 import {
   appendTelegramLifecycleHooks,
@@ -313,6 +316,111 @@ test("Resume connection claims before queue startup and replaces ordinary auto-r
     } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
     await runtime.onSessionStart({ type: "session_start", reason: "resume" }, createLifecycleContext());
     assert.deepEqual(events, ["claim-intent", "config", "delivery", resumeIntent ? "resume-connect" : "auto-restore"]);
+  }
+});
+
+test("Bridge Queue startup and services fence reused-context replacement at every awaited boundary", async () => {
+  for (const phase of ["config", "temp", "delivery", "polling", "refresh"] as const) {
+    const contexts = createTelegramSessionContextStore<ExtensionContext>(), ctx = createLifecycleContext();
+    const events: string[] = [], successor = ["successor"];
+    let items = ["predecessor"];
+    const replaceAt = async (point: typeof phase) => {
+      events.push(point); await Promise.resolve();
+      if (point === phase) { contexts.set(ctx); items = successor; }
+    };
+    const runtime = createTelegramBridgeSessionLifecycleAssembly<string>({ contextStore: contexts,
+      queue: { getCurrentModel: () => undefined, loadConfig: () => replaceAt("config"),
+        setQueuedItems(value) { events.push("state"); items = value; }, setCurrentModel() {}, setPendingModelSwitch() {},
+        syncCounters() {}, syncFlags() {}, bindDeferredDispatchContext() { events.push("bind"); },
+        prepareTempDir: () => replaceAt("temp"), updateStatus() { events.push("status"); },
+        clearModelMenuState() {}, getActiveTurnChatId: () => undefined, clearPreview: async () => {}, clearActiveTurn() {},
+        clearAbort() {}, },
+      follower: { registrationState: { getTarget: () => undefined, getSlot: () => undefined, getThreadName: () => undefined,
+        isRegistered: () => true }, registrationRuntime: { setContext: () => replaceAt("refresh"), registerWithLeader: async () => false },
+        instanceId: "follower", getLeaderState: () => ({ kind: "inactive" }), suspendPolling: async () => {},
+        updateStatus() { events.push("follower-status"); }, recordRuntimeEvent() { events.push("follower-notice"); } },
+      services: { resumeGroupedInput() { events.push("grouped"); }, suspendGroupedInput() {},
+        delivery: { onSessionStart: () => replaceAt("delivery"), onSessionShutdown: async () => {} },
+        polling: { onSessionStart: () => replaceAt("polling") }, inboundWorker: { onSessionShutdown: async () => {} },
+        capabilityMonitor: { start() { events.push("monitor"); }, stop() {} }, queueWatchdog: { start() { events.push("watchdog"); }, stop() {} } },
+    });
+    await runtime.onSessionStart({ type: "session_start", reason: "startup" }, ctx);
+    assert.equal(items, successor, `${phase}: predecessor startup cannot reset successor Queue state`);
+    assert.equal(contexts.get(), ctx);
+    const forbidden = phase === "config" ? ["state", "bind", "temp", "status", "grouped", "delivery", "polling", "monitor", "watchdog"] :
+      phase === "temp" ? ["status", "grouped", "delivery", "polling", "monitor", "watchdog"] :
+      phase === "delivery" ? ["polling", "monitor", "watchdog"] : phase === "polling" ? ["monitor", "watchdog"] : [];
+    forbidden.push("follower-status", "follower-notice");
+    if (phase !== "refresh") forbidden.push("refresh");
+    assert.ok(forbidden.every(effect => !events.includes(effect)), `${phase}: obsolete services must remain inert (${events.join(", ")})`);
+  }
+});
+
+test("Bridge Queue teardown fences receipt-bearing Steer across reused-context replacement", async () => {
+  for (const shape of ["waiting", "frozen", "pending"] as const) for (const outcome of ["settled", "refused", "replaced"] as const) {
+    const contexts = createTelegramSessionContextStore<ExtensionContext>(), ctx = createLifecycleContext();
+    contexts.set(ctx);
+    const events: string[] = [];
+    const store = Queue.createTelegramQueueStore<ExtensionContext>();
+    const deferred = Queue.createTelegramDeferredQueueDispatchRuntime<ExtensionContext>(); deferred.bind(ctx);
+    const originals: Queue.PendingTelegramTurn[] = [1, 2].map(id => ({ kind: "prompt", chatId: 7,
+      target: { chatId: 7, threadId: 42 }, replyToMessageId: id, queueOrder: id, queueLane: "steer", laneOrder: id,
+      statusSummary: "steer", content: [{ type: "text", text: `input-${id}` }], sourceMessageIds: [id],
+      queuedAttachments: [], historyText: "steer", admissionReceipts: [Queue.createTelegramQueueAdmissionReceipt({
+        queueKind: "prompt", scope: `shutdown-${id}`, sourceUpdateIds: id === 1 ? [1, 3] : [2] })!],
+      ...(shape === "waiting" ? {} : { steerAttempted: true }) }));
+    if (shape === "pending") originals[0]!.steerPacketTail = [originals[1]!];
+    store.setQueuedItems(originals);
+    const replacement = [{ ...originals[0]!, queueOrder: 99 }];
+    let discarded: readonly Queue.TelegramQueueItem<ExtensionContext>[] | undefined;
+    const binding = createTelegramQueueBindingRuntime({ store, deferredDispatch: deferred,
+      queue: { allocateItemOrder: () => 3 }, lifecycle: { isCompactionInProgress: () => false, hasDispatchPending: () => shape === "pending" },
+      activeTurn: { has: () => false }, transportStamp: { isActive: () => true },
+      admission: { getSettlement: () => ({ isItemReady: () => true, onControlSettled() {}, onItemsDiscarded(items) {
+        events.push("discard"); discarded = items; return outcome !== "refused";
+      } }), hasPendingQueueMutationForItem: () => false },
+      isIdle: () => true, hasPendingMessages: () => false, isContextCurrent: contexts.isCurrent, isContextAborted: () => false,
+      promptDispatch: { startTypingLoop() {}, onPromptDispatchStart() {}, onPromptDispatchFailure() {} },
+      updateStatus() {}, sendTextReply: async () => undefined, sendUserMessage: () => assert.fail("Teardown cannot replay a packet") });
+    const runtime = createTelegramBridgeSessionLifecycleAssembly<Queue.TelegramQueueItem<ExtensionContext>>({
+      contextStore: contexts,
+      queue: { getCurrentModel: () => undefined, loadConfig: async () => {},
+        setQueuedItems(items) { events.push("state"); store.setQueuedItems(items); }, setCurrentModel() {}, setPendingModelSwitch() {},
+        syncCounters() {}, syncFlags() {}, bindDeferredDispatchContext: deferred.bind, prepareTempDir: async () => {}, updateStatus() {},
+        unbindDeferredDispatchContext: deferred.unbind, discardQueuedItems: binding.mutation.clear,
+        clearModelMenuState() { events.push("menus"); }, getActiveTurnChatId: () => undefined, clearPreview: async () => {},
+        clearActiveTurn() { events.push("turn"); }, clearAbort() { events.push("abort"); } },
+      follower: { registrationState: { getTarget: () => undefined, getSlot: () => undefined, getThreadName: () => undefined,
+        isRegistered: () => false }, registrationRuntime: { setContext() {}, registerWithLeader: async () => false },
+        instanceId: "leader", getLeaderState: () => ({ kind: "inactive" }), updateStatus() {}, recordRuntimeEvent() {},
+        async suspendPolling() {
+          events.push("polling"); await Promise.resolve();
+          if (outcome === "replaced") { contexts.set(ctx); store.setQueuedItems(replacement); deferred.bind(ctx); }
+        } },
+      services: { resumeGroupedInput() {}, suspendGroupedInput() { events.push("media"); },
+        delivery: { onSessionStart: async () => {}, onSessionShutdown: async () => {} }, polling: { onSessionStart: async () => {} },
+        inboundWorker: { async onSessionShutdown() { events.push("worker"); } },
+        capabilityMonitor: { start() {}, stop() {} }, queueWatchdog: { start() {}, stop() {} } },
+    });
+    const shutdown = runtime.onSessionShutdown({ type: "session_shutdown", reason: "reload" }, ctx);
+    if (outcome === "refused") {
+      await assert.rejects(shutdown, /could not be discarded durably/);
+      assert.equal(store.getQueuedItems(), originals); assert.deepEqual(discarded, originals);
+      assert.ok(discarded!.every((item, index) => item === originals[index]));
+      assert.deepEqual(events, ["polling", "discard"]); assert.equal(contexts.get(), ctx);
+    } else {
+      await shutdown;
+      if (outcome === "replaced") {
+        assert.equal(discarded, undefined, `${shape}: obsolete teardown cannot borrow successor receipts`);
+        assert.equal(store.getQueuedItems(), replacement); assert.equal(contexts.get(), ctx);
+        assert.equal(deferred.isBound(), true); assert.deepEqual(events, ["polling"]);
+      } else {
+        assert.deepEqual(discarded, originals); assert.deepEqual(store.getQueuedItems(), []);
+        assert.ok(discarded!.every((item, index) => item === originals[index]));
+        assert.equal(contexts.get(), undefined); assert.equal(deferred.isBound(), false);
+        assert.deepEqual(events, ["polling", "discard", "state", "media", "menus", "turn", "abort", "worker"]);
+      }
+    }
   }
 });
 
@@ -957,7 +1065,13 @@ test("Message activity hooks preserve typing after transient preview errors", as
 test("Lifecycle helpers register pi hooks and delegate to handlers", async () => {
   const harness = createLifecycleApiHarness();
   const events: string[] = [];
+  let active = true;
   registerTelegramLifecycleHooks(harness.api, {
+    isSessionActive: () => active,
+    onTurnEnd: () => {
+      events.push("turn-end");
+      return { entries: [], continue: true };
+    },
     onSessionStart: async () => {
       events.push("session-start");
     },
@@ -1023,6 +1137,7 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
       "before_agent_start",
       "model_select",
       "agent_start",
+      "turn_end",
       "tool_execution_start",
       "tool_execution_update",
       "tool_execution_end",
@@ -1060,6 +1175,11 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
   )({ systemPrompt: ["base", "project context"] }, ctx);
   await getRequiredLifecycleHandler(harness.handlers, "model_select")({}, ctx);
   await getRequiredLifecycleHandler(harness.handlers, "agent_start")({}, ctx);
+  const step = await getRequiredLifecycleHandler(harness.handlers, "turn_end")({}, ctx);
+  assert.deepEqual(step, { entries: [], continue: true });
+  active = false;
+  assert.equal(await getRequiredLifecycleHandler(harness.handlers, "turn_end")({}, ctx), undefined);
+  active = true;
   await getRequiredLifecycleHandler(harness.handlers, "tool_execution_start")(
     {},
     ctx,
@@ -1097,6 +1217,7 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     "before-agent-start",
     "model-select",
     "agent-start",
+    "turn-end",
     "tool-start",
     "tool-update",
     "tool-end",
