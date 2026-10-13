@@ -1854,12 +1854,6 @@ export function createTelegramBusFollowerTargetProvisioner(
         };
       }
       const probeRequiredRecord = reconnectRecord?.status === "probe-required";
-      const exactSessionHandoff =
-        crossSessionReuse &&
-        !!requestedTarget &&
-        registration.previousInstanceId === reconnectRecord?.instanceId &&
-        requestedTarget.chatId === reconnectRecord.target.chatId &&
-        requestedTarget.threadId === reconnectRecord.target.threadId;
       const requiresVisibilityProbe =
         crossSessionReuse ||
         probeRequiredRecord ||
@@ -1881,19 +1875,14 @@ export function createTelegramBusFollowerTargetProvisioner(
         try {
           assertRestoreRegistration();
           await deps.callApi(
-            exactSessionHandoff ? "sendChatAction" : "sendMessage",
-            exactSessionHandoff
-              ? {
-                  chat_id: connectedAnnouncement.target.chatId,
-                  message_thread_id: connectedAnnouncement.target.threadId,
-                  action: "typing",
-                }
-              : {
-                  chat_id: connectedAnnouncement.target.chatId,
-                  message_thread_id: connectedAnnouncement.target.threadId,
-                  text: connectedAnnouncement.text,
-                  parse_mode: connectedAnnouncement.parseMode,
-                },
+            // Typing is presence, not evidence that a retained Thread still accepts messages.
+            "sendMessage",
+            {
+              chat_id: connectedAnnouncement.target.chatId,
+              message_thread_id: connectedAnnouncement.target.threadId,
+              text: connectedAnnouncement.text,
+              parse_mode: connectedAnnouncement.parseMode,
+            },
           );
           assertRestoreRegistration();
           if (recoverableTarget || probeRequiredRecord) {

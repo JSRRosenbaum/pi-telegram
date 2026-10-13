@@ -7,6 +7,7 @@
 ## 0.56.1: Recover interrupted connections
 
 - `Connection recovery`: Explicit `/telegram-connect` can abandon matching unknown Thread-creation attempts and connect afresh without deleting tabs or clearing accepted work. Known pending targets keep their Workspace key and slot; unique creation IDs prevent late replies from attaching to a new attempt. Follower recovery requires `explicit-connect-recovery-v1` on both peers. A lost API reply may leave an extra tab; automatic startup and Restore-only registration never reset it.
+- `Restore`: Reconnecting followers verify retained tabs with a connected message rather than typing, replacing a proven deleted tab. Negotiated `held-menu-aliases-v1` lets `/start` and `/help` restore a follower and open its restricted menu without pairing or bootstrap. A leader Restore waits briefly for the exact command-removal ACK on the original click, independently of menu delivery; lost ACKs never replay input, and old-tab cleanup remains separately fenced.
 - `Windows validation`: Follower control fixtures use fresh registration timestamps and the production Live Restore deadline; a delayed apply case retains exact command and receipt assertions. Commentary/Next integration tests await observed progress under a shared test deadline and always stop their runtime before restoring fixtures, including on failure. Runtime authority and retry policy are unchanged.
 
 ## 0.56.0: Steer from Telegram

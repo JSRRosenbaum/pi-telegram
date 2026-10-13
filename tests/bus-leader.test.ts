@@ -475,7 +475,7 @@ for (const fault of ["normal", "late-recovery", "epoch", "operator", "profile"] 
             return operation();
           });
         },
-        async callApi<TResponse>(method: string) { assert.equal(method, "sendChatAction"); return {} as TResponse; },
+        async callApi<TResponse>(method: string) { assert.equal(method, "sendMessage"); return {} as TResponse; },
         async callMultipart() {}, async downloadFile() {}, getSyncState: () => ({}), setSyncState() {}, setLeaderTarget() {}, recordRuntimeEvent() {},
       });
       try {
@@ -595,11 +595,11 @@ for (const scenario of ["old-target", "missing-identity", "foreign-session", "va
         const result = await connect();
         assert.equal(result?.threadId, request.target.threadId);
         assert.equal(result?.slot, "A");
-        assert.deepEqual(calls, ["sendChatAction"]);
+        assert.deepEqual(calls, ["sendMessage"]);
         assert.equal(threads.listWorkspaceBindings()[0]?.sessionId, request.binding.sessionId);
       } else {
         await assert.rejects(connect(), /Workspace Restore|Workspace identity/);
-        assert.deepEqual(calls, scenario === "late-recovery" || scenario === "lost-evidence" ? ["sendChatAction"] : []);
+        assert.deepEqual(calls, scenario === "late-recovery" || scenario === "lost-evidence" ? ["sendMessage"] : []);
         assert.equal(readFileSync(path, "utf8"), expectedSnapshot);
         assert.deepEqual(threads.list(), records, "failed protection cannot transfer even the in-memory owner");
         assert.ok(threads.claimWorkspaceIdentity(request.binding.cwd, "after-rejection", request.owner.instanceId,
@@ -928,7 +928,7 @@ test("Bus leader migrates a persisted manual follower record into its Workspace"
       }),
       { chatId: 7, threadId: 42, slot: "C", threadName: "Cedar" },
     );
-    assert.deepEqual(calls.map((call) => call.method), ["sendChatAction"]);
+    assert.deepEqual(calls.map((call) => call.method), ["sendMessage"]);
     assert.equal(
       store.getWorkspaceBinding("/repo/workspace")?.target.threadId,
       42,
@@ -1239,7 +1239,7 @@ test("Bus leader releases a failed follower Workspace claim", async () => {
   }
 });
 
-test("Bus leader emits one connected notice across an immediate follower session handoff", async () => {
+test("Bus leader verifies message delivery again across an immediate follower session handoff", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-notice-handoff-"));
   const store = createTelegramTopicTargetStore({
     path: join(dir, "state.json"),
@@ -1284,17 +1284,13 @@ test("Bus leader emits one connected notice across an immediate follower session
     assert.deepEqual(calls.map((call) => call.method), [
       "createForumTopic",
       "sendMessage",
-      "sendChatAction",
+      "sendMessage",
     ]);
     assert.equal(
       calls.filter((call) => call.method === "sendMessage").length,
-      1,
+      2,
     );
-    assert.deepEqual(calls.at(-1)?.body, {
-      chat_id: 7,
-      message_thread_id: 42,
-      action: "typing",
-    });
+    assert.deepEqual(calls.at(-1)?.body, calls[1]?.body);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1349,11 +1345,12 @@ test("Bus leader migrates a reloaded follower from generation to stable identity
     );
     assert.deepEqual(calls, [
       {
-        method: "sendChatAction",
+        method: "sendMessage",
         body: {
           chat_id: 7,
           message_thread_id: 42,
-          action: "typing",
+          text: "<b>📡 Instance <i>Cedar</i> connected.</b>",
+          parse_mode: "HTML",
         },
       },
     ]);
@@ -2151,7 +2148,7 @@ test("Bus leader follower target provisioner transfers a live session-reload tar
   }
 });
 
-test("Bus leader replaces a cross-session follower target proven stale by the visibility probe", async () => {
+for (const exactHandoff of [false, true]) test(`Bus leader replaces a deleted follower target even when typing would succeed (exact handoff=${exactHandoff})`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-stale-tab-"));
   const store = createTelegramTopicTargetStore({
     path: join(dir, "state.json"),
@@ -2194,6 +2191,7 @@ test("Bus leader replaces a cross-session follower target proven stale by the vi
     assert.deepEqual(
       await provision({
         instanceId: "follower-reloaded",
+        ...(exactHandoff ? { previousInstanceId: "follower-a" } : {}),
         profileKey: "manual:owner-a",
         target: { chatId: 7, threadId: 12 },
         connectedAtMs: 1000,

@@ -59,6 +59,9 @@ export declare const TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET: "live-thre
 /** Every live rebinding needs the save/apply/settle trio; held command selections additionally need these two. */
 export declare const TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES: readonly ["live-thread-rebind-save-v1", "live-thread-rebind-apply-v1", "live-thread-rebind-settle-v1"];
 export declare const TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES: readonly ["live-thread-rebind-command-set-v1", "selected-menu-delivery-v1"];
+/** Start/help are restricted menu aliases, negotiated separately from the original held-command set. */
+export declare const TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES: "held-menu-aliases-v1";
+export declare function getTelegramBusHeldCommandCapabilities(name: string): readonly string[];
 export interface TelegramBusSelectedCommandInput {
     name: string;
     target: TelegramTarget & {

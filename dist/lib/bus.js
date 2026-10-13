@@ -80,6 +80,13 @@ export const TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES = [
     TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
     TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
 ];
+/** Start/help are restricted menu aliases, negotiated separately from the original held-command set. */
+export const TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES = "held-menu-aliases-v1";
+export function getTelegramBusHeldCommandCapabilities(name) {
+    return name === "start" || name === "help"
+        ? [...TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES, TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES]
+        : TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES;
+}
 function parseSelectedCommandInput(value) {
     if (!isRecord(value) ||
         !hasOnlyWireKeys(value, ["name", "target"]) ||
@@ -1317,12 +1324,7 @@ export function createTelegramBusLiveRebindController(deps) {
                 : []),
             ...(settling || held ? [TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE] : []),
             ...(observingHeld ? [TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION] : []),
-            ...(held
-                ? [
-                    TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
-                    TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
-                ]
-                : []),
+            ...(held ? getTelegramBusHeldCommandCapabilities(held.name) : []),
         ];
         const follower = deps.getFollower(expected.instanceId), secret = deps.getAuthSecret();
         if (!isCurrent() ||

@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { getTelegramBusTransportRetryPolicy, TELEGRAM_BUS_REGISTRATION_RETRY, } from "./bus-transport.js";
-import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, hasTelegramBusSteerQueueHandoffCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES, TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES, TelegramBusLocalAuthorityError, } from "./bus.js";
+import { createTelegramBusFollowerDeliveryIdentity, createTelegramBusForeignOwnedUpdateForwarder, createTelegramBusLocalServer, createTelegramBusRequestIdFactory, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusProtocolCompatibility, getTelegramBusSocketPath, hasTelegramBusCapability, hasTelegramBusSteerQueueHandoffCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, resolveTelegramBusSocketPath, sendTelegramBusLocalEnvelope, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE, TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES, getTelegramBusHeldCommandCapabilities, TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES, TelegramBusLocalAuthorityError, } from "./bus.js";
 import { parseTelegramUpdateJournalQueueOwner, } from "./journal.js";
 import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, } from "./locks.js";
 import * as Machine from "./machine.js";
@@ -2877,8 +2877,7 @@ export function createTelegramBusForwardedUpdateReceiverRuntime(deps) {
                         ? [
                             TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY,
                             TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE,
-                            TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
-                            TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
+                            ...getTelegramBusHeldCommandCapabilities(commandInput.name),
                         ]
                         : []),
                 ];

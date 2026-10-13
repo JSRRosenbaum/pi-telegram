@@ -111,6 +111,7 @@ export interface RouteHarnessOptions {
   onItemsDiscarded?: Queue.TelegramQueueMutationControllerDeps<TestContext>["onItemsDiscarded"];
   queueAdmission?: Parameters<typeof Bindings.createTelegramQueueBindingRuntime<TestContext>>[0]["admission"];
   hasPendingMessages?: (ctx: TestContext) => boolean;
+  liveRebindCommandCompletionTimeoutMs?: number;
   liveRebindCleanupSchedule?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["liveRebindCleanupSchedule"];
   temporaryThreadCleanupDelayMs?: number;
   getSessionGeneration?: () => number;
@@ -255,6 +256,7 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     inspectTemporaryThreadSources: options.inspectTemporaryThreadSources,
     temporaryThreadCleanupDelayMs: options.temporaryThreadCleanupDelayMs,
     liveRebindCleanupSchedule: options.liveRebindCleanupSchedule,
+    liveRebindCommandCompletionTimeoutMs: options.liveRebindCommandCompletionTimeoutMs,
     getSessionGeneration: options.getSessionGeneration,
     foreignOwnedUpdateForwarder: options.foreignOwnedUpdateForwarder,
     getTargetOwnership: options.getTargetOwnership,
