@@ -48,8 +48,10 @@ import { createTelegramBusProtocolIdentity, createTelegramBusWorkspaceRestoreCon
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE } from "../lib/bus.ts";
 import { withWorkspaceRestoreFixture as fixture, restoreFixtureRecipient as recipient } from "./fixtures/workspace.ts";
 
+for (const selectedName of ["status", "start", "help"] as const)
 for (const fault of ["current", "release-only", "unknown-ack", "complete-no-ack", "wrong-source", "wrong-proof", "wrong-branch", "proof-copy", "query-lost", "recipient-lost", "canonical-lost", "run-replaced", "marker-replaced", "donor-before", "donor-after", "donor-ack", "wrong-command", "group", "null-marker", "non-text", "album", "foreign-source", "mixed", "source-lost", "release-lost", "chooser-current", "chooser-busy", "chooser-unavailable", "chooser-no-preflight", "chooser-capability", "chooser-preflight-replaced", "chooser-preflight-copy", "chooser-port-lost", "chooser-model", "chooser-caption", "chooser-preflight-registry", "chooser-album", "chooser-menu-capability", "chooser-integrated-idle", "chooser-integrated-busy", "chooser-integrated-pre-dispatch", "chooser-integrated-recipient-loss", "chooser-integrated-epoch-loss", "chooser-integrated-issued-loss", "chooser-integrated-report-lost", "chooser-integrated-ack-lost", "chooser-integrated-work-current", "chooser-integrated-work-issued-loss", "chooser-integrated-work-stop", "chooser-integrated-work-stop-loss", "chooser-integrated-work-stop-cleanup", "chooser-integrated-work-report-lost"] as const) {
-  test(`Selected status coordinator requires semantic and exact warm source proof before donor CAS (${fault})`, async () => {
+  if (selectedName !== "status" && !["chooser-integrated-idle", "chooser-integrated-busy", "chooser-integrated-pre-dispatch", "chooser-menu-capability"].includes(fault)) continue;
+  test(`Selected ${selectedName} coordinator requires semantic and exact warm source proof before donor CAS (${fault})`, async () => {
     await fixture(async f => {
       f.request.source.updateIds = fault === "group" || fault === "chooser-album" ? [100, 101] : [100];
       const caller = Journal.createTelegramUpdateJournalStore({ path: `${f.path}.caller`, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "status-caller" }) });
@@ -80,11 +82,12 @@ for (const fault of ["current", "release-only", "unknown-ack", "complete-no-ack"
           else Updates.reportTelegramUpdateDeferred(update.message);
         } });
       const ctx = { cwd: "/repo" }, protocol = Bus.createTelegramBusProtocolIdentity({ runtimeBuild: "status-coordinator", capabilities: [
+        ...(selectedName === "status" ? [] : [Bus.TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES]),
         Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SAVE, Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_APPLY, Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE,
         Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET, Bus.TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
         ...(prelaunch ? [Bus.TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, Bus.TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION] : [])] });
       if (fault === "chooser-capability" || fault === "chooser-menu-capability") protocol.capabilities = protocol.capabilities.filter(cap =>
-        cap !== (fault === "chooser-capability" ? Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET : Bus.TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY));
+        cap !== (fault === "chooser-capability" ? Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET : selectedName === "status" ? Bus.TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY : Bus.TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES));
       const registration = createTelegramBusFollowerRegistrationState(); registration.setRegistered(true, f.request.binding.target, { slot: "A", generation, leaderProtocol: protocol });
       let worker!: Updates.TelegramUpdateWorkerRuntime<typeof ctx>;
       const admission = Updates.createTelegramUpdateAdmissionLifecycleRuntime<typeof ctx>({ resolveBinding: () => ({ runtimeKey: "status", recoveryKey: recipientKey,
@@ -107,7 +110,7 @@ for (const fault of ["current", "release-only", "unknown-ack", "complete-no-ack"
       } as unknown as Parameters<typeof Commands.createTelegramCommandHandlerTargetRuntime<Commands.TelegramCommandRuntimeMessage, typeof ctx>>[0]);
       const owner = { isCurrent: () => current && generation === "registration", assertRecipientCurrent: assertRecipient,
         prepare(readiness: Parameters<typeof status.prepareHeldCommand>[1], context: typeof ctx, input: Parameters<typeof status.prepareHeldCommand>[3]) {
-          prepares++; return status.prepareHeldCommand("status", readiness, context, input);
+          prepares++; return status.prepareHeldCommand(selectedName, readiness, context, input);
         } };
       const targetOwner = createTelegramBusFollowerWorkspaceRestoreHandler<typeof ctx>({ instanceId: "old", getContextAuthority: () => ({ executor: f.auth.executor,
         profileBindingKey: "scope", operatorUserId: 7, cwd: "/repo", sessionId: "session", generation: recipientGeneration, leaderProtocol: protocol }), readRestoreIntent: () => undefined,
@@ -133,7 +136,7 @@ for (const fault of ["current", "release-only", "unknown-ack", "complete-no-ack"
         const recipient = targetOwner.prepareLiveCommandRecipient({ operationId: input.operationId, registrationGeneration: input.recipientRegistrationGeneration,
           sessionId: input.recipientSessionId, sourceUpdateIds: input.updates.map(value => value.update_id), target: input.selectedCommand!.target }, ctx);
         assert.ok(recipient); assert.throws(recipient.assertRecipientCurrent, /released intent/); assertRecipient = recipient.assertRecipientCurrent;
-        const bound = Bindings.createTelegramFollowerSelectedCommandBinding({ name: "status",  ctx, operationId: input.operationId, registrationGeneration: input.recipientRegistrationGeneration,
+        const bound = Bindings.createTelegramFollowerSelectedCommandBinding({ name: selectedName, ctx, operationId: input.operationId, registrationGeneration: input.recipientRegistrationGeneration,
           target: input.selectedCommand!.target, recipient, command: { canPrepareHeldCommand: status.canPrepareHeldCommand, prepareHeldCommand(...args) {
             prepares++; const plan = status.prepareHeldCommand(...args);
             if (plan) { const execute = plan.execute; plan.execute = async () => { menus++; const result = await execute();
@@ -175,11 +178,11 @@ for (const fault of ["current", "release-only", "unknown-ack", "complete-no-ack"
       const control = Bus.createTelegramBusLiveRebindController({ getFollower: () => ({ instanceId: "old", sessionId: "session", slot: "A", cwd: "/repo",
         registrationGeneration: generation, target: registration.getTarget(), busSocketPath: socketPath, pid: process.pid, processBirthId: `${process.pid}:status`, sessionGeneration: 1,
         protocol, connectedAtMs: 1, lastHeartbeatMs: 1 }), localProtocolIdentity: protocol, getAuthSecret: () => "secret", createRequestId: () => `status-${++nonce}` });
-      const follower = { selectedCommand: { name: "status" as const, target: { ...f.request.target } }, async run(action: Parameters<typeof control>[0]) {
+      const follower = { selectedCommand: { name: selectedName, target: { ...f.request.target } }, async run(action: Parameters<typeof control>[0]) {
         assert.equal(this, follower, "Captured run preserves its callable owner");
         calls.push("mode" in action ? action.mode : "save");
         if (!(workCase && "mode" in action && action.mode === "observe" && action.selectedCommand === undefined))
-          assert.deepEqual(action.selectedCommand, { name: "status", target: f.request.target });
+          assert.deepEqual(action.selectedCommand, { name: selectedName, target: f.request.target });
         const result = await control(action);
         if (fault === "chooser-port-lost" && result?.status === "saved") liveFollower.isSelectedCommandAvailable = () => false;
         if (!result) return result;
@@ -281,7 +284,7 @@ for (const fault of ["current", "release-only", "unknown-ack", "complete-no-ack"
         sourceWorker.start("source"); await sourceWorker.waitForDrain();
         caller.appendBatch(f.request.source.updateIds.map(update_id => ({ update_id, ...(fault === "mixed" ? { edited_message: {} } : {}), message: { message_id: update_id, message_thread_id: chooser ? 42 : 11,
           chat: { id: 7, type: "private" }, from: { id: fault === "foreign-source" ? 8 : 7, is_bot: false }, ...(fault === "album" || fault === "chooser-album" ? { media_group_id: "group" } : {}),
-          ...(fault === "chooser-caption" || fault === "chooser-album" ? { caption: "/status" } : { text: fault === "wrong-command" || fault === "chooser-model" ? "/model" : fault === "non-text" ? 17 : "/status" }) } })));
+          ...(fault === "chooser-caption" || fault === "chooser-album" ? { caption: "/status" } : { text: fault === "wrong-command" || fault === "chooser-model" ? "/model" : fault === "non-text" ? 17 : `/${selectedName}` }) } })));
         sourceWorker.signal(); await sourceWorker.waitForDrain(); await admission.onSessionStart(ctx); await worker.waitForDrain(); await receiver.start(); await leaderRuntime?.startPolling({});
         if (fault === "chooser-album") await new Promise<void>(resolve => setTimeout(resolve, 1250));
         const before = caller.read();
@@ -789,8 +792,9 @@ for (const fault of ["single", "group", "held-report", "generic", "partial", "no
         const result = ["single", "group", "held-report", "report-throw", "adapter-mutation"].includes(fault) ? "released"
           : ["caller", "recipient", "worker"].includes(fault) ? "protected" : "unknown";
         assert.equal(await coordinator.advance(), result);
+        assert.equal(coordinator.observeCommandCompletion(), result === "released" ? "released" : "unknown", "Observation cannot issue or replay a command");
         assert.equal(await coordinator.advance(), fault === "post-check-loss" ? "protected" : result, "Reobservation cannot issue another command");
-        if (fault === "observation-error") assert.equal(errors, 2, "Unavailable readback remains diagnostic, not an uncaught continuation or replay");
+        if (fault === "observation-error") assert.equal(errors, 3, "Unavailable readback remains diagnostic, not an uncaught continuation or replay");
         assert.deepEqual({ reads, removals, executions }, before, "Issued observation does not execute, read journals or remove again");
         assert.equal(commands, 1); assert.equal(commits, 1); assert.equal(applications, 1);
         const retained = journal.read();
@@ -3172,6 +3176,7 @@ for (const fault of ["normal", "busy", "all-source", "source", "journal-source",
       });
       const originals = new Map<number, TestMessage>();
       const harness = createRouteHarness({ instanceId: "old", menuActions: menus, setMyCommands: api.setMyCommands,
+        liveRebindCommandCompletionTimeoutMs: 100,
         threadStore: { ...f.threads, withWorkspaceRestoreSnapshot(...args) {
           if (unreadable) throw new Error("Current Workspace unavailable"); return f.threads.withWorkspaceRestoreSnapshot(...args);
         } }, getWorkspaceRestoreStore: () => storeCurrent ? f.store : undefined,
@@ -3250,6 +3255,8 @@ for (const fault of ["normal", "busy", "all-source", "source", "journal-source",
         assert.equal(!!Updates.inspectTelegramDeferredSourceCompletion(originals.get(100)), ack);
         assert.equal(journal.read().entries.some(row => row.updateId === 100), !issued || fault === "lost-before");
         assert.equal(journal.read().sourceCompletions, undefined, "No legacy Restore ACKs");
+        assert.equal(harness.events.some(value => value.includes("Command source disposal confirmed")), ack,
+          `The original Restore click must observe the source ACK without requiring another tap: ${JSON.stringify(harness.events)}`);
         await click(`reroutenew:${rerouteId}:10`); await flush();
         assert.equal(harness.events.some(value => value.includes("Command source disposal confirmed")), ack);
         assert.ok(!harness.events.some(value => value.includes("Input queued in the rebound")));

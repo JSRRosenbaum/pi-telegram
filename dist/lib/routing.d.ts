@@ -113,6 +113,8 @@ export declare function createTelegramLiveRebindCoordinator(input: {
     operationId: string;
     /** Body-free copy of the authenticated saved command reference: correlation only, never authority, an ACK or a cleanup permit. */
     selectedCommandReference(): TelegramLiveRebindSelectedCommandReference | undefined;
+    /** Observe only an already-issued leader command; never prepares, relocates or executes input. */
+    observeCommandCompletion(): "unknown" | "released" | undefined;
     advance(): Promise<"protected" | "unknown" | "released">;
 };
 /** One admitted Restore attempt through recipient readiness, never source dispatch or cleanup. */
@@ -212,6 +214,8 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     /** Quiet period after the last cancelled input before one cleanup attempt; defaults to 0 ms. */
     temporaryThreadCleanupDelayMs?: number;
     /** Live-rebind cleanup attempt pacing; the bounded window ends in `not-issued`, never a time-based deletion. */
+    /** Bounded ACK observation inside the original chooser admission, independent from menu/reply delivery. */
+    liveRebindCommandCompletionTimeoutMs?: number;
     liveRebindCleanupSchedule?: {
         delaysMs: readonly number[];
         intervalMs: number;

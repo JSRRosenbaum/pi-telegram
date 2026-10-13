@@ -54,6 +54,7 @@ import {
   inspectTelegramDeferredSource,
   inspectTelegramDeferredSourceSnapshot,
   inspectTelegramDeferredSourceCompletion,
+  subscribeTelegramDeferredSourceCompletion,
   prepareTelegramDeferredSourceCompletion,
   type TelegramDeferredSourceCompletionPreparation,
   inspectTelegramHistoricalInputs,
@@ -7320,6 +7321,14 @@ for (const scenario of ["normal", "generic", "changed", "missing", "queued", "un
       const expected = inspectTelegramDeferredSource(carrier)!;
       assert.ok(expected);
       assert.equal(inspectTelegramDeferredSourceCompletion(carrier), undefined, "pending input has no disposal ACK");
+      const notifications: unknown[] = [];
+      const unsubscribe = subscribeTelegramDeferredSourceCompletion(carrier, () => {
+        notifications.push(inspectTelegramDeferredSourceCompletion(carrier));
+        throw new Error("An observer cannot invalidate a committed source ACK");
+      });
+      assert.ok(unsubscribe);
+      const cancelled = subscribeTelegramDeferredSourceCompletion(carrier, () => assert.fail("Unsubscribed observer"));
+      cancelled?.();
       if (scenario === "changed") journal.markExecutionFailure({ updateId: 1, expectedAttemptCount: 0, failedAtMs: 1000,
         failureClass: "fixture", summary: "changed", disposition: "retry-wait", nextRetryAtMs: Date.now() + 60_000 });
       if (scenario === "missing") journal.removeCompleted([1]);
@@ -7333,6 +7342,9 @@ for (const scenario of ["normal", "generic", "changed", "missing", "queued", "un
       await new Promise<void>(resolve => setImmediate(resolve));
       await worker.waitForDrain();
       await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(notifications, ["normal", "mutated-report", "binding", "context", "identity", "stopped", "renewed"].includes(scenario) ? [expected] : [],
+        "Notify only after the warm exact ACK is inspectable, never merely after journal removal");
+      unsubscribe();
       if (scenario === "binding") liveBinding = "other";
       if (scenario === "context") contextCurrent = false;
       if (scenario === "identity") generation++;

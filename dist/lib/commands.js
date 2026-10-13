@@ -1446,35 +1446,40 @@ export function createTelegramCommandHandler(deps) {
             },
         };
     };
-    const heldPlans = {
-        status: {
-            completion: "before-effect",
-            effect: "showStatus",
-            prepare(ctx, effects) {
-                const scopedStatus = effects?.showStatus;
-                const captured = {
-                    ...deps,
-                    showStatus: scopedStatus
-                        ? (message, context, options) => {
-                            const address = getTelegramCommandMessageTarget(message);
-                            return scopedStatus.call(effects, address.chatId, address.replyToMessageId, context, address.threadId, options);
-                        }
-                        : deps.showStatus,
-                };
-                return {
-                    captured,
-                    portsCurrent: () => !effects || effects.showStatus === scopedStatus,
-                    async run({ message, command, assertRecipient }) {
-                        const recipientOptions = { assertAuthority: assertRecipient };
-                        return handleTelegramCommandRuntime(command.name, message, ctx, {
-                            ...captured,
-                            assertExecutionCurrent: assertRecipient,
-                            showStatus: (value, context) => captured.showStatus(value, context, recipientOptions),
-                        }, command.args);
-                    },
-                };
-            },
+    // Held followers are already paired and bound. Start/help open the same restricted menu as status;
+    // they cannot pair an operator, bootstrap another Thread or invoke unrestricted Bot API effects.
+    const heldMenuPlan = {
+        completion: "before-effect",
+        effect: "showStatus",
+        prepare(ctx, effects) {
+            const scopedStatus = effects?.showStatus;
+            const captured = {
+                ...deps,
+                showStatus: scopedStatus
+                    ? (message, context, options) => {
+                        const address = getTelegramCommandMessageTarget(message);
+                        return scopedStatus.call(effects, address.chatId, address.replyToMessageId, context, address.threadId, options);
+                    }
+                    : deps.showStatus,
+            };
+            return {
+                captured,
+                portsCurrent: () => !effects || effects.showStatus === scopedStatus,
+                async run({ message, command, assertRecipient }) {
+                    const recipientOptions = { assertAuthority: assertRecipient };
+                    return handleTelegramCommandRuntime("status", message, ctx, {
+                        ...captured,
+                        assertExecutionCurrent: assertRecipient,
+                        showStatus: (value, context) => captured.showStatus(value, context, recipientOptions),
+                    }, command.args);
+                },
+            };
         },
+    };
+    const heldPlans = {
+        status: heldMenuPlan,
+        start: heldMenuPlan,
+        help: heldMenuPlan,
         abort: {
             completion: "after-semantics",
             effect: "sendTextReply",

@@ -61,6 +61,8 @@ The repository uses a **Flat Domain DAG**:
 
 ### Live-Rebind Module Map
 
+For an already-issued leader menu/control command whose semantics finish before delivery, the original chooser may observe its exact warm source-removal ACK for one window of up to eight seconds before answering. Later taps only reobserve; they do not restart that wait. Naming/confirmation/extension producers whose source completion can depend on later publication keep their independent completion path. Updates notifies subscribers only after its carrier retains that ACK, not at the earlier journal-completion hook. Routing rechecks source, recipient, canonical binding and execution generation; observation cannot issue a second command or turn source absence into confirmation. Menu/reply delivery is not awaited. Timeout, abort or authority loss removes subscriptions and retains uncertainty without replay; old-Thread cleanup remains an independent fenced operation.
+
 Release `0.53.0` adds the [live-rebind channel](./multi-instance-bus.md#live-rebind-channel) and bounded old-Thread cleanup. It advertises live save/apply/settle, command-set and selected-menu-delivery through bus protocol v3, retaining Workspace Restore for legacy continuity. A loaded 0.53.0 build prefers the live path; an instance still running an older build keeps Restore until it is reloaded. Windows runs the same channel and strict reads, exercised by the CI matrix; there is no platform-specific alternate protocol.
 
 The channel reuses existing owners rather than adding a parallel command bus, queue or recovery store:

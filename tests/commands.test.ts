@@ -2988,7 +2988,7 @@ test("Held control registry refuses incomplete semantic ports before source obse
   assert.deepEqual(f.effects, []);
 });
 
-for (const name of ["status", "abort"] as const) for (const fault of ["current", "completion-refused", "effect-lost"] as const) {
+for (const name of ["status", "start", "help", "abort"] as const) for (const fault of ["current", "completion-refused", "effect-lost"] as const) {
   test(`Held command registry preserves native completion ordering and detached effects (${name}, ${fault})`, async () => {
     const f = createFencedCommandTargetFixture(), dir = mkdtempSync(join(tmpdir(), "pi-held-command-registry-"));
     const options = { path: join(dir, "journal.json"), botIdentity: createTelegramUpdateJournalBotIdentity({ botToken: "fixture" }) };
@@ -3025,7 +3025,7 @@ for (const name of ["status", "abort"] as const) for (const fault of ["current",
       recipientCurrent = true; assert.equal(held.release(() => true), true);
       await worker.waitForDrain(); await new Promise(resolve => setImmediate(resolve)); await worker.waitForDrain();
       const semantics = name === "abort" ? ["clear-model", "fold", "abort", "update"] : [];
-      assert.deepEqual(f.effects, [...semantics, "complete", ...(fault === "completion-refused" ? [] : [name === "status" ? "status" : "reply"])]);
+      assert.deepEqual(f.effects, [...semantics, "complete", ...(fault === "completion-refused" ? [] : [name === "abort" ? "reply" : "status"])]);
       assert.equal(ordinary, 0);
       assert.deepEqual(plan.inspectCompletion(), fault === "completion-refused" ? undefined : readiness.snapshot.source);
       assert.equal(journal.read().entries.length, fault === "completion-refused" ? 1 : 0);

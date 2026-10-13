@@ -255,6 +255,16 @@ export function inspectTelegramDeferredSourceCompletion(value) {
     const source = getTelegramUpdateAdmissionBinding(value)?.inspectCompletion?.();
     return execution.isCurrent() && source ? { ...source } : undefined;
 }
+/** Warm ACK notification only; subscribers must independently recheck exact completion and recipient authority. */
+export function subscribeTelegramDeferredSourceCompletion(value, notify) {
+    const execution = getTelegramUpdateExecutionFence(value);
+    if (execution?.isCurrent() !== true)
+        return undefined;
+    return getTelegramUpdateAdmissionBinding(value)?.subscribeCompletion?.(() => {
+        if (execution.isCurrent())
+            notify();
+    });
+}
 /** Reuse only live bound deferred originals; raw IDs or cold/adopted input cannot mint this carrier. */
 export function prepareTelegramLiveDeferredInput(values, isCurrent) {
     const carriers = [...values], first = carriers[0], execution = getTelegramUpdateExecutionFence(first);
@@ -5155,6 +5165,7 @@ function createTelegramUpdateSourceAdmissionHandle(deps, capture) {
         let outcome;
         let completionAttempted = false;
         let completedSource;
+        const completionObservers = new Set();
         const boundUpdate = bindTelegramUpdateExecutionFence(bindTelegramUpdateAdmissionSource(update, (next) => {
             if (!execution.isCurrent())
                 return;
@@ -5199,11 +5210,15 @@ function createTelegramUpdateSourceAdmissionHandle(deps, capture) {
                     completion &&
                     execution.isCurrent() &&
                     completion.isCurrent() &&
-                    isDeepStrictEqual(completion.source, expectedSource))
-                    completedSource = {
-                        ...completion,
-                        source: { ...expectedSource },
-                    };
+                    isDeepStrictEqual(completion.source, expectedSource)) {
+                    completedSource = { ...completion, source: { ...expectedSource } };
+                    for (const notify of completionObservers) {
+                        try {
+                            notify();
+                        }
+                        catch { /* Observation cannot invalidate an exact removal ACK. */ }
+                    }
+                }
             })
                 .catch((error) => {
                 try {
@@ -5260,6 +5275,10 @@ function createTelegramUpdateSourceAdmissionHandle(deps, capture) {
                     signal,
                 })
                 : undefined,
+            subscribeCompletion: (notify) => {
+                completionObservers.add(notify);
+                return () => { completionObservers.delete(notify); };
+            },
             inspectCompletion: () => execution.isCurrent() && completedSource?.isCurrent()
                 ? { ...completedSource.source }
                 : undefined,

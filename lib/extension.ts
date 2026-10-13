@@ -66,6 +66,7 @@ const telegramBusProtocolIdentity =
     Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
     Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_STEER,
     Bus.TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY,
+    Bus.TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES,
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
     Bus.TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
@@ -1239,7 +1240,7 @@ export default function (pi: Pi.ExtensionAPI) {
           follower.protocol,
           [
             ...Bus.TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES,
-            ...Bus.TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES,
+            ...Bus.getTelegramBusHeldCommandCapabilities(name),
           ],
         ) &&
         typeof selectedMenuDelivery === "function" &&
@@ -1560,6 +1561,7 @@ export default function (pi: Pi.ExtensionAPI) {
     threadStore,
     runWorkspaceOperation: telegramWorkspaceOperationRuntime.run,
     liveRebindCleanupSchedule: Routing.TELEGRAM_LIVE_REBIND_CLEANUP_SCHEDULE,
+    liveRebindCommandCompletionTimeoutMs: 8_000,
     updateStatus,
     isContextActive: telegramSessionContextStore.isCurrent,
     dispatchNextQueuedTelegramTurn,

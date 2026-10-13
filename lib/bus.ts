@@ -185,6 +185,14 @@ export const TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES = [
   TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
 ] as const;
 
+/** Start/help are restricted menu aliases, negotiated separately from the original held-command set. */
+export const TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES = "held-menu-aliases-v1" as const;
+export function getTelegramBusHeldCommandCapabilities(name: string): readonly string[] {
+  return name === "start" || name === "help"
+    ? [...TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES, TELEGRAM_BUS_CAPABILITY_HELD_MENU_ALIASES]
+    : TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES;
+}
+
 export interface TelegramBusSelectedCommandInput {
   name: string;
   target: TelegramTarget & { threadId: number };
@@ -2541,12 +2549,7 @@ export function createTelegramBusLiveRebindController(deps: {
         : []),
       ...(settling || held ? [TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE] : []),
       ...(observingHeld ? [TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION] : []),
-      ...(held
-        ? [
-            TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
-            TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
-          ]
-        : []),
+      ...(held ? getTelegramBusHeldCommandCapabilities(held.name) : []),
     ];
     const follower = deps.getFollower(expected.instanceId),
       secret = deps.getAuthSecret();

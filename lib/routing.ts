@@ -916,6 +916,16 @@ export function createTelegramLiveRebindCoordinator(input: {
           }
         : undefined;
     },
+    /** Observe only an already-issued leader command; never prepares, relocates or executes input. */
+    observeCommandCompletion(): "unknown" | "released" | undefined {
+      if (!continuationIssued || !leader?.complete) return undefined;
+      if (!current()) return "unknown";
+      try { return observeCommandCompletion(); }
+      catch (error) {
+        input.recordRuntimeEvent?.("telegram", error, { phase: "live-rebind-command-observation" });
+        return "unknown";
+      }
+    },
     async advance(): Promise<"protected" | "unknown" | "released"> {
       if (advancing || !current()) return "protected";
       if (released) return "released";
@@ -1561,6 +1571,8 @@ export interface TelegramInboundRouteRuntimeDeps<
   /** Quiet period after the last cancelled input before one cleanup attempt; defaults to 0 ms. */
   temporaryThreadCleanupDelayMs?: number;
   /** Live-rebind cleanup attempt pacing; the bounded window ends in `not-issued`, never a time-based deletion. */
+  /** Bounded ACK observation inside the original chooser admission, independent from menu/reply delivery. */
+  liveRebindCommandCompletionTimeoutMs?: number;
   liveRebindCleanupSchedule?: {
     delaysMs: readonly number[];
     intervalMs: number;
@@ -1937,6 +1949,7 @@ export function createTelegramInboundRouteRuntime<
       extensionCommand?: Commands.ParsedTelegramCommand;
       extensionKind?: Commands.PreparedSelectedCommand["kind"];
       coordinator?: ReturnType<typeof createTelegramLiveRebindCoordinator>;
+      commandCompletionWaited?: true;
       isCurrent?: () => boolean;
     };
     /** The acknowledged tab presenting an All source; `sourceTarget` is this tab, not the original's location. */
@@ -4870,7 +4883,7 @@ export function createTelegramInboundRouteRuntime<
         Bus.isSameTelegramBusFollowerRegistration(live, follower!) &&
         [
           ...Bus.TELEGRAM_BUS_LIVE_REBIND_CAPABILITIES,
-          ...(heldSelected ? Bus.TELEGRAM_BUS_HELD_COMMAND_CAPABILITIES : []),
+          ...(heldSelected ? Bus.getTelegramBusHeldCommandCapabilities(heldSelected.name) : []),
         ].every((cap) => Bus.hasTelegramBusCapability(live.protocol, cap)) &&
         !!live.target &&
         live.target.chatId === binding.target.chatId &&
@@ -5642,6 +5655,7 @@ export function createTelegramInboundRouteRuntime<
     return {
       operationId: request.operationId,
       selectedCommandReference: () => coordinator?.selectedCommandReference(),
+      observeCommandCompletion: () => coordinator?.observeCommandCompletion(),
       async advance() {
         if (!coordinator) {
           if (!current() || !getRecipient()) return "protected";
@@ -9058,6 +9072,42 @@ export function createTelegramInboundRouteRuntime<
         if (!(await selectPendingDestination())) return true;
         const operationId = selection.coordinator.operationId;
         if (current()) outcome = await selection.coordinator.advance();
+        const completionTimeoutMs = deps.liveRebindCommandCompletionTimeoutMs ?? 0;
+        if (outcome === "unknown" && !selection.commandCompletionWaited && selection.record.owner?.kind === "leader" &&
+          (selection.helpCommand || selection.menuCommand || selection.abortCommand || selection.nextCommand || selection.stopCommand) &&
+          Number.isFinite(completionTimeoutMs) && completionTimeoutMs > 0 &&
+          selection.coordinator.observeCommandCompletion() !== undefined) {
+          selection.commandCompletionWaited = true;
+          const coordinator = selection.coordinator;
+          const signal = Updates.getTelegramUpdateExecutionFence(query)?.signal;
+          outcome = await new Promise<"unknown" | "released">((resolve) => {
+            let settled = false;
+            const subscriptions: (() => void)[] = [];
+            const finish = (result: "unknown" | "released") => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              for (const unsubscribe of subscriptions) unsubscribe();
+              signal?.removeEventListener("abort", abort);
+              resolve(result);
+            };
+            const abort = () => finish("unknown");
+            const observe = () => {
+              if (settled) return;
+              if (!current()) { finish("unknown"); return; }
+              if (coordinator.observeCommandCompletion() === "released") finish("released");
+            };
+            const timer = setTimeout(abort, completionTimeoutMs);
+            timer.unref?.();
+            for (const message of selection.messages) {
+              const unsubscribe = Updates.subscribeTelegramDeferredSourceCompletion(message, observe);
+              if (unsubscribe) subscriptions.push(unsubscribe);
+            }
+            signal?.addEventListener("abort", abort, { once: true });
+            if (signal?.aborted || !current()) abort();
+            else if (coordinator.observeCommandCompletion() === "released") finish("released");
+          });
+        }
         // Cleanup readiness follows the canonical released row, not source disposal: a detached command ACK may
         // still be pending while every attempt samples current work afresh.
         const row =
