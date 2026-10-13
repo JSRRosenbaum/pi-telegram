@@ -26,6 +26,8 @@ import type {
   ToolExecutionEndEvent,
   ToolExecutionStartEvent,
   ToolExecutionUpdateEvent,
+  TurnEndEvent,
+  TurnEndEventResult,
   UIPromptEndEvent,
   UIPromptStartEvent,
 } from "./pi.ts";
@@ -100,6 +102,7 @@ export interface TelegramLifecycleRegistrationDeps {
     event: { model: TelegramLifecycleModel },
     ctx: ExtensionContext,
   ) => Promise<void> | void;
+  onTurnEnd?: (event: TurnEndEvent, ctx: ExtensionContext) => TurnEndEventResult | undefined;
   onAgentStart: (
     event: AgentStartEvent,
     ctx: ExtensionContext,
@@ -575,7 +578,6 @@ export function createTelegramBridgeSessionLifecycleAssembly<
 >(
   deps: TelegramBridgeSessionLifecycleAssemblyDeps<TQueueItem, TModel>,
 ): TelegramSessionLifecycleHooks {
-  const isSessionActive = deps.contextStore.isCurrent;
   const suspendForReplacement =
     BusFollower.createTelegramBusFollowerSessionReplacementSuspender({
       registrationState: deps.follower.registrationState,
@@ -583,32 +585,44 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       suspendPolling: deps.follower.suspendPolling,
       recordRuntimeEvent: deps.follower.recordRuntimeEvent,
     });
-  let preserveTarget = true;
-  const queueLifecycle = Queue.createTelegramSessionLifecycleRuntime({
-    ...deps.queue,
-    isSessionActive,
-    stopPolling: () => suspendForReplacement(preserveTarget),
-    clearPendingMediaGroups: deps.services.suspendGroupedInput,
-  });
+  // A reused context can be current for a successor; inner awaits need this invocation's generation too.
+  const queueLifecycle = (ctx: ExtensionContext, generation: number, preserveTarget = true) =>
+    Queue.createTelegramSessionLifecycleRuntime({
+      ...deps.queue,
+      isSessionActive: () => deps.contextStore.isCurrent(ctx, generation),
+      stopPolling: () => suspendForReplacement(preserveTarget),
+      clearPendingMediaGroups: deps.services.suspendGroupedInput,
+    });
   const servicesLifecycle: TelegramSessionLifecycleHooks = {
     async onSessionStart(event, ctx) {
+      const generation = deps.contextStore.getGeneration();
+      const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
       const resumeConnection = deps.services.connection?.prepare(event, ctx);
-      await queueLifecycle.onSessionStart(event, ctx);
-      if (!isSessionActive(ctx)) return;
+      await queueLifecycle(ctx, generation).onSessionStart(event, ctx);
+      if (!isCurrent()) return;
       deps.services.resumeGroupedInput(ctx);
       await deps.services.delivery.onSessionStart();
-      if (!isSessionActive(ctx)) return;
+      if (!isCurrent()) return;
       if (resumeConnection) resumeConnection();
       else await deps.services.polling.onSessionStart(event, ctx);
+      if (!isCurrent()) return;
       deps.services.capabilityMonitor.start(ctx);
       deps.services.queueWatchdog.start(ctx);
+      await BusFollower.createTelegramBusFollowerSessionRefreshHook({
+        registrationState: deps.follower.registrationState,
+        registrationRuntime: deps.follower.registrationRuntime,
+        getLeaderState: deps.follower.getLeaderState,
+        isSessionActive: isCurrent,
+        updateStatus: deps.follower.updateStatus,
+        recordRuntimeEvent: deps.follower.recordRuntimeEvent,
+      })(event, ctx);
     },
     async onSessionShutdown(event, ctx) {
       const generation = deps.contextStore.getGeneration();
       const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
       if (!isCurrent()) return;
       deps.services.connection?.onSessionShutdown(event, ctx);
-      preserveTarget = event.reason !== "resume";
+      const preserveTarget = event.reason !== "resume";
       let preserveThread: (() => Promise<void>) | undefined;
       if (event.reason === "quit") {
         try {
@@ -625,7 +639,7 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       if (!isCurrent()) return;
       deps.services.queueWatchdog.stop();
       deps.services.capabilityMonitor.stop();
-      await queueLifecycle.onSessionShutdown(event, ctx);
+      await queueLifecycle(ctx, generation, preserveTarget).onSessionShutdown(event, ctx);
       if (!isCurrent()) return;
       await deps.services.inboundWorker.onSessionShutdown();
       if (!isCurrent()) return;
@@ -638,23 +652,9 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       }
     },
   };
-  const followerLifecycle = appendTelegramLifecycleHooks(
-    servicesLifecycle,
-    {
-      onSessionStart: BusFollower.createTelegramBusFollowerSessionRefreshHook({
-        registrationState: deps.follower.registrationState,
-        registrationRuntime: deps.follower.registrationRuntime,
-        getLeaderState: deps.follower.getLeaderState,
-        isSessionActive,
-        updateStatus: deps.follower.updateStatus,
-        recordRuntimeEvent: deps.follower.recordRuntimeEvent,
-      }),
-    },
-    isSessionActive,
-  );
   return createTelegramSessionGenerationFence(
     deps.contextStore,
-    followerLifecycle,
+    servicesLifecycle,
   );
 }
 
@@ -1042,6 +1042,12 @@ export function registerTelegramLifecycleHooks(
     if (!isActive(ctx)) return;
     await deps.onAgentStart(event, ctx);
   });
+  if (deps.onTurnEnd) {
+    pi.on("turn_end", (event, ctx) => {
+      if (!isActive(ctx)) return;
+      return deps.onTurnEnd?.(event, ctx);
+    });
+  }
   pi.on("tool_execution_start", async (event, ctx) => {
     if (!isActive(ctx)) return;
     await deps.onToolExecutionStart(event, ctx);

@@ -35,6 +35,7 @@ import {
   getTelegramBusProtocolCompatibility,
   getTelegramBusSocketPath,
   hasTelegramBusCapability,
+  hasTelegramBusSteerQueueHandoffCapability,
   isTelegramBusEnvelopeAuthorized,
   parseTelegramBusEnvelope,
   resolveTelegramBusSocketPath,
@@ -4751,6 +4752,10 @@ export function createTelegramBusForwardedUpdateReceiverRuntime<TContext>(
             ok: true,
             result: receipt,
           };
+        }
+        if (envelope.payload.queueLane === "steer" &&
+            ![deps.getLocalProtocol?.(), deps.getLeaderProtocol?.()].every(hasTelegramBusSteerQueueHandoffCapability)) {
+          throw new Error("Steer queue handoff capability was not negotiated.");
         }
         if (!deps.handleQueueHandoff) {
           throw new Error(

@@ -1,4 +1,4 @@
-/** Native routing composition shared by route regressions and cross-domain custody acceptance. */
+/** Native routing composition shared by route regressions and cross-domain custody acceptance. Zones: telegram, pi agent, shared utils. */
 import * as Bindings from "../../lib/bindings.ts";
 import * as Commands from "../../lib/commands.ts";
 import * as Media from "../../lib/media.ts";
@@ -198,6 +198,7 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
   const queueMutationRuntime = queueBinding?.mutation ?? Queue.createTelegramQueueMutationController({
     ...telegramQueueStore,
     hasPendingDispatch: bridgeRuntime.lifecycle.hasDispatchPending,
+    allocateLaneOrder: bridgeRuntime.queue.allocateItemOrder,
     onItemsDiscarded: options.onItemsDiscarded,
     updateStatus: () => events.push("status"),
   });

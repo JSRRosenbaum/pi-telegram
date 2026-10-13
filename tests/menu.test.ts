@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram menu helpers
  * Covers inline model/status/thinking menu state, callbacks, and transport payloads
+ * Zones: telegram ui, pi agent
  */
 
 import assert from "node:assert/strict";
@@ -16,6 +17,7 @@ import {
   createTelegramConfigStore,
 } from "../lib/config.ts";
 import { createTelegramQueueMenuRuntime } from "../lib/menu-queue.ts";
+import * as Queue from "../lib/queue.ts";
 import { createTelegramMenuDelivery } from "../lib/menu-model.ts";
 import {
   buildTelegramSettingsMenuReplyMarkup,
@@ -1803,13 +1805,9 @@ test("Queue menu keeps main-menu navigation on top", async () => {
       clear: () => 0,
       removeByMessageIds: () => 0,
       applyReactionByMessageId: (messageId, disposition) => {
-        const item = queuedItems.find(
-          (entry) => entry.replyToMessageId === messageId,
-        );
-        if (!item) return false;
-        item.queueLane =
-          disposition.kind === "priority" ? "priority" : "default";
-        return true;
+        const result = Queue.applyTelegramQueuePromptReactionDisposition(queuedItems, messageId, disposition, 20);
+        queuedItems.splice(0, queuedItems.length, ...result.items);
+        return result.changed;
       },
     },
     sendInteractiveMessage: async (_chatId, text, mode, replyMarkup) => {
@@ -1878,16 +1876,18 @@ test("Queue menu keeps main-menu navigation on top", async () => {
     "1. 🕊 queued <prompt>",
   );
   assert.deepEqual(markups[2]?.inline_keyboard[1], [
-    { text: "🟡 Priority", callback_data: "queue:prio-set:1:10:priority" },
-    { text: "⚫️ Normal", callback_data: "queue:prio-set:1:10:normal" },
+    { text: "⚫️ Normal", callback_data: "queue:lane-set:1:10:normal" },
+    { text: "🟣 Priority", callback_data: "queue:lane-set:1:10:priority" },
+    { text: "⚫️ Steer", callback_data: "queue:lane-set:1:10:steer" },
   ]);
   assert.deepEqual(markups[2]?.inline_keyboard[2], [
     { text: "🟢 Keep", callback_data: "queue:skip-set:1:10:keep" },
     { text: "⚫️ Skip", callback_data: "queue:skip-set:1:10:skip" },
   ]);
   assert.deepEqual(markups[3]?.inline_keyboard[1], [
-    { text: "⚫️ Priority", callback_data: "queue:prio-set:1:10:priority" },
-    { text: "🔵 Normal", callback_data: "queue:prio-set:1:10:normal" },
+    { text: "🔵 Normal", callback_data: "queue:lane-set:1:10:normal" },
+    { text: "⚫️ Priority", callback_data: "queue:lane-set:1:10:priority" },
+    { text: "⚫️ Steer", callback_data: "queue:lane-set:1:10:steer" },
   ]);
   assert.deepEqual(markups[3]?.inline_keyboard[2], [
     { text: "🟢 Keep", callback_data: "queue:skip-set:1:10:keep" },
@@ -2006,27 +2006,9 @@ test("Queue item Keep and Skip selectors share deferred-removal state", async ()
       clear: () => 0,
       removeByMessageIds: () => 0,
       applyReactionByMessageId: (messageId, disposition) => {
-        const item = queuedItems.find(
-          (entry) => entry.kind === "prompt" && entry.replyToMessageId === messageId,
-        );
-        if (!item || item.kind !== "prompt") return false;
-        const isPriority =
-          disposition.kind === "priority" ||
-          disposition.kind === "priority-suppressed";
-        item.queueLane = isPriority ? "priority" : "default";
-        item.priorityEmoji =
-          disposition.kind === "priority"
-            ? disposition.emoji
-            : disposition.kind === "priority-suppressed"
-              ? disposition.priorityEmoji
-              : undefined;
-        item.reactionSuppressionEmoji =
-          disposition.kind === "suppressed"
-            ? disposition.emoji
-            : disposition.kind === "priority-suppressed"
-              ? disposition.suppressionEmoji
-              : undefined;
-        return true;
+        const result = Queue.applyTelegramQueuePromptReactionDisposition(queuedItems, messageId, disposition, 20);
+        queuedItems.splice(0, queuedItems.length, ...result.items);
+        return result.changed;
       },
     },
     sendInteractiveMessage: async () => 99,
@@ -2086,8 +2068,9 @@ test("Queue item Keep and Skip selectors share deferred-removal state", async ()
     "👎",
   );
   assert.deepEqual(markups[1]?.inline_keyboard[1], [
-    { text: "🟡 Priority", callback_data: "queue:prio-set:1:10:priority" },
-    { text: "⚫️ Normal", callback_data: "queue:prio-set:1:10:normal" },
+    { text: "⚫️ Normal", callback_data: "queue:lane-set:1:10:normal" },
+    { text: "🟣 Priority", callback_data: "queue:lane-set:1:10:priority" },
+    { text: "⚫️ Steer", callback_data: "queue:lane-set:1:10:steer" },
   ]);
   assert.deepEqual(markups[1]?.inline_keyboard[2], [
     { text: "⚫️ Keep", callback_data: "queue:skip-set:1:10:keep" },
@@ -2109,10 +2092,11 @@ test("Queue item Keep and Skip selectors share deferred-removal state", async ()
     undefined,
   );
   assert.equal(queuedItems[0]?.queueLane, "priority");
-  assert.equal(texts[2], "<b>1.</b> ⚡\n<pre>[telegram] keep or skip</pre>");
+  assert.equal(texts[2], "<b>1.</b> 👍\n<pre>[telegram] keep or skip</pre>");
   assert.deepEqual(markups[2]?.inline_keyboard[1], [
-    { text: "🟡 Priority", callback_data: "queue:prio-set:1:10:priority" },
-    { text: "⚫️ Normal", callback_data: "queue:prio-set:1:10:normal" },
+    { text: "⚫️ Normal", callback_data: "queue:lane-set:1:10:normal" },
+    { text: "🟣 Priority", callback_data: "queue:lane-set:1:10:priority" },
+    { text: "⚫️ Steer", callback_data: "queue:lane-set:1:10:steer" },
   ]);
   assert.deepEqual(markups[2]?.inline_keyboard[2], [
     { text: "🟢 Keep", callback_data: "queue:skip-set:1:10:keep" },
@@ -2129,6 +2113,98 @@ test("Queue item Keep and Skip selectors share deferred-removal state", async ()
     "ctx",
   ), false);
   assert.equal(queuedItems.length, 1);
+});
+
+function createSteerMenuFixture(item: Queue.PendingTelegramTurn, pending = false) {
+  const store = Queue.createTelegramQueueStore<string>(); store.setQueuedItems([item]);
+  let order = 20;
+  const markup: TelegramInlineKeyboardMarkup[] = [], texts: string[] = [], toasts: Array<string | undefined> = [];
+  const mutation = Queue.createTelegramQueueMutationController<string>({ ...store,
+    hasPendingDispatch: () => pending, allocateLaneOrder: () => ++order, updateStatus: () => {} });
+  const state = createMenuState(2);
+  const runtime = createTelegramQueueMenuRuntime<string>({
+    telegramQueueStore: store, queueMutationRuntime: mutation, hasPendingDispatch: () => pending,
+    sendInteractiveMessage: async () => 99,
+    editInteractiveMessage: async (_chat, _message, text, _mode, keyboard) => { texts.push(text); markup.push(keyboard); },
+    answerCallbackQuery: async (_id, text) => { toasts.push(text); },
+    getModelMenuState: async () => state, getStoredModelMenuState: () => state,
+    storeModelMenuState: () => {}, updateStatusMessage: async () => {}, updateStatus: () => {},
+  });
+  return { ...store, mutation, markup, texts, toasts,
+    click: (data: string) => runtime.handleCallbackQuery({ id: "control", data,
+      message: { chat: { id: 1 }, message_id: 2 } }, "ctx"),
+  };
+}
+
+function createSteerMenuPrompt(overrides: Partial<Queue.PendingTelegramTurn> = {}): Queue.PendingTelegramTurn {
+  return { kind: "prompt", chatId: 1, replyToMessageId: 10, queueOrder: 1, queueLane: "default", laneOrder: 1,
+    sourceMessageIds: [10], queuedAttachments: [], content: [{ type: "text", text: "prompt" }], historyText: "prompt",
+    statusSummary: "prompt", ...overrides };
+}
+
+test("A dispatched guest is inspection-only and stale Skip callbacks retain its reply owner", async () => {
+  const guest = createSteerMenuPrompt({ guestQueryId: "guest", guestInlineMessageId: "inline" });
+  const fixture = createSteerMenuFixture(guest, true);
+  await fixture.click("queue:guest-pick:1");
+  assert.deepEqual(fixture.markup.at(-1)!.inline_keyboard, [[{ text: "⬆️ Back", callback_data: "queue:list" }]]);
+  assert.match(fixture.texts.at(-1)!, /Dispatch protected/);
+  await fixture.click("queue:guest-skip:1");
+  assert.strictEqual(fixture.getQueuedItems()[0], guest);
+  assert.equal(fixture.toasts.at(-1), "Queue item is protected");
+});
+
+test("Steer menu selectors change only their axis and retain FIFO identity", async () => {
+  const fixture = createSteerMenuFixture(createSteerMenuPrompt());
+  await fixture.click("queue:lane-set:1:10:steer");
+  const steer = fixture.getQueuedItems()[0] as Queue.PendingTelegramTurn;
+  assert.equal(steer.queueOrder, 1); assert.equal(steer.queueLane, "steer");
+  assert.deepEqual(fixture.markup[0]!.inline_keyboard[1]!.map(cell => cell.text), ["⚫️ Normal", "⚫️ Priority", "🟡 Steer"]);
+  await fixture.click("queue:skip-set:1:10:skip");
+  const skipped = fixture.getQueuedItems()[0] as Queue.PendingTelegramTurn;
+  assert.equal(skipped.laneOrder, steer.laneOrder); assert.equal(skipped.queueLane, "steer");
+  assert.equal(skipped.priorityEmoji, "🔥"); assert.equal(skipped.reactionSuppressionEmoji, "👎");
+  await fixture.click("queue:skip-set:1:10:keep");
+  assert.equal((fixture.getQueuedItems()[0] as Queue.PendingTelegramTurn).laneOrder, steer.laneOrder);
+  await fixture.click("queue:prio-set:1:10:priority"); // Retained published legacy buttons still have explicit lane intent.
+  const priority = fixture.getQueuedItems()[0] as Queue.PendingTelegramTurn;
+  assert.equal(priority.queueLane, "priority"); assert.equal(priority.priorityEmoji, "👍");
+  assert.deepEqual(fixture.markup.at(-1)!.inline_keyboard[1]!.map(cell => [cell.text, cell.callback_data]), [
+    ["⚫️ Normal", "queue:lane-set:1:10:normal"],
+    ["🟣 Priority", "queue:lane-set:1:10:priority"],
+    ["⚫️ Steer", "queue:lane-set:1:10:steer"],
+  ]);
+  assert.ok(priority.laneOrder > steer.laneOrder);
+  await fixture.click("queue:lane-set:1:10:normal");
+  assert.equal(fixture.getQueuedItems()[0]!.queueLane, "default");
+  assert.deepEqual(fixture.markup.at(-1)!.inline_keyboard[1]!.map(cell => cell.text), ["🔵 Normal", "⚫️ Priority", "⚫️ Steer"]);
+  assert.deepEqual(fixture.toasts, ["Steer selected", undefined, undefined, "Prioritized", "Normal priority"]);
+});
+
+test("Steer menus expose capacity and frozen truth without granting protected mutations", async () => {
+  for (const mode of ["frozen", "pending", "capacity", "control"] as const) {
+    const item = createSteerMenuPrompt({ queueLane: mode === "control" ? "control" : "steer",
+      ...(mode === "frozen" ? { steerAttempted: true } : {}),
+      ...(mode === "capacity" ? { content: [{ type: "text", text: "x".repeat(Queue.TELEGRAM_QUEUE_HANDOFF_PAYLOAD_MAX_BYTES) }] } : {}),
+      ...(mode === "control" ? { sourceMessageIds: [] } : {}),
+    });
+    const fixture = createSteerMenuFixture(item, mode === "pending");
+    await fixture.click("queue:pick:1:10");
+    const before = fixture.getQueuedItems()[0];
+    if (mode === "capacity") {
+      assert.match(fixture.texts[0]!, /Idle Steer capacity exceeded/);
+      assert.equal(fixture.markup[0]!.inline_keyboard.length, 3);
+      await fixture.click("queue:lane-set:1:10:normal");
+      assert.equal(fixture.getQueuedItems()[0]!.queueLane, "default");
+    } else {
+      assert.equal(fixture.markup[0]!.inline_keyboard.length, 1);
+      if (mode !== "control") assert.match(fixture.texts[0]!, /SDK\/model use is unconfirmed/);
+      await fixture.click("queue:prio-set:1:10:normal"); await fixture.click("queue:skip-set:1:10:skip");
+      assert.equal(fixture.getQueuedItems()[0], before);
+      if (mode === "pending") assert.equal(fixture.mutation.applyReactionByMessageId(10,
+        { kind: "reaction-transition", promptLane: "default", priorityEmoji: null }, "ctx"), false);
+      assert.deepEqual(fixture.toasts, [undefined, "Queue item is protected", "Queue item is protected"]);
+    }
+  }
 });
 
 test("Queue menu discards the selected guest prompt by queue order and dismisses its placeholder", async () => {

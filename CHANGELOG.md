@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+## 0.56.0: Steer from Telegram
+
+- `Thread recovery`: A startup Telegram API timeout can leave the owner without a local bus despite retained Threaded Mode. A fresh positive capability probe now starts that owner's Threaded transport instead of treating the unchanged saved mode as readiness. Healthy buses stay running and followers cannot acquire leadership through this recovery.
+- `Steer`: Send corrections into a busy Pi run with a fire reaction or the queue menu. Ready whole prompts form FIFO packets at public model-step boundaries; idle Steer starts one ordinary task. Waiting input stays in Telegram's queue, not Pi's native steering/follow-up queues. Native pending input and compaction defer attempts; delivery is not a transactional model-use acknowledgement, and uncertain attempts never automatically replay.
+- `Queue controls`: Normal/Priority/Steer and independent Keep/Skip share menu and reaction state. Fire dominates Priority reactions; changing lanes appends at the destination tail. Blue Normal, purple Priority and yellow Steer selectors accompany one yellow terminal waiting-work count. Dispatched/frozen prompts are read-only; a dispatched guest cannot be removed by stale Skip controls or lose its reply owner.
+- `Queue transfer`: Negotiated `queue-steer-v1` support preserves unspent Steer prompts, ordering, attachments and whole receipts across live handoff. Donor, leader and recipient must all support it alongside base queue handoff; incompatible peers, attempted work and pending packets refuse transfer before custody changes.
+- `Session lifetime`: Queue startup/shutdown and follower refresh preserve captured session generations across asynchronous preparation and teardown. Reused context objects cannot let an obsolete operation discard a successor queue, publish stale registration success or start its monitors. Failed durable disposal retains work without replay.
+- `Validation scope`: Operator smoke tests confirmed native and Telegram Steer, ordered text batching, voice-derived input and Normal work after completion. Broader live idle/native-pending, media/transfer/Restore, interruption and native-Windows scenarios remain follow-up acceptance work, not verified release guarantees.
+
 ## 0.55.1: Visible Reroute and follower cleanup
 
 - `Reroute visibility`: Temporary Reroute forwards text, voice, files and albums into the selected Thread before local/follower admission, then anchors replies to confirmed copies. Source/recipient/generation fences reach HTTP and IPC write/ACK boundaries; one native grant prevents replay after partial/lost ACKs. Unknown cold All copies stay held with Cancel; real native-source recovery remains supported. Journal originals, receipt/group cleanup protections, Restore and cleanup timing are unchanged.

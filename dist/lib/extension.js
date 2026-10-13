@@ -59,6 +59,7 @@ import * as WorkspaceRetirement from "./workspace-retirement.js";
 const telegramBusProtocolIdentity = Bus.createTelegramCurrentBusProtocolIdentity([
     Bus.TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
     Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+    Bus.TELEGRAM_BUS_CAPABILITY_QUEUE_STEER,
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
     Bus.TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
     Bus.TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
@@ -557,7 +558,6 @@ export default function (pi) {
         },
         getQueuedItems: telegramQueueStore.getQueuedItems,
         getQueuedItemCount: Queue.countExecutableTelegramQueueItems,
-        formatQueuedStatus: Queue.formatQueuedTelegramItemsStatus,
         getRecentRuntimeEvents: runtimeEvents.getEvents,
         getRuntimeLockState: lockRuntime.getStatusLabel,
         ...threadStatusProjectionRuntime,
@@ -796,7 +796,7 @@ export default function (pi) {
             editMessageText: editTelegramMessageText,
         },
     });
-    const { mutation: queueMutationRuntime, dispatchNext: dispatchNextQueuedTelegramTurn, requestNextDispatchAnnouncement, cancelNextDispatchAnnouncement, watchdog: queueDispatchWatchdogRuntime, } = Bindings.createTelegramQueueBindingRuntime({
+    const { mutation: queueMutationRuntime, dispatchNext: dispatchNextQueuedTelegramTurn, requestNextDispatchAnnouncement, cancelNextDispatchAnnouncement, watchdog: queueDispatchWatchdogRuntime, onTurnEnd: onSteerTurnEnd, } = Bindings.createTelegramQueueBindingRuntime({
         store: telegramQueueStore,
         queue,
         lifecycle,
@@ -807,6 +807,8 @@ export default function (pi) {
         promptDispatch: promptDispatchRuntime,
         isIdle,
         hasPendingMessages,
+        isContextCurrent: telegramSessionContextStore.isCurrent,
+        isContextAborted: Pi.isExtensionContextAbortRequested,
         updateStatus,
         sendTextReply,
         sendUserMessage,
@@ -881,6 +883,7 @@ export default function (pi) {
     });
     // --- Queue And Settings Menus ---
     const queueMenuRuntime = MenuQueue.createTelegramQueueMenuRuntime({
+        hasPendingDispatch: lifecycle.hasDispatchPending,
         telegramQueueStore,
         queueMutationRuntime,
         sendInteractiveMessage,
@@ -1858,6 +1861,14 @@ export default function (pi) {
         recordRuntimeEvent,
     });
     queueHandoffReconciliationBinding.set(Updates.createTelegramQueueHandoffReconciliationRuntimeAssembly({
+        hasPendingDispatch: lifecycle.hasDispatchPending,
+        canHandoffSteerWithRecipient(recipient) {
+            const live = telegramBusFollowerRegistry.get(recipient.instanceId);
+            return live?.registrationGeneration === recipient.registrationGeneration &&
+                [telegramBusProtocolIdentity, live?.protocol,
+                    ...(telegramBusFollowerRegistrationState.isRegistered() ? [telegramBusFollowerRegistrationState.getLeaderProtocol()] : [])]
+                    .every(Bus.hasTelegramBusSteerQueueHandoffCapability);
+        },
         ownsDirect: lockRuntime.owns,
         isFollowerRegistered: telegramBusFollowerRegistrationState.isRegistered,
         isBusEnabled: isTelegramBusRuntimeEnabled,
@@ -2461,6 +2472,7 @@ export default function (pi) {
         sendMarkdownReply,
         sendTextReply,
         dispatchNextQueuedTelegramTurn,
+        onSteerTurnEnd,
         onPromptHandedOff(turn, ctx) {
             updateAdmissionRuntimeBinding
                 .getSettlement()

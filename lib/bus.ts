@@ -142,6 +142,8 @@ export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION =
   "durable-follower-admission-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF =
   "queue-handoff-v1" as const;
+/** Unspent Steer lane codec; independent from baseline receipt handoff support. */
+export const TELEGRAM_BUS_CAPABILITY_QUEUE_STEER = "queue-steer-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE =
   "input-custody-reference-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME =
@@ -459,6 +461,11 @@ export function hasTelegramBusCapability(
   capability: string,
 ): boolean {
   return identity?.capabilities.includes(capability) ?? false;
+}
+
+export function hasTelegramBusSteerQueueHandoffCapability(identity: TelegramBusProtocolIdentity | undefined): boolean {
+  return hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF) &&
+    hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER);
 }
 
 export function getTelegramInputCustodyPeerReadiness(

@@ -4,8 +4,8 @@
  * Owns direct pi SDK imports and exposes narrow bridge-facing helpers/types for the extension composition layer
  */
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
-import { type AgentEndEvent, type AgentSettledEvent, type AgentStartEvent, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionCompactEvent, type SessionShutdownEvent, type SessionStartEvent, type SlashCommandInfo, type UIPromptEndEvent, type UIPromptStartEvent } from "@earendil-works/pi-coding-agent";
-export type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SlashCommandInfo, UIPromptEndEvent, UIPromptStartEvent, };
+import { type AgentEndEvent, type AgentSettledEvent, type AgentStartEvent, type BeforeAgentStartEvent, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent, type MessageEndEvent, type SessionBeforeCompactEvent, type SessionCompactEvent, type SessionShutdownEvent, type SessionStartEvent, type SlashCommandInfo, type TurnEndEvent, type TurnEndEventResult, type UIPromptEndEvent, type UIPromptStartEvent } from "@earendil-works/pi-coding-agent";
+export type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionCommandContext, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionShutdownEvent, SessionStartEvent, SlashCommandInfo, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent, };
 export interface SessionCompactFailedEvent {
     type: "session_compact_failed";
     reason: "manual" | "threshold" | "overflow";
@@ -72,5 +72,6 @@ export declare function getExtensionContextCwd(ctx: ExtensionContext): string;
 export declare function getExtensionContextSessionId(ctx: ExtensionContext): string;
 export declare function getExtensionContextSessionId(ctx: ExtensionContext | undefined): string | undefined;
 export declare function isExtensionContextIdle(ctx: ExtensionContext): boolean;
+export declare function isExtensionContextAbortRequested(ctx: ExtensionContext): boolean;
 export declare function hasExtensionContextPendingMessages(ctx: ExtensionContext): boolean;
 export declare function compactExtensionContext(ctx: ExtensionContext, callbacks: Parameters<ExtensionContext["compact"]>[0]): ReturnType<ExtensionContext["compact"]>;

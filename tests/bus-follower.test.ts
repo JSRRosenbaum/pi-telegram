@@ -136,6 +136,7 @@ import {
   sendTelegramBusLocalEnvelope,
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  TELEGRAM_BUS_CAPABILITY_QUEUE_STEER,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
@@ -813,8 +814,11 @@ test("Bus follower receiver stages authenticated queue handoff payloads", async 
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-queue-handoff-receiver-"));
   const socketPath = join(dir, "follower.sock");
   const staged: unknown[] = [];
+  let localProtocol = TEST_BUS_PROTOCOL_IDENTITY, leaderProtocol = TEST_BUS_PROTOCOL_IDENTITY;
   const receiver = createTelegramBusForwardedUpdateReceiverRuntime({
     socketPath,
+    getLocalProtocol: () => localProtocol,
+    getLeaderProtocol: () => leaderProtocol,
     instanceId: "inst-b",
     getAuthSecret: () => "secret",
     getRegistrationGeneration: () => "generation-b",
@@ -930,6 +934,16 @@ test("Bus follower receiver stages authenticated queue handoff payloads", async 
       },
     );
     assert.equal(staged.length, 1);
+    const steerProtocol = createTelegramBusProtocolIdentity({ runtimeBuild: "steer", capabilities: [TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER] });
+    for (const missing of ["local", "leader", "none"] as const) {
+      localProtocol = missing === "local" ? TEST_BUS_PROTOCOL_IDENTITY : steerProtocol;
+      leaderProtocol = missing === "leader" ? TEST_BUS_PROTOCOL_IDENTITY : steerProtocol;
+      const response = await sendTelegramBusLocalEnvelope({ socketPath, envelope: { ...envelope,
+        requestId: `steer:${missing}`, payload: { ...payload, queueLane: "steer" } } });
+      assert.equal(response?.kind === "bus.ack" && response.ok, missing === "none");
+      if (missing !== "none") assert.equal(staged.length, 1, "Unsupported peers never reach staging/admission");
+    }
+    assert.equal(staged.length, 2);
   } finally {
     await receiver.stop();
     rmSync(dir, { recursive: true, force: true });

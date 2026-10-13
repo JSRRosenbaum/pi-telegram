@@ -122,6 +122,9 @@ export function getExtensionContextSessionId(ctx) {
 export function isExtensionContextIdle(ctx) {
     return ctx.isIdle();
 }
+export function isExtensionContextAbortRequested(ctx) {
+    return ctx.signal?.aborted === true;
+}
 export function hasExtensionContextPendingMessages(ctx) {
     return ctx.hasPendingMessages();
 }

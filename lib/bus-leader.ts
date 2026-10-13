@@ -23,6 +23,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT,
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  hasTelegramBusSteerQueueHandoffCapability,
   TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
@@ -3273,6 +3274,10 @@ export function createTelegramBusLeaderEnvelopeHandler(
         "Telegram queue handoff capability was not negotiated.",
       );
     }
+    if (envelope.payload.queueLane === "steer" &&
+        ![deps.protocolIdentity, donor.protocol, recipient?.protocol].every(hasTelegramBusSteerQueueHandoffCapability)) {
+      return rejectTelegramBusRequest(envelope.requestId, "Steer queue handoff capability was not negotiated.");
+    }
     if (
       !recipient?.registrationGeneration ||
       envelope.recipientRegistrationGeneration !==
@@ -4476,6 +4481,10 @@ export function createTelegramBusLeaderRuntime<TContext>(
         input.requestId,
         "Telegram queue handoff capability was not negotiated.",
       );
+    }
+    if (input.payload.queueLane === "steer" &&
+        ![deps.protocolIdentity, recipient?.protocol].every(hasTelegramBusSteerQueueHandoffCapability)) {
+      return rejectTelegramBusRequest(input.requestId, "Steer queue handoff capability was not negotiated.");
     }
     if (
       !recipient?.registrationGeneration ||

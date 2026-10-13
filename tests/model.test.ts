@@ -1,6 +1,7 @@
 /**
  * Regression tests for Telegram model control helpers
  * Exercises model selection state/resolution plus in-flight model-switch orchestration
+ * Zones: telegram, pi agent, shared utils
  */
 
 import assert from "node:assert/strict";
@@ -34,6 +35,7 @@ import {
   THINKING_LEVELS,
 } from "../lib/model.ts";
 import type { PendingTelegramTurn } from "../lib/queue.ts";
+import * as Queue from "../lib/queue.ts";
 
 function createModelTestModel(
   provider = "openai",
@@ -514,6 +516,35 @@ test("Model-switch controller runtime binds continuation queue construction", ()
   assert.equal(controller.hasPendingSwitch(), false);
   assert.equal(appended[0]?.queueOrder, 5);
   assert.equal(appended[0]?.queueLane, "control");
+});
+
+test("Model-switch producer queues Control before abort without retargeting or spending waiting Steer", () => {
+  const steer = createModelTestTurn({ queueOrder: 1, laneOrder: 1, queueLane: "steer", target: { chatId: 7, threadId: 42 } });
+  const active = createModelTestTurn({ target: steer.target });
+  const store = Queue.createTelegramQueueStore<string>([steer]);
+  const mutation = Queue.createTelegramQueueMutationController({ ...store, updateStatus() {} });
+  const before = structuredClone(steer);
+  let aborts = 0;
+  const controller = createTelegramModelSwitchControllerRuntime({ isIdle: () => false, getActiveTurn: () => active,
+    getAbortHandler: () => () => {
+      aborts++;
+      assert.equal(store.getQueuedItems()[0]!.queueLane, "control", "Continuation publication precedes abort");
+      assert.equal(store.getQueuedItems()[1], steer);
+    }, hasAbortHandler: () => true, getActiveToolExecutions: () => 0,
+    allocateItemOrder: () => 2, allocateControlOrder: () => 2, appendQueuedItem: mutation.append, updateStatus() {} });
+  controller.stagePendingSwitch(createModelTestSelection(), "ctx");
+  assert.equal(aborts, 1);
+  const continuation = store.getQueuedItems()[0]!;
+  assert.ok(continuation.kind === "prompt");
+  assert.equal(continuation.queueLane, "control"); assert.deepEqual(continuation.sourceMessageIds, []);
+  assert.deepEqual(continuation.target, steer.target);
+  assert.deepEqual(steer, before, "A model change adds no task affinity, source rewrite or attempt marker to waiting Steer");
+  assert.deepEqual(Queue.planTelegramSteerPacket(store.getQueuedItems(), { blocked: false, isItemReady: () => true }), { kind: "none" });
+  const started = Queue.consumeDispatchedTelegramPrompt(store.getQueuedItems(), true);
+  assert.equal(started.activeTurn, continuation);
+  const packet = Queue.planTelegramSteerPacket(started.remainingItems, { blocked: false, isItemReady: () => true });
+  assert.equal(packet.kind, "packet");
+  if (packet.kind === "packet") assert.equal(packet.items[0], steer, "Same-session continuation preserves later Steer eligibility");
 });
 
 test("Model-switch continuation turn stays control-lane and resume-oriented", () => {

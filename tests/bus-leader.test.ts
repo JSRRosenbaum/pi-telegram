@@ -21,6 +21,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  TELEGRAM_BUS_CAPABILITY_QUEUE_STEER,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
@@ -3120,6 +3121,22 @@ test("Bus leader routes authenticated queue handoff between exact follower gener
     },
   );
   assert.equal(routed.length, 1);
+  const steerProtocol = createTelegramBusProtocolIdentity({ runtimeBuild: "steer", capabilities: [TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER] });
+  for (const missing of ["leader", "donor", "recipient", "none"] as const) {
+    const peers = createTelegramBusFollowerRegistry();
+    peers.register({ instanceId: "donor", registrationGeneration: "donor-generation", connectedAtMs: 1,
+      protocol: missing === "donor" ? TEST_BUS_PROTOCOL_IDENTITY : steerProtocol });
+    peers.register({ instanceId: "recipient", registrationGeneration: "recipient-generation", connectedAtMs: 1,
+      protocol: missing === "recipient" ? TEST_BUS_PROTOCOL_IDENTITY : steerProtocol });
+    let stages = 0;
+    const handler = createTelegramBusLeaderEnvelopeHandler({ followerRegistry: peers, authSecret: "secret",
+      protocolIdentity: missing === "leader" ? TEST_BUS_PROTOCOL_IDENTITY : steerProtocol,
+      routeQueueHandoff: () => { stages += 1; return { status: "staged", receiptId: "receipt-1", sourceUpdateIds: [1] }; },
+    });
+    const result = await handler({ ...envelope, payload: { ...payload, queueLane: "steer" } });
+    assert.equal(result.kind === "bus.ack" && result.ok, missing === "none");
+    assert.equal(stages, missing === "none" ? 1 : 0, "Every participant must support Steer before forwarding");
+  }
 });
 
 test("Bus leader envelope handler registers and heartbeats followers", async () => {
@@ -5972,46 +5989,61 @@ test("Bus leader runtime exposes direct leader-to-follower queue handoff", async
       result: { status: "staged", receiptId: "receipt-1", sourceUpdateIds: [1] },
     }),
   });
-  await recipientServer.start();
-  const response = await runtime.routeQueueHandoff({
-    requestId: "handoff:runtime",
-    auth: undefined,
-    recipientInstanceId: "recipient",
-    recipientRegistrationGeneration: "recipient-generation",
-    donorInstanceId: "leader",
-    donorProcessId: 101,
-    donorProcessBirthId: "101:start:donor",
-    donorSessionGeneration: 1,
-    donorAcquisitionId: "acquisition",
-    donorAcquiredAtMs: 1,
-    handoffToken: "x".repeat(32),
-    payload: {
-      kind: "prompt",
-      chatId: 7,
-      replyToMessageId: 10,
-      queueOrder: 1,
-      queueLane: "default",
-      laneOrder: 1,
-      statusSummary: "handoff",
-      admissionReceipts: [
-        { queueKind: "prompt", receiptId: "receipt-1", sourceUpdateIds: [1] },
-      ],
-      sourceMessageIds: [10],
-      queuedAttachments: [],
-      content: [{ type: "text", text: "handoff prompt" }],
-      historyText: "handoff",
-    },
-    sentAtMs: 1,
-  });
-  assert.deepEqual(response, {
-    kind: "bus.ack",
-    requestId: "handoff:runtime",
-    ok: true,
-    result: { status: "staged", receiptId: "receipt-1", sourceUpdateIds: [1] },
-  });
-  await recipientServer.stop();
-  await runtime.stopPolling();
-  rmSync(dir, { recursive: true, force: true });
+  let upgraded: typeof runtime | undefined;
+  try {
+    await recipientServer.start();
+    const offer: Parameters<typeof runtime.routeQueueHandoff>[0] = {
+      requestId: "handoff:runtime",
+      auth: undefined,
+      recipientInstanceId: "recipient",
+      recipientRegistrationGeneration: "recipient-generation",
+      donorInstanceId: "leader",
+      donorProcessId: 101,
+      donorProcessBirthId: "101:start:donor",
+      donorSessionGeneration: 1,
+      donorAcquisitionId: "acquisition",
+      donorAcquiredAtMs: 1,
+      handoffToken: "x".repeat(32),
+      payload: {
+        kind: "prompt",
+        chatId: 7,
+        replyToMessageId: 10,
+        queueOrder: 1,
+        queueLane: "default",
+        laneOrder: 1,
+        statusSummary: "handoff",
+        admissionReceipts: [
+          { queueKind: "prompt", receiptId: "receipt-1", sourceUpdateIds: [1] },
+        ],
+        sourceMessageIds: [10],
+        queuedAttachments: [],
+        content: [{ type: "text", text: "handoff prompt" }],
+        historyText: "handoff",
+      },
+      sentAtMs: 1,
+    };
+    const response = await runtime.routeQueueHandoff(offer);
+    assert.deepEqual(response, {
+      kind: "bus.ack",
+      requestId: "handoff:runtime",
+      ok: true,
+      result: { status: "staged", receiptId: "receipt-1", sourceUpdateIds: [1] },
+    });
+    const steerOffer = { ...offer, requestId: "handoff:steer", payload: { ...offer.payload, queueLane: "steer" as const } };
+    assert.equal((await runtime.routeQueueHandoff(steerOffer) as { ok: boolean }).ok, false);
+    const steerProtocol = createTelegramBusProtocolIdentity({ runtimeBuild: "steer", capabilities: [TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_QUEUE_STEER] });
+    upgraded = createTelegramBusLeaderRuntime({ socketPath: join(dir, "upgraded.sock"), followerRegistry: registry,
+      protocolIdentity: steerProtocol, startPolling: () => undefined, stopPolling: () => undefined });
+    assert.equal((await upgraded.routeQueueHandoff(steerOffer) as { ok: boolean }).ok, false, "Legacy recipient refuses before native IPC");
+    registry.register({ ...registry.get("recipient")!, protocol: steerProtocol });
+    const supportedResponse = await upgraded.routeQueueHandoff(steerOffer);
+    assert.equal((supportedResponse as { ok: boolean }).ok, true, JSON.stringify(supportedResponse));
+  } finally {
+    await upgraded?.stopPolling();
+    await recipientServer.stop();
+    await runtime.stopPolling();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("Bus leader runtime provisions leader target before polling", async () => {

@@ -576,12 +576,15 @@ test("Thread capability state runtime owns transition flags", () => {
 });
 
 function createCapabilityLifecycleFixture(hooks: {
-  getMe: () => Promise<boolean>;
+  getMe: () => Promise<boolean | undefined>;
+  initialBot?: TelegramThreadCapabilityState;
+  ownsLock?: () => boolean;
+  isFollowerRegistered?: () => boolean;
   persist?: () => Promise<void>;
   startBus?: () => Promise<void>;
 }) {
   const state = createTelegramThreadCapabilityStateRuntime();
-  let bot: TelegramThreadCapabilityState = {};
+  let bot: TelegramThreadCapabilityState = hooks.initialBot ?? {};
   const calls: string[] = [];
   const runtime = createTelegramThreadCapabilityOrchestration<string, unknown>({
     state, getAllowedUserId: () => 1,
@@ -592,7 +595,8 @@ function createCapabilityLifecycleFixture(hooks: {
       getBotState: () => bot,
       setBotState: (value) => { bot = value; calls.push(`bot:${value.threadMode}`); },
     },
-    ownsLock: () => true, isBusRuntimeEnabled: state.isBusRuntimeEnabled,
+    ownsLock: hooks.ownsLock ?? (() => true), isFollowerRegistered: hooks.isFollowerRegistered,
+    isBusRuntimeEnabled: state.isBusRuntimeEnabled,
     startClassicPolling: () => { calls.push("classic-start"); },
     stopClassicPolling: async () => { calls.push("classic-stop"); },
     startBusLeaderPolling: async () => { calls.push("bus-start"); await hooks.startBus?.(); },
@@ -606,6 +610,60 @@ function createCapabilityLifecycleFixture(hooks: {
   });
   return { runtime, state, calls, getBotState: () => bot };
 }
+
+test("A fresh positive probe restores the bus after startup timeout with retained enabled mode", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let probes = 0;
+  const fixture = createCapabilityLifecycleFixture({
+    initialBot: { threadMode: "enabled" },
+    getMe: async () => {
+      if (++probes === 1) throw new Error("connect ETIMEDOUT");
+      return probes === 2 ? undefined : true;
+    },
+  });
+  const { runtime, state, calls } = fixture;
+  const tick = async () => { t.mock.timers.tick(2500); await new Promise<void>(resolve => setImmediate(resolve)); };
+  try {
+    await runtime.pollingPorts.startPolling("ctx");
+    assert.equal(fixture.getBotState().threadMode, "enabled");
+    assert.equal(state.isBusPollingStarted(), false);
+    assert.equal(state.isTopicModeUnavailable(), true);
+    assert.ok(calls.includes("classic-start"));
+    runtime.monitor.start("ctx");
+    await tick();
+    assert.equal(state.isBusPollingStarted(), false, "An unknown response is not fresh capability proof");
+    await tick();
+    assert.equal(state.isBusPollingStarted(), true);
+    assert.equal(state.isTopicModeUnavailable(), false);
+    assert.equal(calls.filter(call => call === "bus-start").length, 1);
+    assert.ok(calls.indexOf("classic-stop") < calls.indexOf("bus-start"));
+    assert.equal(calls.filter(call => call === "health-start").length, 1);
+    await tick();
+    assert.equal(calls.filter(call => call === "bus-start").length, 1, "Healthy bus is not restarted");
+  } finally {
+    runtime.monitor.stop();
+    await runtime.pollingPorts.stopPolling();
+  }
+});
+
+test("An enabled-mode follower probe does not acquire or start a leader bus", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let probes = 0;
+  const { runtime, state, calls } = createCapabilityLifecycleFixture({
+    initialBot: { threadMode: "enabled" }, ownsLock: () => false, isFollowerRegistered: () => true,
+    getMe: async () => { probes++; return true; },
+  });
+  try {
+    runtime.monitor.start("follower");
+    t.mock.timers.tick(2500);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(probes, 1);
+    assert.equal(state.isBusPollingStarted(), false);
+    assert.deepEqual(calls, []);
+  } finally {
+    runtime.monitor.stop();
+  }
+});
 
 test("Obsolete startup probes cannot overwrite a replacement after query or persistence awaits", async () => {
   for (const boundary of ["query", "persist"] as const) {
