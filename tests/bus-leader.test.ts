@@ -1132,6 +1132,71 @@ test("Explicit same-cwd follower provisioning leaves the active leader target un
   }
 });
 
+test("Explicit follower connect recovers unknown creation without changing another binding", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-connect-recovery-"));
+  const path = join(dir, "state.json"), store = createTelegramTopicTargetStore({ path });
+  const identity = createTelegramWorkspaceBindingIdentity("/other", 0, "other-session")!;
+  store.upsertWorkspaceBinding({ ...identity, target: { chatId: 7, threadId: 80 }, slot: "A", updatedAtMs: 1 });
+  await store.persist();
+  const before = store.listWorkspaceBindings();
+  let creates = 0, syncState = {};
+  const events: unknown[] = [];
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7, topicTargetStore: store, getCurrentLeaderEpoch: () => "epoch",
+    async callApi<TResponse>(method: string) {
+      if (method === "createForumTopic") {
+        if (++creates === 1) throw new TelegramApiCommitUnknownError(method, new Error("response lost"));
+        return { message_thread_id: 42 } as TResponse;
+      }
+      return true as TResponse;
+    },
+    getSyncState: () => syncState, setSyncState: value => { syncState = value; },
+    recordRuntimeEvent(_category, message) { events.push(message); },
+  });
+  const registration = { instanceId: "follower", profileKey: "manual:stable", cwd: "/repo", sessionId: "session", connectedAtMs: Date.now() };
+  try {
+    await assert.rejects(provision(registration), /may have committed/);
+    assert.equal(creates, 1);
+    assert.equal(store.listPendingProvisions().length, 1);
+    await assert.rejects(provision(registration), /unfinished Thread|remains ambiguous/);
+    assert.equal(creates, 1, "Ordinary retry never repeats unknown creation");
+    assert.equal(await provision(registration, { existingWorkspaceBindingOnly: true, recoverConnection: true }), undefined);
+    assert.equal(creates, 1, "Restore-only cannot reset even with a conflicting caller option");
+    const target = await provision(registration, { recoverConnection: true });
+    assert.equal(target?.threadId, 42);
+    assert.equal(creates, 2);
+    assert.deepEqual(store.listWorkspaceBindings().filter(b => b.cwd === identity.cwd), before);
+    assert.deepEqual(store.listPendingProvisions(), []);
+    assert.ok(events.some(value => String(value).includes("Explicit connect reset")));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Follower connect reuses a known pending Thread across runtime replacement without another create", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-follower-targeted-recovery-"));
+  const path = join(dir, "state.json"), store = createTelegramTopicTargetStore({ path });
+  const identity = createTelegramWorkspaceBindingIdentity("/repo", 0, "session")!;
+  store.upsertPendingProvision({ id: "known", owner: "manual-follower", instanceId: "old",
+    profileKey: "manual:stable", workspaceBindingKey: identity.bindingKey, status: "ambiguous",
+    target: { chatId: 7, threadId: 42 }, slot: "B", threadName: "Boreal", startedAtMs: 1 });
+  await store.persist();
+  let syncState = {};
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7, topicTargetStore: store, getCurrentLeaderEpoch: () => "epoch",
+    async callApi<TResponse>(method: string) {
+      assert.notEqual(method, "createForumTopic"); assert.notEqual(method, "deleteForumTopic");
+      return true as TResponse;
+    },
+    getSyncState: () => syncState, setSyncState: value => { syncState = value; }, recordRuntimeEvent() {},
+  });
+  try {
+    const target = await provision({ instanceId: "new", profileKey: "manual:stable", cwd: "/repo",
+      sessionId: "session", connectedAtMs: Date.now() }, { recoverConnection: true });
+    assert.equal(target?.threadId, 42); assert.equal(target?.slot, "B");
+    assert.equal(store.getWorkspaceBinding("/repo", "a", "session")?.target.threadId, 42);
+    assert.deepEqual(store.listPendingProvisions(), []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("Bus leader releases a failed follower Workspace claim", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-workspace-fail-"));
   const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
@@ -3288,6 +3353,20 @@ for (const mode of ["before", "during-provision", "supported", "leader-only-read
     assert.equal(provisions, mode === "before" || mode === "leader-only-reader" ? 0 : 1);
   });
 }
+
+test("Explicit connect recovery refuses missing negotiated capability before provisioning", async () => {
+  let provisions = 0;
+  const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "no-recovery",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION] });
+  const handler = createRawTelegramBusLeaderEnvelopeHandler({
+    followerRegistry: createTelegramBusFollowerRegistry(), protocolIdentity: protocol,
+    provisionFollowerTarget() { provisions++; return { chatId: 7, threadId: 42 }; },
+  });
+  const ack = await handler({ kind: "follower.register", requestId: "recovery", recoverConnection: true,
+    registration: { instanceId: "follower", registrationGeneration: "recovery", protocol, connectedAtMs: Date.now() } });
+  assert.equal(ack.kind === "bus.ack" && ack.ok, false);
+  assert.equal(provisions, 0);
+});
 
 test("Bus leader rejects incompatible protocol before follower provisioning", async () => {
   const registry = createTelegramBusFollowerRegistry();

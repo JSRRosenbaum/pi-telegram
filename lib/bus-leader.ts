@@ -23,6 +23,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT,
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY,
   hasTelegramBusSteerQueueHandoffCapability,
   TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
@@ -1529,7 +1530,7 @@ export function createTelegramBusFollowerTargetProvisioner(
   deps: TelegramBusFollowerTargetProvisionerDeps,
 ): (
   registration: TelegramBusInstanceRegistration,
-  options?: { existingWorkspaceBindingOnly?: boolean },
+  options?: { existingWorkspaceBindingOnly?: boolean; recoverConnection?: boolean },
 ) => Promise<
   (TelegramTarget & { slot?: string; threadName?: string }) | undefined
 > {
@@ -1548,6 +1549,16 @@ export function createTelegramBusFollowerTargetProvisioner(
     const chatId = deps.getAllowedUserId();
     if (typeof chatId !== "number") return registration.target;
     await deps.topicTargetStore.load();
+    if (options?.recoverConnection && !options.existingWorkspaceBindingOnly) {
+      const epoch = deps.getCurrentLeaderEpoch?.();
+      await Threads.resetTelegramConnectionProvisioning({
+        store: deps.topicTargetStore, owner: "manual-follower", instanceId: registration.instanceId,
+        profileKey: registration.profileKey ?? `manual:${registration.instanceId}`,
+        isCurrent: () => !deps.getCurrentLeaderEpoch ||
+          (epoch !== undefined && deps.getCurrentLeaderEpoch() === epoch),
+        recordEvent: deps.recordRuntimeEvent,
+      });
+    }
     let restoredPredecessor: Threads.TelegramTopicTargetRecord | undefined;
     if (options?.existingWorkspaceBindingOnly && registration.cwd && registration.sessionId &&
         !registration.previousInstanceId && deps.getLiveFollowers && deps.isFollowerProcessAlive) {
@@ -1580,6 +1591,7 @@ export function createTelegramBusFollowerTargetProvisioner(
           {
             existingBindingOnly: options?.existingWorkspaceBindingOnly === true,
             sessionId: registration.sessionId,
+            provisionProfileKey: registration.profileKey ?? `manual:${registration.instanceId}`,
             onCapacityUnavailable() {
               capacityUnavailable = true;
             },
@@ -2944,7 +2956,7 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
   ) => Promise<unknown> | unknown;
   provisionFollowerTarget?: (
     registration: TelegramBusInstanceRegistration,
-    options?: { existingWorkspaceBindingOnly?: boolean },
+    options?: { existingWorkspaceBindingOnly?: boolean; recoverConnection?: boolean },
   ) =>
     | Promise<
         (TelegramTarget & { slot?: string; threadName?: string }) | undefined
@@ -3453,6 +3465,9 @@ export function createTelegramBusLeaderEnvelopeHandler(
             ));
         const restoringWorkspace =
           envelope.kind === "follower.restoreWorkspace";
+        const recoverConnection = envelope.kind === "follower.register" && envelope.recoverConnection === true;
+        const supportsConnectionRecovery = [deps.protocolIdentity, envelope.registration.protocol]
+          .every(identity => hasTelegramBusCapability(identity, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY));
         const supportsWorkspaceAutoConnect =
           hasTelegramBusCapability(
             deps.protocolIdentity,
@@ -3468,7 +3483,8 @@ export function createTelegramBusLeaderEnvelopeHandler(
           !readerCompatible() ||
           (envelope.registration.cwd !== undefined &&
             envelope.registration.sessionId === undefined) ||
-          (restoringWorkspace && !supportsWorkspaceAutoConnect)
+          (restoringWorkspace && !supportsWorkspaceAutoConnect) ||
+          (recoverConnection && !supportsConnectionRecovery)
         ) {
           return {
             kind: "bus.ack" as const,
@@ -3526,7 +3542,7 @@ export function createTelegramBusLeaderEnvelopeHandler(
                 );
               const target = await deps.provisionFollowerTarget?.(
                 envelope.registration,
-                { existingWorkspaceBindingOnly: restoringWorkspace },
+                { existingWorkspaceBindingOnly: restoringWorkspace, ...(recoverConnection ? { recoverConnection: true } : {}) },
               );
               if (restoringWorkspace && !target) {
                 return {

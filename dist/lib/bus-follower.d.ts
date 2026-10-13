@@ -37,6 +37,7 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
         target?: TelegramTarget;
         previousInstanceId?: string;
         restoreWorkspace?: boolean;
+        recoverConnection?: boolean;
     }) => Promise<boolean>;
     setContext: (ctx: TContext) => void | Promise<void>;
     disconnectFromLeader?: () => Promise<boolean>;

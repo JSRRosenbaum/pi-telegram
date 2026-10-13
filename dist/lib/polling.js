@@ -752,10 +752,10 @@ export function createTelegramThreadAwarePollingPorts(deps) {
         }
         return deps.topicTargetStore.getBotState().threadMode === "enabled";
     };
-    const registerFollowerWithOwner = async (ctx, owner) => {
+    const registerFollowerWithOwner = async (ctx, owner, options) => {
         if (!(await refreshFollowerState()))
             return undefined;
-        return deps.registerFollowerWithLeader(ctx, owner);
+        return deps.registerFollowerWithLeader(ctx, owner, options);
     };
     const restoreFollowerWithOwner = async (ctx, owner) => {
         if (!(await refreshFollowerState())) {

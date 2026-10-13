@@ -26,7 +26,7 @@ import {
   recoverStaleTelegramTopicApiError,
   settleStaleTelegramTopicExecutionFailure,
 } from "../lib/sync.ts";
-import { TelegramApiStaleTargetError } from "../lib/telegram-api.ts";
+import { TelegramApiStaleTargetError, TelegramApiCommitUnknownError } from "../lib/telegram-api.ts";
 import {
   createTelegramWorkspaceAdmissionLedger,
   runWithTelegramWorkspaceAdmissionsAsync,
@@ -424,6 +424,30 @@ test("Telegram sync slice state records suspect and fresh transitions", () => {
     updatedAtMs: 2000,
     lastReconcileAction: "startup-probe",
   });
+});
+
+test("Explicit leader connect resets unknown creation while automatic startup remains protective", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-connect-recovery-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+  let creates = 0;
+  const deps = {
+    getAllowedUserId: () => 7, instanceId: "leader", cwd: "/repo", sessionId: "session",
+    getCurrentLeaderEpoch: () => "epoch", topicTargetStore: store, recordEvent() {},
+    async callApi<TResponse>(method: string) {
+      assert.equal(method, "createForumTopic", "Recovery does not delete or probe unknown targets");
+      if (++creates === 1) throw new TelegramApiCommitUnknownError(method, new Error("response lost"));
+      return { message_thread_id: 42 } as TResponse;
+    },
+  };
+  try {
+    await assert.rejects(ensureTelegramLeaderThreadBinding(deps), /may have committed/);
+    await assert.rejects(ensureTelegramLeaderThreadBinding(deps), /unfinished Thread|remains ambiguous/);
+    assert.equal(creates, 1);
+    const result = await ensureTelegramLeaderThreadBinding({ ...deps, forceFreshUnnamed: true });
+    assert.equal(result?.target.threadId, 42);
+    assert.equal(creates, 2);
+    assert.deepEqual(store.listPendingProvisions(), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("Leader thread sync creates a visible leader thread when no binding exists", async () => {

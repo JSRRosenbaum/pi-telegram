@@ -178,6 +178,7 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
       target?: TelegramTarget;
       previousInstanceId?: string;
       restoreWorkspace?: boolean;
+      recoverConnection?: boolean;
     },
   ) => Promise<boolean>;
   setContext: (ctx: TContext) => void | Promise<void>;
@@ -2930,7 +2931,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
         deps.setActiveAuthSecret?.(undefined);
         await deps.stopReceiving?.();
       };
-      const pendingHandoff = options
+      const pendingHandoff = options && !options.recoverConnection
         ? undefined
         : getTelegramFollowerSessionHandoff();
       const pendingHandoffOptions = isTelegramFollowerSessionHandoffFresh(
@@ -2946,8 +2947,9 @@ export function createTelegramBusFollowerRegistrationRuntime<
             target?: TelegramTarget;
             previousInstanceId?: string;
             restoreWorkspace?: boolean;
+            recoverConnection?: boolean;
           }
-        | undefined = options ?? pendingHandoffOptions;
+        | undefined = options ? { ...pendingHandoffOptions, ...options } : pendingHandoffOptions;
       const leaderSocketPath =
         leader.busSocketPath ??
         deps.getLeaderSocketPath?.() ??
@@ -2968,6 +2970,8 @@ export function createTelegramBusFollowerRegistrationRuntime<
           : "follower.register",
         requestId: registrationGeneration,
         auth: activeAuthSecret,
+        ...(registrationOptions?.recoverConnection && !registrationOptions.restoreWorkspace
+          ? { recoverConnection: true as const } : {}),
         registration: {
           instanceId: deps.instanceId,
           ...(registrationOptions?.previousInstanceId

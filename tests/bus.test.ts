@@ -361,6 +361,17 @@ test("Bus envelope auth compares the exact secret in constant time", () => {
   );
 });
 
+test("Explicit connection recovery is a register-only true wire flag", () => {
+  const registration = { instanceId: "follower", connectedAtMs: 1 };
+  const envelope = { kind: "follower.register", requestId: "connect", registration, recoverConnection: true };
+  const parsed = parseTelegramBusEnvelope(JSON.stringify(envelope));
+  assert.equal(parsed?.kind === "follower.register" && parsed.recoverConnection, true);
+  for (const recoverConnection of [false, "true", 1, null]) {
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, recoverConnection })), undefined);
+  }
+  assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, kind: "follower.restoreWorkspace" })), undefined);
+});
+
 test("Bus envelopes classify bootstrap, fenced traffic, and responses", () => {
   assert.equal(
     getTelegramBusEnvelopeTrafficClass({

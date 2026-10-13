@@ -187,6 +187,7 @@ export declare function createTelegramBusInstanceLifecycleAnnouncement(input: {
 }): TelegramBusFollowerLifecycleAnnouncement;
 export declare function createTelegramBusFollowerTargetProvisioner(deps: TelegramBusFollowerTargetProvisionerDeps): (registration: TelegramBusInstanceRegistration, options?: {
     existingWorkspaceBindingOnly?: boolean;
+    recoverConnection?: boolean;
 }) => Promise<(TelegramTarget & {
     slot?: string;
     threadName?: string;
@@ -248,6 +249,7 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
     }>) => Promise<unknown> | unknown;
     provisionFollowerTarget?: (registration: TelegramBusInstanceRegistration, options?: {
         existingWorkspaceBindingOnly?: boolean;
+        recoverConnection?: boolean;
     }) => Promise<(TelegramTarget & {
         slot?: string;
         threadName?: string;

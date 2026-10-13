@@ -4,9 +4,10 @@
 
 ## Unreleased
 
-## 0.56.1: Windows control fixture timing
+## 0.56.1: Recover interrupted connections
 
-- `Windows validation`: Selected-follower control fixtures now use fresh registration timestamps and the production Live Restore RPC deadline, rather than a stale synthetic owner and a one-second override. A delayed native apply regression crosses the prune tick while retaining exact command, receipt and donor-ACK assertions; failures include source/recipient phase evidence. Runtime authority and retry policy are unchanged.
+- `Connection recovery`: Explicit `/telegram-connect` can abandon matching unknown Thread-creation attempts and connect afresh without deleting tabs or clearing accepted work. Known pending targets keep their Workspace key and slot; unique creation IDs prevent late replies from attaching to a new attempt. Follower recovery requires `explicit-connect-recovery-v1` on both peers. A lost API reply may leave an extra tab; automatic startup and Restore-only registration never reset it.
+- `Windows validation`: Follower control fixtures use fresh registration timestamps and the production Live Restore deadline; a delayed apply case retains exact command and receipt assertions. Commentary/Next integration tests await observed progress under a shared test deadline and always stop their runtime before restoring fixtures, including on failure. Runtime authority and retry policy are unchanged.
 
 ## 0.56.0: Steer from Telegram
 

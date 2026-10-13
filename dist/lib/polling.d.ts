@@ -221,7 +221,9 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
         forceFreshLeaderThread?: boolean;
     }) => Promise<void>;
     stopPolling: () => Promise<void>;
-    registerFollowerWithOwner: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
+    registerFollowerWithOwner: (ctx: TContext, owner: TOwner, options?: {
+        recoverConnection?: boolean;
+    }) => Promise<boolean | undefined>;
     restoreFollowerWithOwner: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     stopFollowerRegistration: () => void;
 }
@@ -233,7 +235,9 @@ export interface TelegramThreadAwarePollingControls<TContext, TOwner> {
     stopBusLeaderPolling: () => Promise<void>;
     startLeaderHealth: () => void;
     stopLeaderHealth: () => void;
-    registerFollowerWithLeader: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
+    registerFollowerWithLeader: (ctx: TContext, owner: TOwner, options?: {
+        recoverConnection?: boolean;
+    }) => Promise<boolean | undefined>;
     restoreFollowerWithLeader?: (ctx: TContext, owner: TOwner) => Promise<boolean | undefined>;
     hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
     stopFollowerRegistration: () => void;

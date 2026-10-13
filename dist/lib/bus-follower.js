@@ -1792,7 +1792,7 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                 deps.setActiveAuthSecret?.(undefined);
                 await deps.stopReceiving?.();
             };
-            const pendingHandoff = options
+            const pendingHandoff = options && !options.recoverConnection
                 ? undefined
                 : getTelegramFollowerSessionHandoff();
             const pendingHandoffOptions = isTelegramFollowerSessionHandoffFresh(pendingHandoff)
@@ -1801,7 +1801,7 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                     previousInstanceId: pendingHandoff.instanceId,
                 }
                 : undefined;
-            const registrationOptions = options ?? pendingHandoffOptions;
+            const registrationOptions = options ? { ...pendingHandoffOptions, ...options } : pendingHandoffOptions;
             const leaderSocketPath = leader.busSocketPath ??
                 deps.getLeaderSocketPath?.() ??
                 getTelegramBusSocketPath();
@@ -1821,6 +1821,8 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                     : "follower.register",
                 requestId: registrationGeneration,
                 auth: activeAuthSecret,
+                ...(registrationOptions?.recoverConnection && !registrationOptions.restoreWorkspace
+                    ? { recoverConnection: true } : {}),
                 registration: {
                     instanceId: deps.instanceId,
                     ...(registrationOptions?.previousInstanceId

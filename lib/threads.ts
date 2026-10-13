@@ -783,6 +783,7 @@ export interface TelegramTopicTargetStore {
   ) => { slot?: string; threadName?: string } | undefined;
   listReservations: () => TelegramThreadReservation[];
   listPendingProvisions: () => TelegramThreadPendingProvision[];
+  resetPendingProvisionForConnect: (expected: TelegramThreadPendingProvision, isCurrent: () => boolean) => Promise<boolean>;
   listPendingCleanups: () => TelegramThreadCleanupIntent[];
   listSyncObservations: () => TelegramTopicSyncObservation[];
   reserveThread: (reservation: TelegramThreadReservation) => void;
@@ -902,6 +903,7 @@ export interface TelegramTopicTargetStore {
     options?: {
       existingBindingOnly?: boolean;
       sessionId?: string;
+      provisionProfileKey?: string;
       onCapacityUnavailable?: () => void;
     },
   ) => TelegramWorkspaceBindingIdentity | undefined;
@@ -4168,6 +4170,7 @@ export function createTelegramTopicTargetStore(
         }
     ),
     isCurrentPublication?: () => boolean,
+    resetProvisions?: readonly TelegramThreadPendingProvision[],
   ): Promise<boolean> => {
     const submittedPath = getPath(),
       submittedProfile = activeProfile();
@@ -4367,6 +4370,13 @@ export function createTelegramTopicTargetStore(
                   !!expectedRestore,
               ),
         );
+        if (resetProvisions) {
+          const recoveries = readProvisionRecoveries(path, true);
+          if (mutationRevision !== persistedRevision || resetProvisions.some(expected =>
+            expected.target || Object.hasOwn(recoveries, expected.id) ||
+            !isDeepStrictEqual(disk.pendingProvisions?.find(value => value.id === expected.id), expected)))
+            throw new Error("Telegram connection recovery provisioning evidence changed.");
+        }
         if (!isDeepStrictEqual(disk.workspaceRestore, expectedRestore))
           throw new Error(
             "Workspace Restore evidence changed before publication.",
@@ -4429,7 +4439,7 @@ export function createTelegramTopicTargetStore(
             }
           : {}),
         reservations: reservations.map((reservation) => ({ ...reservation })),
-        pendingProvisions: pendingProvisions.map((provision) => ({
+        pendingProvisions: pendingProvisions.filter(provision => !resetProvisions?.some(expected => expected.id === provision.id)).map((provision) => ({
           ...provision,
           ...(provision.target ? { target: { ...provision.target } } : {}),
         })),
@@ -4636,6 +4646,7 @@ export function createTelegramTopicTargetStore(
         loadedProfile = submittedProfile;
         loaded = true;
         observedWorkspaceSemantic = getTelegramStateSemanticSnapshot(wire);
+        if (resetProvisions) { pendingProvisions = file.pendingProvisions; mutationRevision += 1; }
         if (transition) {
           records = new Map(
             file.threads.map((record) => {
@@ -4808,6 +4819,10 @@ export function createTelegramTopicTargetStore(
       if (isCurrentPublication?.() === false) return false;
       loadedPath = path;
       loaded = true;
+      if (resetProvisions) {
+        if (mutationRevision !== persistedRevision) return false;
+        pendingProvisions = file.pendingProvisions;
+      }
       if (mutationRevision === persistedRevision) dirty = false;
       return true;
     });
@@ -6814,6 +6829,11 @@ export function createTelegramTopicTargetStore(
       current.status = "ambiguous";
       return true;
     },
+    resetPendingProvisionForConnect(expected, isCurrent) {
+      // Stage no in-memory deletion: refusal or a stale publication must keep its protective hold.
+      if (expected.target || !isCurrent()) return Promise.resolve(false);
+      return persistSnapshot(undefined, isCurrent, [structuredClone(expected)]);
+    },
     removePendingProvision(id) {
       const before = pendingProvisions.length;
       pendingProvisions = pendingProvisions.filter(
@@ -7608,8 +7628,14 @@ export function createTelegramTopicTargetStore(
         ) {
           return undefined;
         }
-        const retainedTarget = binding?.target ?? legacyRecord?.target;
-        const retainedSlot = binding?.slot ?? legacyRecord?.slot;
+        const ownedProvisions = pendingProvisions.filter(value =>
+          value.workspaceBindingKey === identity.bindingKey &&
+          (value.instanceId === instanceId || value.instanceId === effectivePreviousInstanceId ||
+            (options?.provisionProfileKey !== undefined && value.profileKey === options.provisionProfileKey)));
+        if (ownedProvisions.length > 1) return undefined;
+        const ownProvision = ownedProvisions[0];
+        const retainedTarget = ownProvision?.target ?? binding?.target ?? legacyRecord?.target;
+        const retainedSlot = ownProvision?.slot ?? binding?.slot ?? legacyRecord?.slot;
         const otherBindings = Array.from(workspaceBindings.values())
           .filter(
             (other) => other.bindingKey !== identity.bindingKey && other.slot,
@@ -7641,7 +7667,7 @@ export function createTelegramTopicTargetStore(
             )
             .map((reservation) => reservation.slot),
           ...pendingProvisions
-            .filter((provision) =>
+            .filter((provision) => provision !== ownProvision &&
               isPendingProvisionLiveOrTargeted(provision, nowMs),
             )
             .map((provision) => provision.slot),
@@ -9661,6 +9687,32 @@ export function createTelegramTopicTargetRenamer(
   };
 }
 
+/** Caller holds profile Workspace admission; only an explicit connect grants a fresh creation attempt. */
+export async function resetTelegramConnectionProvisioning(input: {
+  store: TelegramTopicTargetStore;
+  owner: TelegramThreadPendingProvision["owner"];
+  instanceId: string;
+  profileKey: string;
+  isCurrent: () => boolean;
+  recordEvent: (category: string, message: unknown, details?: Record<string, unknown>) => void;
+}): Promise<void> {
+  if (!input.isCurrent()) throw new Error("Telegram connection recovery authority changed.");
+  const removed: TelegramThreadPendingProvision[] = [];
+  for (const pending of input.store.listPendingProvisions()) {
+    if (pending.owner !== input.owner || pending.target ||
+        (pending.profileKey !== input.profileKey && pending.instanceId !== input.instanceId)) continue;
+    if (!input.isCurrent()) throw new Error("Telegram connection recovery authority changed.");
+    if (!await input.store.resetPendingProvisionForConnect(pending, input.isCurrent))
+      throw new Error("Telegram connection recovery lost publication authority.");
+    if (!input.isCurrent()) throw new Error("Telegram connection recovery authority changed.");
+    removed.push(pending);
+  }
+  if (removed.length === 0) return;
+  input.recordEvent("connection", "Explicit connect reset unfinished Thread creation; an unconfirmed Telegram Thread may remain.", {
+    phase: "connect-provision-reset", count: removed.length, owner: input.owner,
+  });
+}
+
 export function createTelegramTopicTargetProvisioner(
   deps: TelegramTopicTargetProvisionerDeps,
 ): (
@@ -9923,7 +9975,7 @@ export function createTelegramTopicTargetProvisioner(
         slot,
       );
     }
-    const pendingId = `provision:${request.instanceId}:${slot}:${nowMs}`;
+    const pendingId = `provision:${request.instanceId}:${slot}:${nowMs}:${randomUUID()}`;
     const pendingOwner =
       request.owner?.kind === "leader" ? "leader" : "manual-follower";
     assertLeaderEpoch("before-pending-intent");
