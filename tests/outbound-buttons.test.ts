@@ -102,6 +102,24 @@ test("Fenced top-level button sequences are vertical aliases for explicit matric
   }
 });
 
+test("Adjacent top-level matrices in one fenced block are vertical rows", () => {
+  const actions: unknown[] = [];
+  const plan = planTelegramButtonReply(
+    '```telegram_button\n[{First|one}]\n[{Second|two}]\n```',
+    {
+      registerAction: (action) => {
+        actions.push(action);
+        return `tgbtn:${actions.length}`;
+      },
+    },
+  );
+  assert.deepEqual(actions, [
+    { text: "First", prompt: "one" },
+    { text: "Second", prompt: "two" },
+  ]);
+  assert.equal((plan.markdown.match(/<tg-button-row>/g) ?? []).length, 2);
+});
+
 test("Fenced singleton JSON/CML cells are equivalent and labels cannot inject Rich markup", () => {
   for (const payload of ['{Run|do-it}', '{"label":"Run","prompt":"do-it"}']) {
     const plan = planTelegramButtonReply(`\`\`\`telegram_button\n${payload}\n\`\`\``, {

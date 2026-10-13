@@ -512,21 +512,29 @@ function parseTelegramAdaptiveActionPayloadRows(
     return undefined;
   };
 
-  const parseVerticalSequence = (): Record<string, unknown>[][] | undefined => {
+  const parseTopLevelRows = (): Record<string, unknown>[][] | undefined => {
     const rows: Record<string, unknown>[][] = [];
     while (offset < source.length) {
       skipWhitespace();
-      if (source[offset] !== "{") break;
-      const cell = parseCell();
-      if (!cell) return undefined;
-      rows.push([cell]);
+      const character = source[offset];
+      if (character === "{") {
+        const cell = parseCell();
+        if (!cell) return undefined;
+        rows.push([cell]);
+      } else if (character === "[") {
+        const matrix = parseMatrix();
+        if (!matrix) return undefined;
+        rows.push(...matrix);
+      } else {
+        break;
+      }
       if (!consumeOptionalSeparator()) return undefined;
     }
     return rows.length > 0 ? rows : undefined;
   };
 
   skipWhitespace();
-  const rows = source[offset] === "{" ? parseVerticalSequence() : parseMatrix();
+  const rows = parseTopLevelRows();
   if (!rows) return undefined;
   skipWhitespace();
   if (!options.allowTrailing && offset !== source.length) return undefined;

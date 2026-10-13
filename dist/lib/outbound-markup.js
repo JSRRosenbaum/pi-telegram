@@ -463,23 +463,33 @@ function parseTelegramAdaptiveActionPayloadRows(source, parseCompactPayload, opt
         }
         return undefined;
     };
-    const parseVerticalSequence = () => {
+    const parseTopLevelRows = () => {
         const rows = [];
         while (offset < source.length) {
             skipWhitespace();
-            if (source[offset] !== "{")
+            const character = source[offset];
+            if (character === "{") {
+                const cell = parseCell();
+                if (!cell)
+                    return undefined;
+                rows.push([cell]);
+            }
+            else if (character === "[") {
+                const matrix = parseMatrix();
+                if (!matrix)
+                    return undefined;
+                rows.push(...matrix);
+            }
+            else {
                 break;
-            const cell = parseCell();
-            if (!cell)
-                return undefined;
-            rows.push([cell]);
+            }
             if (!consumeOptionalSeparator())
                 return undefined;
         }
         return rows.length > 0 ? rows : undefined;
     };
     skipWhitespace();
-    const rows = source[offset] === "{" ? parseVerticalSequence() : parseMatrix();
+    const rows = parseTopLevelRows();
     if (!rows)
         return undefined;
     skipWhitespace();

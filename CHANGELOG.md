@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Button grammar`: A fenced `telegram_button` block whose rows are separate adjacent top-level matrices (one `[...]` row per line) now parses as vertical rows instead of being silently stripped with no controls and no error. `parseVerticalSequence` is replaced by `parseTopLevelRows`, which loops over adjacent top-level groups for both singleton and matrix payloads; single-matrix, JSON, compact-CML and nested-row grouping are unchanged.
+
 ## 0.56.1: Recover interrupted connections
 
 - `Connection recovery`: Explicit `/telegram-connect` can abandon matching unknown Thread-creation attempts and connect afresh without deleting tabs or clearing accepted work. Known pending targets keep their Workspace key and slot; unique creation IDs prevent late replies from attaching to a new attempt. Follower recovery requires `explicit-connect-recovery-v1` on both peers. A lost API reply may leave an extra tab; automatic startup and Restore-only registration never reset it.
