@@ -71,7 +71,7 @@ function buildTelegramQueueMenuReplyMarkup(items, emptyRefreshIndex = 0) {
         return { inline_keyboard: [backRow, refreshRow] };
     const rows = items.map((item) => {
         const badge = getTelegramQueueMenuLaneBadge(item);
-        const prefix = item.reactionSuppressionEmoji ? `${item.reactionSuppressionEmoji} ` :
+        const prefix = item.reactionSuppressionEmoji ? "👎 " :
             badge ? `${badge} ` : item.hasAttachments ? "📎 " : "";
         const position = item.reactionSuppressionEmoji
             ? formatSkippedTelegramQueuePosition(item.queuePosition)
@@ -130,11 +130,10 @@ function getTelegramQueueMenuLaneBadge(item) {
         return "🔥";
     if (item.queueLane !== "priority")
         return "";
-    const emoji = item.priorityEmoji?.replace(/\uFE0F/g, "");
-    return emoji === "❤" || emoji === "🕊" ? emoji : "👍";
+    return "👍";
 }
 function getTelegramQueueMenuItemText(item) {
-    const marker = item.reactionSuppressionEmoji ?? getTelegramQueueMenuLaneBadge(item);
+    const marker = item.reactionSuppressionEmoji ? "👎" : getTelegramQueueMenuLaneBadge(item);
     const badge = marker ? ` ${marker}` : "";
     const position = item.reactionSuppressionEmoji
         ? `<s>${item.queuePosition}</s>.`
@@ -441,11 +440,10 @@ function applyQueuedTelegramPromptMenuFlags(chatId, replyToMessageId, ctx, deps,
     const disposition = { kind: "reaction-transition" };
     if (flags.lane !== undefined) {
         disposition.promptLane = flags.lane;
-        disposition.priorityEmoji = flags.lane === "steer" ? "🔥" : flags.lane === "priority" ?
-            getTelegramQueueMenuLaneBadge({ queueLane: "priority", priorityEmoji: item.queueLane === "priority" ? item.priorityEmoji : undefined }) : null;
+        disposition.priorityEmoji = flags.lane === "steer" ? "🔥" : flags.lane === "priority" ? "👍" : null;
     }
     if (flags.skipped !== undefined)
-        disposition.suppressionEmoji = flags.skipped ? (item.reactionSuppressionEmoji ?? "👎") : null;
+        disposition.suppressionEmoji = flags.skipped ? "👎" : null;
     return deps.queueMutationRuntime.applyReactionByMessageId(replyToMessageId, disposition, ctx) ||
         ((flags.lane === undefined || flags.lane === item.queueLane) &&
             (flags.skipped === undefined || flags.skipped === (item.reactionSuppressionEmoji !== undefined)));

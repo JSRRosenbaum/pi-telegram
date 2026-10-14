@@ -108,16 +108,10 @@ export type TelegramReactionType =
 
 export const TELEGRAM_PRIORITY_REACTIONS = [
   { id: 10, name: "like", emoji: "👍" },
-  { id: 12, name: "heart", emoji: "❤" },
-  { id: 13, name: "dove", emoji: "🕊" },
 ] as const;
 export const TELEGRAM_STEER_REACTIONS = [{ id: 14, name: "fire", emoji: "🔥" }] as const;
 export const TELEGRAM_REMOVAL_REACTIONS = [
   { id: 20, name: "dislike", emoji: "👎" },
-  { id: 21, name: "ghost", emoji: "👻" },
-  { id: 22, name: "broken-heart", emoji: "💔" },
-  { id: 23, name: "poop", emoji: "💩" },
-  { id: 24, name: "wastebasket", emoji: "🗑" },
 ] as const;
 export const TELEGRAM_PRIORITY_REACTION_EMOJIS =
   TELEGRAM_PRIORITY_REACTIONS.map((reaction) => reaction.emoji);
@@ -159,7 +153,7 @@ function getTelegramQueueReactionTransition(
 ): TelegramQueueReactionDisposition | undefined {
   const oldEmojis = collectTelegramReactionEmojis(oldReactions);
   const newEmojis = collectTelegramReactionEmojis(newReactions);
-  // Fire is effective Steer intent; weaker positive aliases under it do not reorder the lane.
+  // Fire selects Steer; thumbs-up beneath it does not reorder the lane. Other emoji carry no queue intent.
   const steerEmoji = TELEGRAM_STEER_REACTIONS[0].emoji;
   const oldPriorityEmoji = oldEmojis.has(steerEmoji) ? steerEmoji : getTelegramReactionEmoji(oldEmojis, TELEGRAM_PRIORITY_REACTION_EMOJIS);
   const newPriorityEmoji = newEmojis.has(steerEmoji) ? steerEmoji : getTelegramReactionEmoji(newEmojis, TELEGRAM_PRIORITY_REACTION_EMOJIS);
@@ -547,6 +541,7 @@ interface TelegramUpdateAdmissionBinding {
   inspectSource?: () => TelegramDeferredSourceEvidence | undefined;
   inspectSourceSnapshot?: () => TelegramDeferredSourceSnapshot | undefined;
   inspectCompletion?: () => TelegramDeferredSourceEvidence | undefined;
+  subscribeCompletion?: (notify: () => void) => () => void;
   isSourceUnsettled?: () => boolean;
   prepareLiveInput?: (
     sourceUpdateIds: readonly number[],
@@ -615,6 +610,7 @@ export function bindTelegramUpdateAdmissionSource<
     | "inspectSource"
     | "inspectSourceSnapshot"
     | "inspectCompletion"
+    | "subscribeCompletion"
     | "isSourceUnsettled"
     | "acknowledgeTransferred"
     | "prepareLiveInput"
@@ -741,6 +737,15 @@ export function inspectTelegramDeferredSourceCompletion(
   const source =
     getTelegramUpdateAdmissionBinding(value)?.inspectCompletion?.();
   return execution.isCurrent() && source ? { ...source } : undefined;
+}
+
+/** Warm ACK notification only; subscribers must independently recheck exact completion and recipient authority. */
+export function subscribeTelegramDeferredSourceCompletion(value: unknown, notify: () => void): (() => void) | undefined {
+  const execution = getTelegramUpdateExecutionFence(value);
+  if (execution?.isCurrent() !== true) return undefined;
+  return getTelegramUpdateAdmissionBinding(value)?.subscribeCompletion?.(() => {
+    if (execution.isCurrent()) notify();
+  });
 }
 
 /** Reuse only live bound deferred originals; raw IDs or cold/adopted input cannot mint this carrier. */
@@ -8721,6 +8726,7 @@ function createTelegramUpdateSourceAdmissionHandle<
     let outcome: TelegramUpdateAdmissionOutcome | undefined;
     let completionAttempted = false;
     let completedSource: TelegramDeferredSourceCompletion | undefined;
+    const completionObservers = new Set<() => void>();
     const boundUpdate = bindTelegramUpdateExecutionFence(
       bindTelegramUpdateAdmissionSource(
         update,
@@ -8777,11 +8783,12 @@ function createTelegramUpdateSourceAdmissionHandle<
                 execution.isCurrent() &&
                 completion.isCurrent() &&
                 isDeepStrictEqual(completion.source, expectedSource)
-              )
-                completedSource = {
-                  ...completion,
-                  source: { ...expectedSource },
-                };
+              ) {
+                completedSource = { ...completion, source: { ...expectedSource } };
+                for (const notify of completionObservers) {
+                  try { notify(); } catch { /* Observation cannot invalidate an exact removal ACK. */ }
+                }
+              }
             })
             .catch((error) => {
               try {
@@ -8842,6 +8849,10 @@ function createTelegramUpdateSourceAdmissionHandle<
                   signal,
                 })
               : undefined,
+          subscribeCompletion: (notify) => {
+            completionObservers.add(notify);
+            return () => { completionObservers.delete(notify); };
+          },
           inspectCompletion: () =>
             execution.isCurrent() && completedSource?.isCurrent()
               ? { ...completedSource.source }

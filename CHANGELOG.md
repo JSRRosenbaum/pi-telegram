@@ -6,9 +6,15 @@
 
 - `Button grammar`: A fenced `telegram_button` block whose rows are separate adjacent top-level matrices (one `[...]` row per line) now parses as vertical rows instead of being silently stripped with no controls and no error. `parseVerticalSequence` is replaced by `parseTopLevelRows`, which loops over adjacent top-level groups for both singleton and matrix payloads; single-matrix, JSON, compact-CML and nested-row grouping are unchanged.
 
+## 0.56.2: Canonical Queue Reactions
+
+- `Queue reactions`: Only thumbs-up selects Priority, thumbs-down selects Skip, and fire selects Steer. Heart, dove, ghost, broken-heart, poop and wastebasket aliases are no longer controls. Unsupported reactions neither flush waiting input nor change queue intent; removing a supported reaction does not fall back to a retired alias. Only thumbs-down cancels a waiting standalone Continue.
+- `Queue display`: Priority and Skip badges use thumbs-up and thumbs-down even for retained older metadata. Existing lane, disposition, source and receipt authority remain unchanged; Control keeps its lightning label, not a reaction shortcut.
+
 ## 0.56.1: Recover interrupted connections
 
 - `Connection recovery`: Explicit `/telegram-connect` can abandon matching unknown Thread-creation attempts and connect afresh without deleting tabs or clearing accepted work. Known pending targets keep their Workspace key and slot; unique creation IDs prevent late replies from attaching to a new attempt. Follower recovery requires `explicit-connect-recovery-v1` on both peers. A lost API reply may leave an extra tab; automatic startup and Restore-only registration never reset it.
+- `Restore`: Reconnecting followers verify retained tabs with a connected message rather than typing, replacing a proven deleted tab. Negotiated `held-menu-aliases-v1` lets `/start` and `/help` restore a follower and open its restricted menu without pairing or bootstrap. A leader Restore waits briefly for the exact command-removal ACK on the original click, independently of menu delivery; lost ACKs never replay input, and old-tab cleanup remains separately fenced.
 - `Windows validation`: Follower control fixtures use fresh registration timestamps and the production Live Restore deadline; a delayed apply case retains exact command and receipt assertions. Commentary/Next integration tests await observed progress under a shared test deadline and always stop their runtime before restoring fixtures, including on failure. Runtime authority and retry policy are unchanged.
 
 ## 0.56.0: Steer from Telegram
