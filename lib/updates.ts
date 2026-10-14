@@ -108,16 +108,10 @@ export type TelegramReactionType =
 
 export const TELEGRAM_PRIORITY_REACTIONS = [
   { id: 10, name: "like", emoji: "👍" },
-  { id: 12, name: "heart", emoji: "❤" },
-  { id: 13, name: "dove", emoji: "🕊" },
 ] as const;
 export const TELEGRAM_STEER_REACTIONS = [{ id: 14, name: "fire", emoji: "🔥" }] as const;
 export const TELEGRAM_REMOVAL_REACTIONS = [
   { id: 20, name: "dislike", emoji: "👎" },
-  { id: 21, name: "ghost", emoji: "👻" },
-  { id: 22, name: "broken-heart", emoji: "💔" },
-  { id: 23, name: "poop", emoji: "💩" },
-  { id: 24, name: "wastebasket", emoji: "🗑" },
 ] as const;
 export const TELEGRAM_PRIORITY_REACTION_EMOJIS =
   TELEGRAM_PRIORITY_REACTIONS.map((reaction) => reaction.emoji);
@@ -159,7 +153,7 @@ function getTelegramQueueReactionTransition(
 ): TelegramQueueReactionDisposition | undefined {
   const oldEmojis = collectTelegramReactionEmojis(oldReactions);
   const newEmojis = collectTelegramReactionEmojis(newReactions);
-  // Fire is effective Steer intent; weaker positive aliases under it do not reorder the lane.
+  // Fire selects Steer; thumbs-up beneath it does not reorder the lane. Other emoji carry no queue intent.
   const steerEmoji = TELEGRAM_STEER_REACTIONS[0].emoji;
   const oldPriorityEmoji = oldEmojis.has(steerEmoji) ? steerEmoji : getTelegramReactionEmoji(oldEmojis, TELEGRAM_PRIORITY_REACTION_EMOJIS);
   const newPriorityEmoji = newEmojis.has(steerEmoji) ? steerEmoji : getTelegramReactionEmoji(newEmojis, TELEGRAM_PRIORITY_REACTION_EMOJIS);

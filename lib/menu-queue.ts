@@ -115,7 +115,7 @@ function buildTelegramQueueMenuReplyMarkup(
   if (items.length === 0) return { inline_keyboard: [backRow, refreshRow] };
   const rows = items.map((item) => {
     const badge = getTelegramQueueMenuLaneBadge(item);
-    const prefix = item.reactionSuppressionEmoji ? `${item.reactionSuppressionEmoji} ` :
+    const prefix = item.reactionSuppressionEmoji ? "👎 " :
       badge ? `${badge} ` : item.hasAttachments ? "📎 " : "";
     const position = item.reactionSuppressionEmoji
       ? formatSkippedTelegramQueuePosition(item.queuePosition)
@@ -179,16 +179,15 @@ function escapeTelegramQueueMenuHtmlPreview(text: string): string {
   return truncated ? escaped + suffix : escaped;
 }
 
-function getTelegramQueueMenuLaneBadge(item: Pick<TelegramQueueMenuItem, "queueLane" | "priorityEmoji">): string {
+function getTelegramQueueMenuLaneBadge(item: Pick<TelegramQueueMenuItem, "queueLane">): string {
   if (item.queueLane === "control") return "⚡";
   if (item.queueLane === "steer") return "🔥";
   if (item.queueLane !== "priority") return "";
-  const emoji = item.priorityEmoji?.replace(/\uFE0F/g, "");
-  return emoji === "❤" || emoji === "🕊" ? emoji : "👍";
+  return "👍";
 }
 
 function getTelegramQueueMenuItemText(item: TelegramQueueMenuItem): string {
-  const marker = item.reactionSuppressionEmoji ?? getTelegramQueueMenuLaneBadge(item);
+  const marker = item.reactionSuppressionEmoji ? "👎" : getTelegramQueueMenuLaneBadge(item);
   const badge = marker ? ` ${marker}` : "";
   const position = item.reactionSuppressionEmoji
     ? `<s>${item.queuePosition}</s>.`
@@ -920,10 +919,9 @@ function applyQueuedTelegramPromptMenuFlags<Context>(
   const disposition: Extract<Queue.TelegramQueueReactionDisposition, { kind: "reaction-transition" }> = { kind: "reaction-transition" };
   if (flags.lane !== undefined) {
     disposition.promptLane = flags.lane;
-    disposition.priorityEmoji = flags.lane === "steer" ? "🔥" : flags.lane === "priority" ?
-      getTelegramQueueMenuLaneBadge({ queueLane: "priority", priorityEmoji: item.queueLane === "priority" ? item.priorityEmoji : undefined }) : null;
+    disposition.priorityEmoji = flags.lane === "steer" ? "🔥" : flags.lane === "priority" ? "👍" : null;
   }
-  if (flags.skipped !== undefined) disposition.suppressionEmoji = flags.skipped ? (item.reactionSuppressionEmoji ?? "👎") : null;
+  if (flags.skipped !== undefined) disposition.suppressionEmoji = flags.skipped ? "👎" : null;
   return deps.queueMutationRuntime.applyReactionByMessageId(replyToMessageId, disposition, ctx) ||
     ((flags.lane === undefined || flags.lane === item.queueLane) &&
       (flags.skipped === undefined || flags.skipped === (item.reactionSuppressionEmoji !== undefined)));

@@ -1861,7 +1861,7 @@ test("Queue menu keeps main-menu navigation on top", async () => {
   );
   const [suppressedItem] = queuedItems;
   if (suppressedItem?.kind === "prompt") {
-    suppressedItem.reactionSuppressionEmoji = "👎";
+    suppressedItem.reactionSuppressionEmoji = "💩"; // Retained state projects canonical Skip, not a supported reaction alias.
   }
   await runtime.openQueueMenu(1, 2, "ctx");
   queuedItems.length = 0;
@@ -1873,7 +1873,7 @@ test("Queue menu keeps main-menu navigation on top", async () => {
   ]);
   assert.equal(
     markups[0]?.inline_keyboard[2]?.[0]?.text,
-    "1. 🕊 queued <prompt>",
+    "1. 👍 queued <prompt>",
   );
   assert.deepEqual(markups[2]?.inline_keyboard[1], [
     { text: "⚫️ Normal", callback_data: "queue:lane-set:1:10:normal" },
@@ -1904,7 +1904,7 @@ test("Queue menu keeps main-menu navigation on top", async () => {
   assert.equal(texts[0], "<b>⏳ Queue:</b>");
   assert.equal(
     texts[2],
-    "<b>1.</b> 🕊\n<pre>[telegram] queued &lt;prompt&gt;\n\nfull body</pre>",
+    "<b>1.</b> 👍\n<pre>[telegram] queued &lt;prompt&gt;\n\nfull body</pre>",
   );
   assert.equal(
     texts[3],
