@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-- `Button grammar`: A fenced `telegram_button` block whose rows are separate adjacent top-level matrices (one `[...]` row per line) now parses as vertical rows instead of being silently stripped with no controls and no error. `parseVerticalSequence` is replaced by `parseTopLevelRows`, which loops over adjacent top-level groups for both singleton and matrix payloads; single-matrix, JSON, compact-CML and nested-row grouping are unchanged.
+- `Button grammar`: Adjacent complete JSON/CML cells and matrices now compose one button surface in source order instead of dropping fenced controls or truncating footer controls. Each matrix contributes its existing rows; horizontal grouping, disabled controls and callback semantics remain unchanged. Invalid fenced groups register no callbacks. This extends button syntax only; rendering mode and voice syntax are unchanged.
 
 ## 0.56.2: Canonical Queue Reactions
 

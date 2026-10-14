@@ -364,7 +364,7 @@ function parseTelegramVoiceCompactActionPayload(
 function parseTelegramAdaptiveActionPayloadRows(
   source: string,
   parseCompactPayload: TelegramCompactActionPayloadParser,
-  options: { allowTrailing?: boolean; maxCompactAtoms?: number } = {},
+  options: { allowTrailing?: boolean; maxCompactAtoms?: number; allowMatrixGroups?: boolean } = {},
 ): { rows: Record<string, unknown>[][]; end: number } | undefined {
   let offset = 0;
   const isStructuralWhitespace = (character: string | undefined): boolean =>
@@ -521,7 +521,7 @@ function parseTelegramAdaptiveActionPayloadRows(
         const cell = parseCell();
         if (!cell) return undefined;
         rows.push([cell]);
-      } else if (character === "[") {
+      } else if (character === "[" && options.allowMatrixGroups) {
         const matrix = parseMatrix();
         if (!matrix) return undefined;
         rows.push(...matrix);
@@ -589,7 +589,7 @@ export function parseTelegramButtonPayloadRows(
   return parseTelegramAdaptiveActionPayloadRows(
     source.trim(),
     parseTelegramButtonCompactActionPayload,
-    { maxCompactAtoms: 4 },
+    { maxCompactAtoms: 4, allowMatrixGroups: true },
   )?.rows;
 }
 
@@ -604,7 +604,7 @@ export function parseTelegramActionPayloadRows(
       parseTelegramAdaptiveActionPayloadRows(
         content.slice(offset),
         parseTelegramButtonCompactActionPayload,
-        { allowTrailing: true, maxCompactAtoms: 4 },
+        { allowTrailing: true, maxCompactAtoms: 4, allowMatrixGroups: true },
       )?.rows,
   );
   if (!scanned) return undefined;

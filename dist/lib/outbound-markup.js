@@ -474,7 +474,7 @@ function parseTelegramAdaptiveActionPayloadRows(source, parseCompactPayload, opt
                     return undefined;
                 rows.push([cell]);
             }
-            else if (character === "[") {
+            else if (character === "[" && options.allowMatrixGroups) {
                 const matrix = parseMatrix();
                 if (!matrix)
                     return undefined;
@@ -537,10 +537,10 @@ function isPlausibleTelegramMatrixStart(source, start) {
     return (source[offset] === "{" || source[offset] === "[" || source[offset] === "]");
 }
 export function parseTelegramButtonPayloadRows(source) {
-    return parseTelegramAdaptiveActionPayloadRows(source.trim(), parseTelegramButtonCompactActionPayload, { maxCompactAtoms: 4 })?.rows;
+    return parseTelegramAdaptiveActionPayloadRows(source.trim(), parseTelegramButtonCompactActionPayload, { maxCompactAtoms: 4, allowMatrixGroups: true })?.rows;
 }
 export function parseTelegramActionPayloadRows(comment, command) {
-    const scanned = scanTelegramActionComment(comment, command, (content, offset) => parseTelegramAdaptiveActionPayloadRows(content.slice(offset), parseTelegramButtonCompactActionPayload, { allowTrailing: true, maxCompactAtoms: 4 })?.rows);
+    const scanned = scanTelegramActionComment(comment, command, (content, offset) => parseTelegramAdaptiveActionPayloadRows(content.slice(offset), parseTelegramButtonCompactActionPayload, { allowTrailing: true, maxCompactAtoms: 4, allowMatrixGroups: true })?.rows);
     if (!scanned)
         return undefined;
     if ("payload" in scanned)
