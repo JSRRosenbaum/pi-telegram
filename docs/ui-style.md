@@ -56,7 +56,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 | `☑️` | Activate / choose this item | Model detail activation action, generated button-only choice heading | Positive selection cue; use `🟢 Active` for already-current state. |
 | `⛔️` | Cancel source routing | `⛔️ Cancel routing` chooser action and the `Routing cancelled` toast | Not an abort of active Pi work. Private retention remains mandatory; disposable-tab removal stays bound to exact eligible target authority and follows only once every input in the tab is resolved. |
 | `❌` | No / cancel / terminal failure | Confirmation cancel buttons and terminal failure notices | Do not use for a recoverable operation failure that leaves session state intact. |
-| `🗑` | Delete / defer removal | Destructive confirmations and removal reaction | In the queue menu, reversible Keep/Skip selectors replace immediate deletion. |
+| `🗑` | Delete | Destructive confirmations | Not a queue reaction shortcut; queue menus use reversible Keep/Skip selectors. |
 
 ### Informational Feedback
 
@@ -96,14 +96,10 @@ The menu may clear internal Skip but cannot remove a reaction created by the use
 | --- | --- | --- | --- |
 | `👍` | Promote to priority | Queue reaction shortcut | Normalized from variants like `👍️`. |
 | `⚡` | Producer-owned Control marker | Control queue rows | Not a positive-reaction alias or command classifier; old stored Priority badges project `👍` without changing lane authority. |
-| `❤` / `❤️` | Promote to priority | Queue reaction shortcut | Normalize display consistently where code normalizes reactions. |
-| `🕊` / `🕊️` | Promote to priority | Queue reaction shortcut | Soft/peaceful promotion gesture. |
-| `🔥` | Select Steer | Queue reaction shortcut and Steer badge | Dominates `👍`, heart and dove; not immediate issuance or model-use proof. |
+| `🔥` | Select Steer | Queue reaction shortcut and Steer badge | Dominates `👍`; not immediate issuance or model-use proof. |
 | `👎` | Defer removal of waiting turn | Queue reaction shortcut and queue emoji marker | Reversible until the marked turn reaches dispatch; not negative feedback to the agent. |
-| `👻` | Defer removal of waiting turn | Queue reaction shortcut and queue emoji marker | Disappear/remove metaphor. |
-| `💔` | Defer removal of waiting turn | Queue reaction shortcut and queue emoji marker | Reversible cancel metaphor. |
-| `💩` | Defer removal of waiting turn | Queue reaction shortcut and queue emoji marker | Reversible reject metaphor. |
-| `🗑` | Defer removal | Queue reaction shortcut and queue emoji marker | Like Skip, the reaction remains reversible until dispatch reaches the marked turn. |
+
+Only `👍`, `👎`, and `🔥` are queue reaction shortcuts. Every other reaction is decorative, including the retired aliases. Retained queue state uses canonical badges without changing lane, disposition or receipt authority.
 
 ### Decorative Or Local-Example Emoji
 

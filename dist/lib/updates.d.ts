@@ -22,14 +22,6 @@ export declare const TELEGRAM_PRIORITY_REACTIONS: readonly [{
     readonly id: 10;
     readonly name: "like";
     readonly emoji: "👍";
-}, {
-    readonly id: 12;
-    readonly name: "heart";
-    readonly emoji: "❤";
-}, {
-    readonly id: 13;
-    readonly name: "dove";
-    readonly emoji: "🕊";
 }];
 export declare const TELEGRAM_STEER_REACTIONS: readonly [{
     readonly id: 14;
@@ -40,25 +32,9 @@ export declare const TELEGRAM_REMOVAL_REACTIONS: readonly [{
     readonly id: 20;
     readonly name: "dislike";
     readonly emoji: "👎";
-}, {
-    readonly id: 21;
-    readonly name: "ghost";
-    readonly emoji: "👻";
-}, {
-    readonly id: 22;
-    readonly name: "broken-heart";
-    readonly emoji: "💔";
-}, {
-    readonly id: 23;
-    readonly name: "poop";
-    readonly emoji: "💩";
-}, {
-    readonly id: 24;
-    readonly name: "wastebasket";
-    readonly emoji: "🗑";
 }];
-export declare const TELEGRAM_PRIORITY_REACTION_EMOJIS: ("👍" | "❤" | "🕊")[];
-export declare const TELEGRAM_REMOVAL_REACTION_EMOJIS: ("👎" | "👻" | "💔" | "💩" | "🗑")[];
+export declare const TELEGRAM_PRIORITY_REACTION_EMOJIS: "👍"[];
+export declare const TELEGRAM_REMOVAL_REACTION_EMOJIS: "👎"[];
 export interface TelegramUpdateDeletion {
     deleted_business_messages?: {
         message_ids?: unknown;

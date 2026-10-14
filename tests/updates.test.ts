@@ -372,27 +372,15 @@ test("Update helpers normalize emoji reactions and collect emoji-only entries", 
     ]),
     [
       [10, "like", "👍"],
-      [12, "heart", "❤"],
-      [13, "dove", "🕊"],
     ],
   );
   assert.deepEqual(
     TELEGRAM_REMOVAL_REACTIONS.map((reaction) => reaction.id),
-    [20, 21, 22, 23, 24],
+    [20],
   );
-  assert.deepEqual(TELEGRAM_PRIORITY_REACTION_EMOJIS, [
-    "👍",
-    "❤",
-    "🕊",
-  ]);
+  assert.deepEqual(TELEGRAM_PRIORITY_REACTION_EMOJIS, ["👍"]);
   assert.deepEqual(TELEGRAM_STEER_REACTIONS, [{ id: 14, name: "fire", emoji: "🔥" }]);
-  assert.deepEqual(TELEGRAM_REMOVAL_REACTION_EMOJIS, [
-    "👎",
-    "👻",
-    "💔",
-    "💩",
-    "🗑",
-  ]);
+  assert.deepEqual(TELEGRAM_REMOVAL_REACTION_EMOJIS, ["👎"]);
 });
 
 test("Update helpers extract topic lifecycle service messages", () => {
@@ -1180,6 +1168,37 @@ test("Steer reactions use effective intent, fire dominance, and independent supp
   await react([], ["🔥"]); assert.equal(store.getQueuedItems()[0], plain, "Late fire never reissues protected work");
 });
 
+test("Unsupported reactions neither control the queue nor retain removed supported intent", async () => {
+  for (const ignored of ["❤", "❤️", "🕊", "🕊️", "👻", "💔", "💩", "🗑", "🗑️", "⚡", "⚡️", "🎉"]) {
+    const transitions: Queue.TelegramQueueReactionDisposition[] = [];
+    let flushes = 0;
+    const react = (old: string[], next: string[]) => handleAuthorizedTelegramReactionUpdate({
+      chat: { id: 7, type: "private" }, user: { id: 7, is_bot: false }, message_id: 10,
+      old_reaction: old.map(emoji => ({ type: "emoji", emoji })), new_reaction: next.map(emoji => ({ type: "emoji", emoji })),
+    }, { allowedUserId: 7, ctx: TEST_CONTEXT,
+      flushPendingMediaGroupMessage: async () => { flushes++; return true; },
+      applyQueuedTelegramTurnReactionByMessageId: (_id, disposition) => { transitions.push(disposition); return true; },
+    });
+    await react([], [ignored]); await react([ignored], []);
+    for (const supported of ["👍", "👎", "🔥"]) {
+      await react([supported], [supported, ignored]);
+      await react([supported, ignored], [supported]);
+    }
+    assert.deepEqual(transitions, [], `${ignored} is decorative, including beside supported intent`);
+    assert.equal(flushes, 0, "An unsupported reaction must not flush a prompt or cancel a waiting continuation");
+    await react(["👍", ignored], [ignored]);
+    await react(["🔥", ignored], [ignored]);
+    await react(["👎", ignored], [ignored]);
+    await react([ignored], ["🔥", ignored]);
+    assert.deepEqual(transitions, [
+      { kind: "reaction-transition", priorityEmoji: null },
+      { kind: "reaction-transition", priorityEmoji: null },
+      { kind: "reaction-transition", suppressionEmoji: null },
+      { kind: "reaction-transition", priorityEmoji: "🔥", promptLane: "steer" },
+    ], `${ignored} cannot substitute for a removed supported reaction`);
+  }
+});
+
 test("Update runtime preserves both flags from complete reaction sets with removal precedence", async () => {
   const events: string[] = [];
   const deps = {
@@ -1363,14 +1382,8 @@ test("Update runtime preserves both flags from complete reaction sets with remov
     "apply:10:reaction-transition:p:👍;s:=",
     "apply:11:reaction-transition:p:-;s:=",
     "apply:12:reaction-transition:p:=;s:👎",
-    "apply:14:reaction-transition:p:❤;s:=",
-    "apply:15:reaction-transition:p:🕊;s:=",
     "apply:16:reaction-transition:p:🔥;s:=",
-    "apply:17:reaction-transition:p:=;s:👻",
-    "apply:18:reaction-transition:p:=;s:💔",
-    "apply:19:reaction-transition:p:=;s:💩",
-    "apply:20:reaction-transition:p:=;s:🗑",
-    "apply:21:reaction-transition:p:👍;s:💩",
+    "apply:21:reaction-transition:p:👍;s:=",
     "apply:22:reaction-transition:p:=;s:-",
     "apply:23:reaction-transition:p:=;s:-",
     "apply:24:reaction-transition:p:👍;s:-",

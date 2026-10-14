@@ -208,7 +208,7 @@ In Threaded Mode, `All` is input-only: messages enter temporary routing tabs, an
 
 Messages sent while Pi is busy become queued turns. Queue controls let you inspect, prioritize, keep or skip, and dispatch work without touching the terminal.
 
-Use reactions or the queue menu to control waiting prompts.
+Use reactions or the queue menu to control waiting prompts. Only `👍`, `👎`, and `🔥` have queue semantics; all other reactions are ignored.
 
 Priority — when the prompt runs:
 - **Normal — no dedicated reaction emoji.** The default lane for ordinary queued work.
@@ -227,7 +227,7 @@ Queue policy:
 - One yellow terminal counter shows waiting work across all lanes, excluding current or already-dispatched work, Skip and frozen attempts.
 - Dispatched or frozen prompts are inspection-only. An uncertain Steer attempt is not automatically retried.
 - The bot cannot remove your Telegram reactions; changing a menu choice may leave the original reaction visible.
-- A negative reaction to your waiting standalone `/continue` cancels it immediately rather than marking it for reversible Skip. Already-running work is unaffected.
+- A `👎` reaction to your waiting standalone `/continue` cancels it immediately rather than marking it for reversible Skip. Already-running work is unaffected.
 - The queue is session-local. Let it drain before reload or shutdown, or accept losing waiting work.
 
 See [Queue Behavior and Safety](./docs/architecture.md#priority-reactions-keep-and-skip) for reaction precedence, dispatch rules and recovery details.
