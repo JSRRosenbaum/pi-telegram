@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Button grammar`: Adjacent complete JSON/CML cells and matrices now compose one button surface in source order instead of dropping fenced controls or truncating footer controls. Each matrix contributes its existing rows; horizontal grouping, disabled controls and callback semantics remain unchanged. Invalid fenced groups register no callbacks. This extends button syntax only; rendering mode and voice syntax are unchanged.
+
 ## 0.56.2: Canonical Queue Reactions
 
 - `Queue reactions`: Only thumbs-up selects Priority, thumbs-down selects Skip, and fire selects Steer. Heart, dove, ghost, broken-heart, poop and wastebasket aliases are no longer controls. Unsupported reactions neither flush waiting input nor change queue intent; removing a supported reaction does not fall back to a retired alias. Only thumbs-down cancels a waiting standalone Continue.
