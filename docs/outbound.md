@@ -197,6 +197,7 @@ The extension injects prompt guidance by context:
 
 - If no bot token is configured, no Telegram bridge suffix is injected.
 - For ordinary local/TUI prompts, the compact routing note points to bundled Skills, including portable `show-me`, while forbidding Telegram use unless explicitly requested.
+- Pi 1.2 custom-message starts may omit the user `prompt`. They retain connected bridge guidance without acquiring Telegram-user origin from their message content; explicit custom origin also overrides any stale prompt field. Legacy user events without `messageType` retain prefix-based Telegram detection. Unavailable transport still strips Telegram tool guidance.
 - For Telegram-originated turns, the compact note routes the agent to `telegram-bridge` for voice/button/direct-delivery/Threaded Mode/formatting/debug guidance and to `show-me` when the user needs a visual explanation of work or behavior.
 - For ordinary Telegram-originated answers, write the full technical answer as phone-width Markdown. `show-me` may instead deliver a focused self-contained HTML artifact when explicitly requested or when spatial density earns it, while keeping the immediate reply useful.
 - Add `telegram_voice` with positional CML by default or JSON when multiline content, named fields, or escaping requires it. A companion summary is optional, no specific summary format is required.
