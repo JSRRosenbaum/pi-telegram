@@ -952,6 +952,88 @@ for (const replace of [false, true]) test(`Context loss before the scheduled fir
   } finally { typing.stop(); }
 });
 
+for (const stage of ["before-issuance", "after-issuance"] as const) {
+  test(`Repeated work presence preserves an in-flight typing action ${stage}`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const typing = Runtime.createTelegramTypingLoop(), ctx = {}, failures: unknown[] = [];
+    let release!: () => void, issued = 0, completed = 0;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const start = Runtime.createTelegramTypingLoopStarter({
+      typing, getDefaultChatId: () => 7, isContextActive: value => value === ctx,
+      getSessionGeneration: () => 1, getTransportAuthority: () => "unchanged", isThreadedMode: () => true,
+      async sendTypingAction(_chat, options) {
+        if (stage === "before-issuance") await held;
+        options!.assertAuthority!(); issued++;
+        if (stage === "after-issuance") await held;
+        options!.assertAuthority!(); completed++;
+      },
+      recordRuntimeEvent(_category, error) { failures.push(error); }, updateStatus() {},
+    });
+    try {
+      start(ctx, 7, { target: { chatId: 7, threadId: 42 } }); await flushMicrotasks();
+      for (let update = 0; update < 100; update++) {
+        assert.equal(start(ctx, 7, { target: { chatId: 7, threadId: 42 }, ensure: true }), false);
+      }
+      release(); await flushMicrotasks();
+      assert.equal(issued, 1); assert.equal(completed, 1); assert.deepEqual(failures, []);
+      t.mock.timers.tick(3000); await flushMicrotasks();
+      assert.equal(issued, 2); assert.equal(completed, 2);
+    } finally { release(); typing.stop(); }
+  });
+}
+
+for (const withGeneration of [true, false]) {
+  test(`Fresh SDK context wrappers ${withGeneration ? "preserve" : "replace"} presence ${withGeneration ? "within a session generation" : "without generation evidence"}`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const typing = Runtime.createTelegramTypingLoop(), sessionManager = {};
+    const first = { sessionManager }, next = { sessionManager }, guards: Array<() => void> = [];
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const start = Runtime.createTelegramTypingLoopStarter<typeof first>({
+      typing, getDefaultChatId: () => 7, isContextActive: ctx => ctx.sessionManager === sessionManager,
+      ...(withGeneration ? { getSessionGeneration: () => 1 } : {}),
+      getTransportAuthority: () => "unchanged", isThreadedMode: () => true,
+      async sendTypingAction(_chat, options) { guards.push(options!.assertAuthority!); if (guards.length === 1) await held; },
+      updateStatus() {},
+    });
+    try {
+      start(first, 7, { target: { chatId: 7, threadId: 42 } }); await flushMicrotasks();
+      start(next, 7, { target: { chatId: 7, threadId: 42 }, ensure: true });
+      if (withGeneration) assert.doesNotThrow(guards[0]);
+      else assert.throws(guards[0], /Typing context authority changed/);
+      release(); await flushMicrotasks(); t.mock.timers.tick(3000); await flushMicrotasks();
+      assert.doesNotThrow(guards.at(-1)!);
+    } finally { release(); typing.stop(); }
+  });
+}
+
+for (const changed of ["context", "generation", "transport", "chat", "thread", "stopped"] as const) {
+  test(`Ensuring work presence cannot retain an action after ${changed} changes`, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const typing = Runtime.createTelegramTypingLoop(), firstContext = {}, guards: Array<() => void> = [];
+    let current = firstContext, generation = 1, authority = "first", release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const start = Runtime.createTelegramTypingLoopStarter({
+      typing, getDefaultChatId: () => 7, isContextActive: ctx => ctx === current,
+      getSessionGeneration: () => generation, getTransportAuthority: () => authority, isThreadedMode: () => true,
+      async sendTypingAction(_chat, options) { guards.push(options!.assertAuthority!); if (guards.length === 1) await held; },
+      updateStatus() {},
+    });
+    try {
+      start(firstContext, 7, { target: { chatId: 7, threadId: 42 } }); await flushMicrotasks();
+      if (changed === "context") current = {};
+      if (changed === "generation") generation++;
+      if (changed === "transport") authority = "replacement";
+      if (changed === "stopped") typing.stop();
+      const chatId = changed === "chat" ? 8 : 7, threadId = changed === "thread" ? 43 : 42;
+      start(current, chatId, { target: { chatId, threadId }, ensure: true });
+      assert.throws(guards[0], /Typing context authority changed/);
+      release(); await flushMicrotasks(); t.mock.timers.tick(3000); await flushMicrotasks();
+      assert.ok(guards.length >= 2); assert.doesNotThrow(guards.at(-1)!);
+    } finally { release(); typing.stop(); }
+  });
+}
+
 for (const end of ["stop", "same-target-replacement"] as const) {
   test(`Typing transport guard cannot outlive its loop with unchanged context and epoch (${end})`, async (t) => {
     t.mock.timers.enable({ apis: ["setInterval"] });
