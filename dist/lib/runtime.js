@@ -161,6 +161,7 @@ function updateTelegramRuntimeStatusSafely(updateStatus, ctx, options) {
     }
 }
 export function createTelegramTypingLoopStarter(deps) {
+    let currentOwner;
     return (ctx, chatId, options) => {
         const sessionGeneration = deps.getSessionGeneration?.();
         const transportAuthority = deps.getTransportAuthority?.();
@@ -177,9 +178,24 @@ export function createTelegramTypingLoopStarter(deps) {
         // Queue dispatch precedes agent_start: only an explicit destination permits Threaded presence, never chat fallback.
         if (!canContinue())
             return false;
+        const resolvedChatId = chatId ?? deps.getDefaultChatId();
+        if (resolvedChatId === undefined || resolvedChatId === 0)
+            return false;
+        // Streaming updates ensure presence without revoking the same owner's pending HTTP/IPC action.
+        // Explicit starts still replace the loop, including a new turn on the same session and Thread.
+        if (options?.ensure && currentOwner?.canContinue() &&
+            (deps.getSessionGeneration
+                ? Object.is(currentOwner.sessionGeneration, sessionGeneration)
+                : Object.is(currentOwner.ctx, ctx)) &&
+            Object.is(currentOwner.transportAuthority, transportAuthority) &&
+            currentOwner.chatId === resolvedChatId && currentOwner.threadId === target?.threadId)
+            return false;
+        const owner = { ctx, sessionGeneration, transportAuthority, chatId: resolvedChatId,
+            threadId: target?.threadId, canContinue };
+        currentOwner = owner;
         let active = true;
         return deps.typing.start({
-            chatId: chatId ?? deps.getDefaultChatId(),
+            chatId: resolvedChatId,
             target,
             intervalMs: deps.intervalMs ?? TELEGRAM_TYPING_ACTION_INTERVAL_MS,
             sendTypingAction: async (targetChatId, actionOptions) => {
@@ -219,6 +235,8 @@ export function createTelegramTypingLoopStarter(deps) {
             shouldContinue: canContinue,
             onStopped: () => {
                 active = false;
+                if (currentOwner === owner)
+                    currentOwner = undefined;
             },
         });
     };

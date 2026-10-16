@@ -1538,7 +1538,7 @@ export function registerTelegramLifecycleRuntimeHooks({
       promptDispatchRuntime.startTypingLoop(
         ctx,
         turn?.chatId ?? target?.chatId,
-        { target },
+        { target, ensure: true },
       ) !== false
     );
   };
@@ -1547,6 +1547,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     const turn = activeTurnRuntime.get();
     promptDispatchRuntime.startTypingLoop(ctx, turn?.chatId, {
       target: turn?.target,
+      ensure: true,
     });
   };
   let observedAutomaticCompaction = false;

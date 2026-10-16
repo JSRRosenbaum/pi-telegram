@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.56.4: Typing Keepalive Continuity
+
+- `Typing continuity`: Streaming updates keep the current work's pending presence request alive instead of cancelling it through repeated loop replacement. Explicit starts, session or transport changes, Thread changes and stopping still revoke the previous action; compaction cannot claim an existing agent loop.
+- `Windows validation`: Grouped Restore fixtures control album debounce after both originals are admitted and await chooser publication, so slow filesystem work cannot accidentally split their input group. Exact source, receipt and readiness assertions remain intact; production debounce and routing behavior are unchanged.
+
 ## 0.56.3: Button Matrices and Custom-Message Starts
 
 - `Button grammar`: Adjacent complete JSON/CML cells and matrices now compose one button surface in source order instead of dropping fenced controls or truncating footer controls. Each matrix contributes its existing rows; horizontal grouping, disabled controls and callback semantics remain unchanged. Invalid fenced groups register no callbacks. This extends button syntax only; rendering mode and voice syntax are unchanged.
