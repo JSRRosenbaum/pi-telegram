@@ -847,7 +847,7 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
             return false;
         const turn = activeTurnRuntime.get();
         const target = turn?.target ?? proactivePushTargetGetter();
-        return (promptDispatchRuntime.startTypingLoop(ctx, turn?.chatId ?? target?.chatId, { target }) !== false);
+        return (promptDispatchRuntime.startTypingLoop(ctx, turn?.chatId ?? target?.chatId, { target, ensure: true }) !== false);
     };
     const startActiveTurnTypingLoop = (ctx) => {
         if (uiPromptActive)
@@ -855,6 +855,7 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         const turn = activeTurnRuntime.get();
         promptDispatchRuntime.startTypingLoop(ctx, turn?.chatId, {
             target: turn?.target,
+            ensure: true,
         });
     };
     let observedAutomaticCompaction = false;

@@ -119,6 +119,7 @@ export interface TelegramTypingLoopStarterDeps<TContext> extends TelegramRuntime
 }
 export declare function createTelegramTypingLoopStarter<TContext>(deps: TelegramTypingLoopStarterDeps<TContext>): (ctx: TContext, chatId?: number, options?: {
     target?: TelegramTypingLoopTarget;
+    ensure?: boolean;
 }) => boolean;
 /** The whole typing-loop state; only `transitionTelegramTypingLoop` produces a new one. */
 export interface TelegramTypingMachineState {
@@ -214,6 +215,7 @@ export interface TelegramPromptDispatchRuntimeDeps<TContext> extends TelegramTyp
 export interface TelegramPromptDispatchRuntime<TContext> {
     startTypingLoop: (ctx: TContext, chatId?: number, options?: {
         target?: TelegramTypingLoopTarget;
+        ensure?: boolean;
     }) => boolean | void;
     onPromptDispatchStart: (ctx: TContext, chatId?: number, target?: TelegramTypingLoopTarget) => void;
     onPromptDispatchFailure: (ctx: TContext, message: string) => void;
