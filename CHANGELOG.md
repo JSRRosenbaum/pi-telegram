@@ -7,6 +7,7 @@
 ## 0.56.4: Typing Keepalive Continuity
 
 - `Typing continuity`: Streaming updates keep the current work's pending presence request alive instead of cancelling it through repeated loop replacement. Explicit starts, session or transport changes, Thread changes and stopping still revoke the previous action; compaction cannot claim an existing agent loop.
+- `Windows validation`: Grouped Restore fixtures control album debounce after both originals are admitted and await chooser publication, so slow filesystem work cannot accidentally split their input group. Exact source, receipt and readiness assertions remain intact; production debounce and routing behavior are unchanged.
 
 ## 0.56.3: Button Matrices and Custom-Message Starts
 

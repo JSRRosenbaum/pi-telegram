@@ -1673,6 +1673,7 @@ test("Lifecycle binding drains diagnostics before quit cleanup and preserves cle
 
 test("Lifecycle binding routes native typing, previews, and normalized activity", async () => {
   const events: string[] = [];
+  const typingEnsures: boolean[] = [];
   let generation = 1, previewGate: Promise<void> | undefined, previewResets = 0;
   const harness = createBindingApiHarness();
   const runtime = Runtime.createTelegramBridgeRuntime();
@@ -1719,6 +1720,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
       capture: () => ({ target: { chatId: 7 }, isCurrent: () => true }),
     },
     assistantOutputRuntime: {
+      beginTurn: () => {},
       start: () => events.push("assistant-output:start"),
       stop: () => events.push("assistant-output:stop"),
     },
@@ -1738,7 +1740,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     activeTurnRuntime: {
       clear: () => {},
       has: () => activeTurn,
-      set: () => {},
+      set: () => { activeTurn = true; },
       get: () =>
         activeTurn
           ? active
@@ -1760,11 +1762,11 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
       startTypingLoop: (
         _ctx: ExtensionContext,
         chatId?: number,
-        options?: { target?: { threadId?: number } },
-      ) =>
-        events.push(
-          `typing:${chatId ?? "none"}:${options?.target?.threadId ?? "all"}`,
-        ),
+        options?: { target?: { threadId?: number }; ensure?: boolean },
+      ) => {
+        typingEnsures.push(options?.ensure === true);
+        return events.push(`typing:${chatId ?? "none"}:${options?.target?.threadId ?? "all"}`);
+      },
     },
     deferredQueueDispatchRuntime: { request: () => {} },
     modelContextAvailabilityRuntime: { reconcile: () => {} },
@@ -1940,6 +1942,7 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
     "activity:compact-end:unknown",
     "send:**✅ Compaction completed.**",
   ];
+  assert.ok(typingEnsures.length > 0 && typingEnsures.every(Boolean), "Activity, streaming, UI resume and compaction must ensure existing presence");
   // Pi hooks keep their order without waiting for the independently delivered projection.
   assert.deepEqual(events.filter((event) => !event.startsWith("send:")), expected.filter((event) => !event.startsWith("send:")));
   assert.deepEqual(events.filter((event) => event.startsWith("send:")), expected.filter((event) => event.startsWith("send:")));
@@ -1955,4 +1958,11 @@ test("Lifecycle binding routes native typing, previews, and normalized activity"
   const oldStart = getRequiredBindingHandler(harness.handlers, "agent_start")({ type: "agent_start" }, sameContext);
   generation++; await oldStart;
   assert.deepEqual(events, [], "A superseded agent-start continuation cannot publish activity or claim replacement typing");
+
+  typingEnsures.length = 0;
+  activeTurn = false;
+  steerStore.setQueuedItems([{ ...active, queueLane: "default" }]);
+  runtime.lifecycle.setDispatchPending(true);
+  await getRequiredBindingHandler(harness.handlers, "agent_start")({ type: "agent_start" }, sameContext);
+  assert.deepEqual(typingEnsures, [false, true], "Queued handoff replaces the owner before ordinary activity ensures it");
 });

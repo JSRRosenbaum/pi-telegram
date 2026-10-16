@@ -11806,7 +11806,7 @@ for (const role of ["leader", "follower"] as const) {
     for (const delivery of lostReply ? ["normal", "local-regression", "canonical-regression", ...(role === "leader" ? leaderBoundaryFaults : [])] : role === "follower"
       ? ["normal", "lost-ack", "registration-change", "cleanup-unknown", "authority-ended", "settlement-publication-interrupted", "session-change", "target-change", "queued-before", "queued-during", "active-before", "canonical-before-ack", "canonical-after-ready", "registry-recovery", "registry-disk-regression", ...journalProtectionCases, ...sessionReferenceCases, ...cleanupWakeCases, ...recipientWakeCases, ...forwardProofCases, ...warmCleanupCases, ...warmDisposalCases, "warm-cleanup-registration"]
       : ["normal", "cleanup-unknown", "authority-ended", "settlement-publication-interrupted", "session-change", "target-change", "queued-before", "queued-during", "active-before", "canonical-before-ack", "canonical-after-ready", ...leaderBoundaryFaults, ...journalProtectionCases, ...cleanupWakeCases, ...queuedProofCases, ...warmCleanupCases, ...warmDisposalCases]) {
-    test(`Restore button uses durable relocation at full capacity (${role}, lost reply: ${lostReply}, delivery: ${delivery})`, async () => {
+    test(`Restore button uses durable relocation at full capacity (${role}, lost reply: ${lostReply}, delivery: ${delivery})`, async (t) => {
       await withTopicStore(async (threadStore, path) => {
         const instanceId = role === "leader" ? "leader-a" : "follower-a";
         const oldTarget = { chatId: 7, threadId: 7 };
@@ -12017,6 +12017,18 @@ for (const role of ["leader", "follower"] as const) {
         let acceptancePublications = 0;
         let capturedSourceHash: string | undefined;
         const grouped = queuedGroupCases.includes(delivery), sourceIds = grouped ? [100, 101] : [100];
+        // Whole-group Restore needs both admitted originals; filesystem latency must not split the fixture album.
+        let flushGroup: (() => void) | undefined;
+        if (grouped) {
+          const schedule = globalThis.setTimeout;
+          t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+            if (ms !== 1200) return schedule(callback, ms, ...args);
+            const timer = schedule(() => {}, 2_147_483_647);
+            t.after(() => clearTimeout(timer));
+            flushGroup = () => { clearTimeout(timer); callback(...args); };
+            return timer;
+          });
+        }
         const sourceHashes = new Map<number, string>();
         let queueObservers = 0, inboundGroups = 0;
         let queueProofReads = 0, queuePublicationUnavailable = delivery === "queue-cold" || delivery === "queue-group-cold";
@@ -12416,7 +12428,12 @@ for (const role of ["leader", "follower"] as const) {
           await worker.waitForDrain();
           if (grouped) {
             assert.equal(inboundGroups, 0, "unbound album originals are deferred before semantic admission");
-            await new Promise<void>(resolve => setTimeout(resolve, 1250));
+            assert.ok(flushGroup, "both originals entered the unbound album debounce");
+            flushGroup();
+            const chooserDeadline = Date.now() + 10_000;
+            while (!events.some(value => value.includes("rerouterestore:1")) && Date.now() < chooserDeadline) {
+              await new Promise<void>(resolve => setTimeout(resolve, 10));
+            }
             assert.match(events.join("\n"), /rerouterestore:1/, "one native coalesced chooser governs both originals");
             await click("rerouterestore:1");
             assert.match(events.join("\n"), /reroutenew:1:7/, "the shared Restore selection names the same binding");
