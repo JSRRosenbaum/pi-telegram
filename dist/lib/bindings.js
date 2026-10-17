@@ -575,11 +575,7 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
                             throw new Error(`Telegram profile "${profileName}" has no token.`);
                         }
                         await configStore.load();
-                        const latestProfile = configStore.getStoredConfig().profiles?.[profileName];
-                        configStore.setProfile(profileName, {
-                            ...profile,
-                            threadDisplayMode: latestProfile?.threadDisplayMode,
-                        });
+                        configStore.setProfile(profileName, profile);
                         configStore.activateProfile(profileName);
                         await onTransportChanged?.();
                         await persistConfig(configStore.get());

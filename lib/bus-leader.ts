@@ -1591,6 +1591,7 @@ export function createTelegramBusFollowerTargetProvisioner(
           {
             existingBindingOnly: options?.existingWorkspaceBindingOnly === true,
             sessionId: registration.sessionId,
+            sessionHandoff: registration.previousInstanceId !== undefined,
             provisionProfileKey: registration.profileKey ?? `manual:${registration.instanceId}`,
             onCapacityUnavailable() {
               capacityUnavailable = true;
@@ -1854,11 +1855,52 @@ export function createTelegramBusFollowerTargetProvisioner(
         };
       }
       const probeRequiredRecord = reconnectRecord?.status === "probe-required";
+      // Pi /new or /fork inside one live process keeps its Thread; that process already proves the tab.
+      const sameProcessSessionHandoff =
+        crossSessionReuse &&
+        reconnectRecord?.status === "active" &&
+        registration.previousInstanceId === reconnectRecord.instanceId &&
+        recoverableTarget === undefined &&
+        Threads.isSameTelegramProcessInstance(
+          reconnectRecord.instanceId,
+          registration.instanceId,
+        );
       const requiresVisibilityProbe =
-        crossSessionReuse ||
+        (crossSessionReuse && !sameProcessSessionHandoff) ||
         probeRequiredRecord ||
         recoverableTarget !== undefined;
-      const retainedDisplayBinding = deps.topicTargetStore.getWorkspaceBindingByTarget(result.target, registration.sessionId);
+      const transferSessionHandoffRecord = async (): Promise<void> => {
+        const nowMs = getNowMs();
+        const transferredRecord = deps.topicTargetStore.upsert({
+          ...result.record,
+          profileKey: followerProfileKey,
+          owner:
+            followerOwner.kind === "manual-follower"
+              ? followerOwner
+              : {
+                  kind: "manual-follower",
+                  instanceId: registration.instanceId,
+                },
+          instanceId: registration.instanceId,
+          updatedAtMs: nowMs,
+          lastSyncObservedAtMs: nowMs,
+          lastReconcileAction: "follower-session-handoff",
+        });
+        await deps.topicTargetStore.persist();
+        result = {
+          target: transferredRecord.target,
+          reused: true,
+          record: transferredRecord,
+        };
+      };
+      if (sameProcessSessionHandoff) {
+        assertRestoreRegistration();
+        await transferSessionHandoffRecord();
+      }
+      // A session handoff still owns the predecessor session's binding until the Workspace commit re-keys it.
+      const retainedDisplayBinding =
+        deps.topicTargetStore.getWorkspaceBindingByTarget(result.target, registration.sessionId) ??
+        deps.topicTargetStore.getWorkspaceBindingByTarget(result.target);
       let connectedAnnouncement =
         !result.reused || requiresVisibilityProbe
           ? createTelegramBusInstanceLifecycleAnnouncement({
@@ -1913,28 +1955,7 @@ export function createTelegramBusFollowerTargetProvisioner(
               record: activatedRecord,
             };
           } else if (crossSessionReuse && reconnectRecord) {
-            const nowMs = getNowMs();
-            const transferredRecord = deps.topicTargetStore.upsert({
-              ...result.record,
-              profileKey: followerProfileKey,
-              owner:
-                followerOwner.kind === "manual-follower"
-                  ? followerOwner
-                  : {
-                      kind: "manual-follower",
-                      instanceId: registration.instanceId,
-                    },
-              instanceId: registration.instanceId,
-              updatedAtMs: nowMs,
-              lastSyncObservedAtMs: nowMs,
-              lastReconcileAction: "follower-session-handoff",
-            });
-            await deps.topicTargetStore.persist();
-            result = {
-              target: transferredRecord.target,
-              reused: true,
-              record: transferredRecord,
-            };
+            await transferSessionHandoffRecord();
           }
           connectedAnnouncement = undefined;
         } catch (error) {

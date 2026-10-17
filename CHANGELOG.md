@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.57.0: Thread Continuity and Shared Settings
+
+- `Config`: Thread display now lives in shared top-level `threads.displayMode`, beside the other Settings preferences; profiles hold only bot identity and the paired owner. The old `profiles.<name>.threadDisplayMode` key is not migrated and is ignored, so configs without the new key use the Letters default until Settings saves a choice.
+- `Session replacement`: A follower's `/new` or `/fork` in the same Pi process now keeps its Thread silently. It keeps the same tab, letter slot and acknowledged display title, with no second connected notice. A connected notice for a handoff from another process now shows the acknowledged title instead of the generated dictionary name.
+
 ## 0.56.4: Typing Keepalive Continuity
 
 - `Typing continuity`: Streaming updates keep the current work's pending presence request alive instead of cancelling it through repeated loop replacement. Explicit starts, session or transport changes, Thread changes and stopping still revoke the previous action; compaction cannot claim an existing agent loop.

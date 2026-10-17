@@ -2148,6 +2148,94 @@ test("Bus leader follower target provisioner transfers a live session-reload tar
   }
 });
 
+for (const sameProcess of [true, false]) test(`Bus leader keeps the acknowledged Thread title across a follower session handoff (same process=${sameProcess})`, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-new-session-"));
+  const store = createTelegramTopicTargetStore({
+    path: join(dir, "state.json"),
+    getNowMs: () => 1000,
+  });
+  const target = { chatId: 7, threadId: 42 };
+  store.upsert({
+    profileKey: "manual:100:start:1",
+    owner: { kind: "manual-follower", instanceId: "100:start:1" },
+    target,
+    status: "active",
+    createdAtMs: 500,
+    updatedAtMs: 500,
+    instanceId: "100:1000",
+    slot: "Y",
+    threadName: "Yale",
+  });
+  store.upsertWorkspaceBinding({
+    ...createTelegramWorkspaceBindingIdentity("/repo", 0, "session-a")!,
+    target,
+    slot: "Y",
+    threadName: "Yale",
+    displayTitle: "Repo",
+    updatedAtMs: 500,
+  });
+  await store.persist();
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  let syncState = {};
+  const provision = createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, body });
+      if (method === "createForumTopic") {
+        throw new Error("session handoff must not create a Thread");
+      }
+      return { ok: true } as TResponse;
+    },
+    getNowMs: () => 1000,
+    getSyncState: () => syncState,
+    setSyncState: (state) => {
+      syncState = state;
+    },
+    recordRuntimeEvent() {},
+  });
+  try {
+    const instanceId = sameProcess ? "100:2000" : "200:2000";
+    const assigned = await provision({
+      instanceId,
+      previousInstanceId: "100:1000",
+      profileKey: "manual:100:start:1",
+      cwd: "/repo",
+      sessionId: "session-b",
+      target,
+      connectedAtMs: 2000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(assigned?.threadId, 42);
+    assert.equal(assigned?.slot, "Y");
+    assert.deepEqual(
+      calls,
+      sameProcess
+        ? []
+        : [
+            {
+              method: "sendMessage",
+              body: {
+                chat_id: 7,
+                message_thread_id: 42,
+                text: "<b>📡 Instance <i>Repo</i> connected.</b>",
+                parse_mode: "HTML",
+              },
+            },
+          ],
+    );
+    const binding = store.getWorkspaceBindingByTarget(target);
+    assert.equal(binding?.sessionId, "session-b");
+    assert.equal(binding?.slot, "Y");
+    assert.equal(binding?.displayTitle, "Repo");
+    assert.equal(store.getWorkspaceBindingByTarget(target, "session-a"), undefined);
+    assert.equal(store.list()[0]?.instanceId, instanceId);
+    assert.equal(store.list()[0]?.slot, "Y");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 for (const exactHandoff of [false, true]) test(`Bus leader replaces a deleted follower target even when typing would succeed (exact handoff=${exactHandoff})`, async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-stale-tab-"));
   const store = createTelegramTopicTargetStore({

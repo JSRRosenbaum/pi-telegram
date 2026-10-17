@@ -561,6 +561,8 @@ export interface TelegramTopicTargetStore {
         existingBindingOnly?: boolean;
         sessionId?: string;
         provisionProfileKey?: string;
+        /** Explicit same-process session handoff from `previousInstanceId`; never inferred. */
+        sessionHandoff?: boolean;
         onCapacityUnavailable?: () => void;
     }) => TelegramWorkspaceBindingIdentity | undefined;
     releaseWorkspaceClaim: (instanceId: string) => boolean;
