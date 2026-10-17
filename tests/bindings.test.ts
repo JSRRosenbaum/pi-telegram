@@ -1452,7 +1452,8 @@ test("Named setup preserves a display preference changed while the token form wa
   const configPath = join(dir, "telegram.json");
   const store = Config.createTelegramConfigStore({ agentDir: dir, configPath, initialConfig: {
     profiles: { default: { botToken: "default-token" },
-      work: { botToken: "old-token", threadDisplayMode: "letters" } },
+      work: { botToken: "old-token" } },
+    threads: { displayMode: "letters" },
   } });
   await store.persist();
   t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({
@@ -1485,7 +1486,8 @@ test("Named setup preserves a display preference changed while the token form wa
     } as unknown as ExtensionContext);
     const saved = await Config.readTelegramConfig(configPath);
     assert.equal(saved.profiles?.work.botToken, "new-token");
-    assert.equal(saved.profiles?.work.threadDisplayMode, "directory-snake");
+    assert.equal(saved.threads?.displayMode, "directory-snake");
+    assert.deepEqual(Object.keys(saved.profiles?.work ?? {}).sort(), ["botId", "botToken", "botUsername"]);
     assert.equal(store.getActiveProfileName(), "work");
   } finally {
     await rm(dir, { recursive: true, force: true });

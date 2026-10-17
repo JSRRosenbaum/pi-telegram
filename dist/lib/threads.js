@@ -4892,10 +4892,25 @@ export function createTelegramTopicTargetStore(options) {
                 if (ownedProvisions.length > 1)
                     return undefined;
                 const ownProvision = ownedProvisions[0];
-                const retainedTarget = ownProvision?.target ?? binding?.target ?? legacyRecord?.target;
-                const retainedSlot = ownProvision?.slot ?? binding?.slot ?? legacyRecord?.slot;
+                // A same-cwd session handoff keeps its predecessor's Thread slot; the Workspace commit re-keys that binding.
+                const handoffBindings = binding ||
+                    ownProvision ||
+                    !options?.sessionHandoff ||
+                    !previousInstanceId ||
+                    !isSameTelegramProcessInstance(previousInstanceId, instanceId)
+                    ? []
+                    : Array.from(workspaceBindings.values()).filter((candidate) => candidate.cwd === identity.cwd &&
+                        candidate.sessionId !== identity.sessionId &&
+                        Array.from(records.values()).some((record) => record.instanceId === previousInstanceId &&
+                            record.status === "active" &&
+                            targetMatches(record.target, candidate.target)));
+                const handoffBinding = handoffBindings.length === 1 ? handoffBindings[0] : undefined;
+                const retainedTarget = ownProvision?.target ?? binding?.target ?? handoffBinding?.target ?? legacyRecord?.target;
+                const retainedSlot = ownProvision?.slot ?? binding?.slot ?? handoffBinding?.slot ?? legacyRecord?.slot;
                 const otherBindings = Array.from(workspaceBindings.values())
-                    .filter((other) => other.bindingKey !== identity.bindingKey && other.slot)
+                    .filter((other) => other.bindingKey !== identity.bindingKey &&
+                    other.bindingKey !== handoffBinding?.bindingKey &&
+                    other.slot)
                     .map((other) => ({
                     bindingKey: other.bindingKey,
                     slot: other.slot.toLowerCase(),

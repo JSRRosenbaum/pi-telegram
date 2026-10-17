@@ -1043,12 +1043,7 @@ export function registerTelegramCommandsAndTools({
               );
             }
             await configStore.load();
-            const latestProfile =
-              configStore.getStoredConfig().profiles?.[profileName];
-            configStore.setProfile(profileName, {
-              ...profile,
-              threadDisplayMode: latestProfile?.threadDisplayMode,
-            });
+            configStore.setProfile(profileName, profile);
             configStore.activateProfile(profileName);
             await onTransportChanged?.();
             await persistConfig(configStore.get());

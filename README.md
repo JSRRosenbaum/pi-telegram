@@ -261,7 +261,7 @@ Classic private DM mode is the base product mode. When Telegram private-chat Thr
 - When all `A`–`Z` slots are reserved, a new connection may reclaim the oldest inactive, unprotected Thread. **This deletes that Thread and all its messages**, not Pi session history or project files. Active or protected work blocks reclamation; restoring a remembered session does not evict another binding.
 - Telegram never launches hidden Pi processes.
 
-In Settings → **🧵 Thread display**, choose Letters (default), Names, Directory Title or Directory Snake. Use `/name` for a custom Thread name and **Reset to automatic** to restore the selected naming style. Renaming preserves the Thread and its queued work. See [Thread Display](./docs/architecture.md#threaded-mode-multi-instance-bus) for naming details.
+In Settings → **🧵 Thread display**, choose Letters (default), Names, Directory Title or Directory Snake. The choice is shared across all profiles through `threads.displayMode`; profiles contain only bot identity and the paired owner. Use `/name` for a custom Thread name and **Reset to automatic** to restore the selected naming style. Renaming preserves the Thread and its queued work. See [Thread Display](./docs/architecture.md#threaded-mode-multi-instance-bus) for naming details.
 
 | Mode | Best for | Runtime shape |
 | --- | --- | --- |
