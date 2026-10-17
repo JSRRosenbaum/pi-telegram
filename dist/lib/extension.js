@@ -1033,6 +1033,29 @@ export default function (pi) {
         delivery: deliveryLifecycleRuntime,
         api: telegramApiTargetActivityRuntime,
     });
+    const prepareTemporaryThreadJournalInspection = function (target, requiredJournalBindingKeys, ownInputs) {
+        const binding = resolveTelegramUpdateJournalBinding();
+        const botToken = configStore.getBotToken();
+        if (!binding || !botToken)
+            return undefined;
+        const profile = configStore.getActiveProfileName() ?? "default";
+        const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken, botId: getTelegramBotId() });
+        return {
+            directory: Paths.resolveTelegramTempDir(), profile, botIdentity,
+            pollingPath: telegramLeaderJournalPath.resolve(configStore.getActiveProfileName()),
+            requiredJournalBindingKeys: [binding.recoveryKey, ...requiredJournalBindingKeys],
+            ...(target.threadId !== undefined && ownInputs
+                ? { cleanup: { target: { chatId: target.chatId, threadId: target.threadId }, ownInputs } } : {}),
+            limits: { maxDirectoryEntries: 10_000, maxFiles: 4096, maxBytes: 64 * 1024 * 1024,
+                maxEntries: 10_000, maxWork: 100_000 },
+            withSourceReference(path, operation) {
+                return telegramJournalReferenceRegistry.withReference({
+                    referenceClass: "operator-disposition",
+                    recoveryKey: Journal.createTelegramUpdateJournalBindingKey({ path, profileName: profile, botIdentity }),
+                }, operation);
+            },
+        };
+    };
     const inboundRouteRuntime = Routing.createTelegramInboundRouteRuntime({
         configStore,
         callApi: callTelegramApi,
@@ -1112,53 +1135,24 @@ export default function (pi) {
             });
         },
         inspectTemporaryThreadSources(target, requiredJournalBindingKeys, ownInputs) {
-            const binding = resolveTelegramUpdateJournalBinding();
-            const botToken = configStore.getBotToken();
-            if (!binding || !botToken)
+            const input = prepareTemporaryThreadJournalInspection(target, requiredJournalBindingKeys, ownInputs);
+            if (!input)
                 return undefined;
-            const profile = configStore.getActiveProfileName() ?? "default";
-            const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({
-                botToken,
-                botId: getTelegramBotId(),
-            });
             return withTelegramJournalSourceSerialization(function () {
-                return Journal.isTelegramThreadCleanupJournalNamespaceClear({
-                    directory: Paths.resolveTelegramTempDir(),
-                    profile,
-                    botIdentity,
-                    pollingPath: telegramLeaderJournalPath.resolve(configStore.getActiveProfileName()),
-                    requiredJournalBindingKeys: [
-                        binding.recoveryKey,
-                        ...requiredJournalBindingKeys,
-                    ],
-                    ...(target.threadId !== undefined && ownInputs
-                        ? {
-                            cleanup: {
-                                target: { chatId: target.chatId, threadId: target.threadId },
-                                ownInputs,
-                            },
-                        }
-                        : {}),
-                    limits: {
-                        maxDirectoryEntries: 10_000,
-                        maxFiles: 4096,
-                        maxBytes: 64 * 1024 * 1024,
-                        maxEntries: 10_000,
-                        maxWork: 100_000,
-                    },
-                    withSourceReference(path, operation) {
-                        return telegramJournalReferenceRegistry.withReference({
-                            referenceClass: "operator-disposition",
-                            recoveryKey: Journal.createTelegramUpdateJournalBindingKey({
-                                path,
-                                profileName: profile,
-                                botIdentity,
-                            }),
-                        }, operation);
-                    },
-                })
-                    ? []
-                    : undefined;
+                return Journal.isTelegramThreadCleanupJournalNamespaceClear(input) ? [] : undefined;
+            });
+        },
+        recoverTemporaryThreadDeadQueueOwners(target, requiredJournalBindingKeys, ownInputs, isCurrent) {
+            const input = prepareTemporaryThreadJournalInspection(target, requiredJournalBindingKeys, ownInputs);
+            if (!input || !isCurrent())
+                return 0;
+            return Journal.recoverTelegramThreadCleanupDeadQueueOwners({
+                ...input, isCurrent, withSourceSerialization: withTelegramJournalSourceSerialization,
+                recoveryOwner: {
+                    instanceId: telegramInstanceId, processId: telegramProcessId,
+                    processBirthId: telegramQueueProcessBirthId,
+                    sessionGeneration: telegramSessionContextStore.getGeneration(),
+                },
             });
         },
         hasWorkspaceRestoreAuthority() {
@@ -2485,6 +2479,7 @@ export default function (pi) {
         deleteMessage: deleteTelegramMessage,
         sendGuestReply,
         editGuestReply,
+        editGuestInlineMessage: telegramApiRuntime.editGuestInlineMessage,
         stopGuestPlaceholder: guestPlaceholderRuntime.stop,
         finalizeMarkdownPreview,
         preparePreviewDelivery,

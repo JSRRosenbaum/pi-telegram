@@ -412,9 +412,56 @@ async function withLiveRebindStoreFixture(role: "leader" | "follower", layout: "
   }, role);
 }
 
+for (const targetKind of ["old", "new", "unrelated"] as const) for (const boundary of ["before", "after-grant"] as const) {
+  test(`Live Restore rechecks late provisioning recovery (${targetKind}, ${boundary})`, async () => {
+    await fixture(async f => {
+      const pending = { id: "late-target", owner: "manual-follower" as const, instanceId: "other", slot: "X", startedAtMs: 1 };
+      f.threads.upsertPendingProvision(pending); await f.threads.persist();
+      const committed = (await f.store.commitLiveRebind(f.request, recipient("leader"), f.auth, { holdInput: true }))!;
+      const released = f.store.advanceLiveRebind(committed, "release", f.auth)!;
+      const expected = boundary === "after-grant" ? f.store.advanceLiveRebind(released, "issue-cleanup", f.auth)! : released;
+      const target = targetKind === "old" ? f.request.binding.target : targetKind === "new" ? f.request.target : { chatId: 7, threadId: 99 };
+      await writeFile(`${f.path}.provision-recovery.json`, JSON.stringify({ [pending.id]: { instanceId: pending.instanceId, target } }), { mode: 0o600 });
+      const bytes = await readFile(f.path, "utf8");
+      if (targetKind === "unrelated") {
+        f.threads.withWorkspaceLiveRebindSnapshot(expected, () => {});
+        if (boundary === "before") assert.equal(f.threads.isWorkspaceLiveRebindCleanupTargetProtected(expected), false);
+      } else {
+        assert.throws(() => f.threads.withWorkspaceLiveRebindSnapshot(expected, () => {}), /provisioning recovery conflict/);
+        if (boundary === "before") {
+          assert.equal(f.threads.isWorkspaceLiveRebindCleanupTargetProtected(expected), true);
+          assert.throws(() => f.store.advanceLiveRebind(expected, "issue-cleanup", f.auth), /provisioning recovery conflict/);
+        }
+      }
+      assert.equal(await readFile(f.path, "utf8"), bytes, "Late target evidence never gets erased to obtain a cleanup grant");
+    });
+  });
+}
+
+for (const cleanup of ["issued", "unknown"] as const) {
+  test(`Protected Restore old target allows only unrelated provisioning (${cleanup})`, async () => {
+    await withLiveRebindStoreFixture("leader", "consolidated", async f => {
+      const committed = (await f.store.commitLiveRebind(f.request, recipient("leader"), f.auth, { holdInput: true }))!;
+      const released = f.store.advanceLiveRebind(committed, "release", f.auth)!;
+      const issued = f.store.advanceLiveRebind(released, "issue-cleanup", f.auth)!;
+      const retained = cleanup === "unknown" ? f.store.advanceLiveRebind(issued, "unknown", f.auth)! : issued;
+      const unrelated = { id: "unrelated", owner: "leader" as const, instanceId: "other", workspaceBindingKey: "other-binding", slot: "X", startedAtMs: 1 };
+      f.threads.upsertPendingProvision(unrelated);
+      await f.threads.persist();
+      assert.deepEqual(f.store.listLiveRebindings(), [retained], "Unrelated provisioning cannot erase the delete grant or uncertainty");
+      assert.deepEqual(f.threads.listPendingProvisions(), [unrelated]);
+      for (const collision of [
+        { target: f.request.binding.target }, { target: f.request.target },
+        { slot: f.request.binding.slot }, { workspaceBindingKey: f.request.binding.bindingKey },
+      ]) assert.throws(() => f.threads.upsertPendingProvision({ ...unrelated, id: "collision", ...collision }), /Protected Workspace Restore provisioning conflict/);
+      assert.deepEqual(f.threads.listProtectedLiveRebindTargets(), [f.request.binding.target]);
+    });
+  });
+}
+
 for (const role of ["leader", "follower"] as const) {
 for (const layout of ["standalone", "consolidated"] as const) {
-for (const fault of ["clear", "unreleased", "issued", "wrong-target", "dirty-binding", "binding", "live-record", "stale-record", "reservation", "provision", "untargeted-provision", "unrelated-provision", "cleanup", "recipient-claim", "foreign-claim", "orphan-claim", "unrelated-claim", "canonical-only"] as const) {
+for (const fault of ["clear", "unreleased", "issued", "wrong-target", "dirty-binding", "binding", "live-record", "stale-record", "reservation", "provision", "untargeted-provision", "unrelated-provision", "provision-slot", "provision-binding", "provision-owner", "cleanup", "recipient-claim", "foreign-claim", "orphan-claim", "unrelated-claim", "canonical-only"] as const) {
   test(`Live cleanup protection observes canonical and warm ownership without legacy exemptions (${role}, ${layout}, ${fault})`, async () => {
     await withLiveRebindStoreFixture(role, layout, async f => {
       const committed = (await f.store.commitLiveRebind(f.request, recipient(role), f.auth))!;
@@ -453,6 +500,11 @@ for (const fault of ["clear", "unreleased", "issued", "wrong-target", "dirty-bin
         f.threads.upsertPendingProvision({ id: "other-provision", owner: "leader", instanceId: "other", slot: "B", startedAtMs: 900,
           ...(fault === "unrelated-provision" ? { target: { chatId: old.chatId, threadId: 77 } } : {}) }); await f.threads.persist();
       }
+      if (fault === "provision-slot" || fault === "provision-binding" || fault === "provision-owner") {
+        injectCanonical(file => (file.pendingProvisions ??= []).push({ id: "conflicting", owner: "leader", instanceId: "other", startedAtMs: 900,
+          ...(fault === "provision-slot" ? { slot: f.request.binding.slot } : fault === "provision-binding"
+            ? { workspaceBindingKey: f.request.binding.bindingKey } : { instanceId: f.request.owner.instanceId }) }));
+      }
       if (fault === "cleanup") { f.threads.upsertPendingCleanup({ id: "other-cleanup", owner: "leader", instanceId: "other", runtimeGeneration: "other", target: old, requestedAtMs: 1000 }); await f.threads.persist(); }
       if (fault === "recipient-claim" || fault === "foreign-claim") {
         const claim = f.threads.claimWorkspaceIdentity(f.request.binding.cwd, fault === "recipient-claim" ? f.request.owner.instanceId! : "contender",
@@ -463,10 +515,10 @@ for (const fault of ["clear", "unreleased", "issued", "wrong-target", "dirty-bin
         const claim = f.threads.claimWorkspaceIdentity("/other", "other", undefined, { sessionId: "other-session" }); assert.ok(claim);
         if (fault === "unrelated-claim") { f.threads.upsertWorkspaceBinding({ ...f.request.binding, ...claim, target: { chatId: old.chatId, threadId: 77 } }, "other"); await f.threads.persist(); }
       }
-      const corrupted = ["binding", "canonical-only", "live-record", "reservation", "provision"].includes(fault);
+      const corrupted = ["binding", "canonical-only", "live-record", "reservation", "provision", "provision-slot", "provision-binding", "provision-owner"].includes(fault);
       const bytes = await readFile(f.path, "utf8"), bindings = f.threads.listWorkspaceBindings(), records = f.threads.list();
       const operations = corrupted ? undefined : f.store.listLiveRebindings();
-      const protectedNow = !["clear", "stale-record", "recipient-claim", "unrelated-claim", "unrelated-provision"].includes(fault);
+      const protectedNow = !["clear", "stale-record", "recipient-claim", "unrelated-claim", "unrelated-provision", "untargeted-provision"].includes(fault);
       assert.equal(f.threads.isWorkspaceLiveRebindCleanupTargetProtected(expected), protectedNow);
       assert.equal(f.threads.isWorkspaceLiveRebindCleanupTargetProtected(expected), protectedNow, "A read grants no issued or retained cleanup action");
       assert.equal(await readFile(f.path, "utf8"), bytes); assert.deepEqual(f.threads.listWorkspaceBindings(), bindings); assert.deepEqual(f.threads.list(), records);
@@ -8326,7 +8378,7 @@ for (const source of ["same", "foreign"] as const) {
   });
 }
 
-for (const fault of ["none", "unissued", "ended-authority", "foreign-executor", "foreign-operator", "bound", "unknown-provision", "malformed"] as const) {
+for (const fault of ["none", "unissued", "ended-authority", "foreign-executor", "foreign-operator", "bound", "unknown-provision", "targeted-provision", "malformed"] as const) {
   test(`Issued temporary cleanup inspection is an exact read-only veto, never a new grant (${fault})`, async () => {
     await fixture(async ({ store, auth, path }) => {
       let entry = store.acknowledgeTemporaryThread(store.reserveTemporaryThread(temporarySource, temporaryToken, auth)!.entry,
@@ -8336,19 +8388,20 @@ for (const fault of ["none", "unissued", "ended-authority", "foreign-executor", 
         updateId: id, operatorAuthorityId: "telegram-owner:7" }))!;
       const unissued = entry;
       entry = store.issueTemporaryThreadCleanup(entry, auth)!.entry;
-      if (["bound", "unknown-provision", "malformed"].includes(fault)) {
+      if (["bound", "unknown-provision", "targeted-provision", "malformed"].includes(fault)) {
         const file = JSON.parse(await readFile(path, "utf8"));
         if (fault === "bound") file.workspaceBindings[0].target = entry.target;
-        if (fault === "unknown-provision") file.pendingProvisions = [{ id: "unknown", owner: "leader", instanceId: "other", startedAtMs: 1 }];
+        if (fault === "unknown-provision" || fault === "targeted-provision") file.pendingProvisions = [{ id: "unknown", owner: "leader", instanceId: "other", startedAtMs: 1,
+          ...(fault === "targeted-provision" ? { target: entry.target } : {}) }];
         if (fault === "malformed") file.threads.push({ owner: "unknown" });
         await writeFile(path, JSON.stringify(file));
       }
       const bytes = await readFile(path, "utf8");
       const authority = fault === "ended-authority" ? { ...auth, isCurrent: () => false } : fault === "foreign-executor"
         ? { ...auth, executor: { instanceId: "other", leaderEpoch: "other" } } : fault === "foreign-operator" ? { ...auth, operatorUserId: 8 } : auth;
-      if (fault === "bound" || fault === "malformed") assert.throws(() => store.isTemporaryThreadCleanupCurrent(entry, authority),
+      if (fault === "bound" || fault === "targeted-provision" || fault === "malformed") assert.throws(() => store.isTemporaryThreadCleanupCurrent(entry, authority),
         /Protected temporary Thread target conflict|Invalid temporary Thread target evidence/);
-      else assert.equal(store.isTemporaryThreadCleanupCurrent(fault === "unissued" ? unissued : entry, authority), fault === "none");
+      else assert.equal(store.isTemporaryThreadCleanupCurrent(fault === "unissued" ? unissued : entry, authority), fault === "none" || fault === "unknown-provision");
       assert.equal(await readFile(path, "utf8"), bytes, "inspection never repairs, adopts, mutates or consumes the issuance marker");
       if (fault === "none") {
         assert.equal(store.inspectTemporaryThreadTarget(entry, auth)?.kind, "unknown", "an issued target never becomes optimistically disposable");
@@ -8394,12 +8447,12 @@ for (const fault of ["none", "unresolved", "stale-frame", "ended-authority", "un
         assert.throws(() => publication.issueTemporaryThreadCleanup(candidate, active), /issuance fault|evidence changed before publication/);
       } else {
         const result = publication.issueTemporaryThreadCleanup(candidate, active);
-        assert.equal(result?.issued, fault === "none" ? true : undefined);
+        assert.equal(result?.issued, fault === "none" || fault === "unknown-provision" ? true : undefined);
       }
       const cold = createTelegramTopicTargetStore({ path }); await cold.load();
       const successor = open({ threadStore: cold });
       const observed = successor.listTemporaryThreads()[0]!;
-      assert.equal(observed.cleanupIssued, fault === "none" || fault === "after-rename" ? true : undefined);
+      assert.equal(observed.cleanupIssued, fault === "none" || fault === "unknown-provision" || fault === "after-rename" ? true : undefined);
       assert.deepEqual(cold.listWorkspaceBindings(), ownerImages, "issuance never changes any Workspace or slot");
       assert.deepEqual(observed.inputs, entry.inputs);
       assert.deepEqual(observed.cancelledInputs, entry.cancelledInputs, "no source settlement is fabricated by issuance");
@@ -8579,7 +8632,7 @@ for (const scenario of ["temporary", "bound", "creating", "stale-frame", "owner-
           assert.equal(cold.listWorkspaceBindings()[0]?.target.threadId, 10, "fresh inspection never trusts the cached predecessor projection");
           observed.binding.target.threadId = 999;
           assert.equal(reopened.inspectTemporaryThreadTarget(expected, next)?.kind, "bound");
-        } else assert.deepEqual(observed, { kind: scenario === "temporary" ? "temporary" : "unknown" });
+        } else assert.deepEqual(observed, { kind: scenario === "temporary" || scenario === "unknown-provision" ? "temporary" : "unknown" });
       }
       assert.equal(await readFile(path, "utf8"), before, "no observation adopts, consumes, resets or publishes facts");
       if (!["malformed-row", "malformed-array", "corrupt"].includes(scenario)) {

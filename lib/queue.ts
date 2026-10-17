@@ -1983,13 +1983,18 @@ export interface TelegramAgentEndRuntimeDeps<
   ) => Promise<void>;
   sendGuestReply?: (guestQueryId: string, markdown: string) => Promise<void>;
   /** Replaces the early guest ACK with the final text. */
-  editGuestReply?: (inlineMessageId: string, markdown: string) => Promise<void>;
+  editGuestReply?: (
+    inlineMessageId: string,
+    markdown: string,
+    options?: { assertAuthority?: () => void },
+  ) => Promise<void>;
   /** Cancels the animated guest placeholder before the final edit. */
   stopGuestPlaceholder?: (inlineMessageId: string) => Promise<void>;
   sendGuestAttachment?: (
     turn: TTurn,
     attachment: QueuedAttachment,
     caption?: string,
+    options?: { isDeliveryActive?: () => boolean },
   ) => Promise<void>;
   sendGuestVoiceReply?: (
     turn: TTurn,
@@ -2350,13 +2355,46 @@ export async function handleTelegramAgentEndRuntime<
         });
       }
     }
-    if (turn.guestInlineMessageId && deps.editGuestReply) {
-      const experimentText = assistant.errorMessage
+    if (!isDeliveryActive()) return;
+    if (turn.guestInlineMessageId) {
+      let experimentText = assistant.errorMessage
         ? "Telegram bridge: Pi failed while processing the request."
         : finalText;
+      const [attachment] = turn.queuedAttachments;
+      if (!assistant.errorMessage && attachment) {
+        try {
+          if (!deps.sendGuestAttachment) throw new Error("Guest attachment delivery is unavailable.");
+          await deps.sendGuestAttachment(turn, attachment, finalText || undefined, { isDeliveryActive });
+          if (isDeliveryActive() && endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
+          return;
+        } catch (error) {
+          deps.recordRuntimeEvent?.("delivery", error, {
+            phase: "guest-attachment", guestQueryId: turn.guestQueryId,
+          });
+          if (!isDeliveryActive()) return;
+          if (isTelegramApiCommitUnknownError(error)) {
+            if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
+            return;
+          }
+          experimentText = "Telegram bridge could not deliver the requested attachment. Please retry in a normal bot chat.";
+        }
+      } else if (!assistant.errorMessage && hasOutboundArtifacts) {
+        experimentText = [finalText, "Telegram Guest Mode cannot replace an inline placeholder with a voice note. Please request MP3 audio or use a normal bot chat."].filter(Boolean).join("\n\n");
+      }
+      if (!deps.editGuestReply) {
+        deps.recordRuntimeEvent?.("delivery", new Error("Guest inline reply editing is unavailable."), {
+          phase: "guest-ack-edit", guestQueryId: turn.guestQueryId,
+        });
+        if (endPlan.shouldDispatchNext) deps.dispatchNextQueuedTelegramTurn();
+        return;
+      }
       if (experimentText) {
         try {
-          await deps.editGuestReply(turn.guestInlineMessageId, experimentText);
+          await deps.editGuestReply(turn.guestInlineMessageId, experimentText, {
+            assertAuthority() {
+              if (!isDeliveryActive()) throw new Error("Guest reply edit lost authority.");
+            },
+          });
           deps.recordRuntimeEvent?.(
             "guest",
             new Error("Guest ACK edited the guest answer"),
@@ -2401,6 +2439,7 @@ export async function handleTelegramAgentEndRuntime<
           turn,
           guestAttachment,
           finalText || undefined,
+          { isDeliveryActive },
         );
       } catch (error) {
         deps.recordRuntimeEvent?.("delivery", error, {

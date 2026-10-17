@@ -1267,14 +1267,31 @@ export function createTelegramBridgeApiRuntime(deps) {
             const sent = await callRecorded("answerGuestQuery", buildTelegramAnswerGuestQueryBody(guestQueryId, text, options));
             return sent?.inline_message_id;
         },
-        editGuestInlineMessage: async (inlineMessageId, content) => {
+        editGuestInlineMessage: async (inlineMessageId, content, options) => {
+            if (content.media) {
+                try {
+                    const result = await callRecorded("editMessageMedia", {
+                        inline_message_id: inlineMessageId,
+                        media: content.media,
+                    }, { ...options, maxAttempts: 1, retryRateLimit: false });
+                    if (result !== true)
+                        throw new Error("Missing inline edit acknowledgement.");
+                }
+                catch (error) {
+                    // Only a parsed rejection permits replacing this attempt with a failure notice.
+                    if (isTelegramApiRequestRejected(error, "editMessageMedia"))
+                        throw error;
+                    throw new TelegramApiCommitUnknownError("editMessageMedia", error);
+                }
+                return;
+            }
             await callRecorded("editMessageText", {
                 inline_message_id: inlineMessageId,
                 ...(content.richMessage
                     ? { rich_message: content.richMessage }
                     : { text: content.text }),
                 ...(content.parseMode ? { parse_mode: content.parseMode } : {}),
-            });
+            }, options);
         },
         prepareTempDir: () => prepareTelegramTempDir(deps.tempDir, deps.tempFileMaxAgeMs),
         deleteMessage: (chatId, messageId) => callRecorded("deleteMessage", {

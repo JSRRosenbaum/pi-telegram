@@ -1667,7 +1667,7 @@ export function createTelegramCommandHandler(deps) {
         const captured = { ...deps }, parsed = { ...command }, message = parsed.name === "status"
             ? copySelectedMenuCarrier(original)
             : copySelectedReplyAnchor(original);
-        const assertRecipientCurrent = admission.assertRecipientCurrent, report = admission.reportCompleted;
+        const assertRecipientCurrent = admission.assertRecipientCurrent, report = admission.reportCompleted, beforeEffects = admission.beforeEffects;
         const effects = parsed.name === "status"
             ? undefined
             : {
@@ -1693,8 +1693,13 @@ export function createTelegramCommandHandler(deps) {
                 throw new Error(`Selected ${parsed.name} plan owner is unavailable.`);
         };
         return issueSelectedOnce(assertCurrent, async () => {
-            if (plan.completion === "before-effect" && !report.call(admission))
-                return false;
+            if (plan.completion === "before-effect") {
+                if (!report.call(admission))
+                    return false;
+                if (beforeEffects)
+                    await beforeEffects();
+                assertRecipientCurrent();
+            }
             return prepared.run({
                 message,
                 command: parsed,
@@ -1720,7 +1725,7 @@ export function createTelegramCommandHandler(deps) {
             ...copySelectedReplyAnchor(original),
             from: { ...original.from },
         };
-        const assertRecipientCurrent = admission.assertRecipientCurrent, reportCompleted = admission.reportCompleted;
+        const assertRecipientCurrent = admission.assertRecipientCurrent, reportCompleted = admission.reportCompleted, beforeEffects = admission.beforeEffects;
         const assertAdmissionCurrent = createSelectedSemanticGuard(admission, () => captured.assertExecutionCurrent?.(original), false);
         const assertSemanticCurrent = () => {
             assertAdmissionCurrent();
@@ -1732,7 +1737,7 @@ export function createTelegramCommandHandler(deps) {
             persistAllowedUserId: async () => {
                 throw new Error(`Selected ${name} cannot acquire pairing authority.`);
             },
-        }, { assertSemanticCurrent, assertRecipientCurrent, reportCompleted }));
+        }, { assertSemanticCurrent, assertRecipientCurrent, reportCompleted, beforeEffects }));
     };
     const prepareSelectedConfirmation = (name) => (command, messages, ctx, admission) => {
         const original = messages[0], captured = { ...deps };
@@ -2036,7 +2041,7 @@ export function createTelegramCommandHandler(deps) {
                 typeof admission.reportCompleted !== "function")
                 return undefined;
             const assertSourceCurrent = admission.assertSourceCurrent, assertRecipientCurrent = admission.assertRecipientCurrent;
-            const reportCompleted = admission.reportCompleted, assertExecutionCurrent = deps.assertExecutionCurrent;
+            const reportCompleted = admission.reportCompleted, beforeEffects = admission.beforeEffects, assertExecutionCurrent = deps.assertExecutionCurrent;
             const assertIssuanceCurrent = () => {
                 assertSourceCurrent.call(admission);
                 assertExecutionCurrent?.call(deps, original);
@@ -2060,8 +2065,14 @@ export function createTelegramCommandHandler(deps) {
                 openSettingsMenu: menuDeps.openSettingsMenu &&
                     ((value, context) => menuDeps.openSettingsMenu(value, context, recipientOptions)),
             };
-            return issueSelectedOnce(assertIssuanceCurrent, async () => reportCompleted.call(admission) &&
-                handleTelegramCommandRuntime(name, message, ctx, recipientDeps, args));
+            return issueSelectedOnce(assertIssuanceCurrent, async () => {
+                if (!reportCompleted.call(admission))
+                    return false;
+                if (beforeEffects)
+                    await beforeEffects();
+                assertRecipientCurrent();
+                return handleTelegramCommandRuntime(name, message, ctx, recipientDeps, args);
+            });
         },
     });
 }
@@ -2157,6 +2168,8 @@ async function handleTelegramHelpCommand(commandName, message, ctx, deps, admiss
         assertSemanticCurrent();
         if (!admission.reportCompleted())
             return false;
+        if (admission.beforeEffects)
+            await admission.beforeEffects();
         admission.assertRecipientCurrent();
     }
     const assertEffectCurrent = admission?.assertRecipientCurrent ??

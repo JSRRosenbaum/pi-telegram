@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.57.1: Guest Media and Routing Cleanup
+
+- `Guest attachments`: Queued photos, documents and MP3 audio now replace the acknowledged Guest Mode placeholder instead of being silently skipped. Upload failures and confirmed edit rejections report errors; uncertain edits are not replayed or overwritten. OGG/Opus attachments are rejected before queueing on this path, and voice markup explains the limitation. Live-client media acceptance remains a deferred follow-up. Fixes #346.
+- `Routing cleanup`: Exhausted Reroute tabs and a restored instance's old tab are no longer blocked by unrelated creation attempts with unknown targets. Uncertain creation records stay intact; binding, slot, owner and concrete or recovered target conflicts still protect. Temporary cleanup can recover whole historical receipts from proven-dead owners; live/unverifiable owners, handoff offers and damaged sources remain protected. Idle leader Reroute and Restore passed operator live checks.
+- `Command ordering`: Fresh local menu Reroute waits for exact source removal and a temporary-tab cleanup attempt before rendering. Restore confirms the new binding, decides old-tab cleanup, then releases held input. Busy work retains protection, and uncertain deletion never repeats. Other Reroute commands, follower delivery and sources without fresh completion readiness retain their existing paths.
+
 ## 0.57.0: Thread Continuity and Shared Settings
 
 - `Config`: Thread display now lives in shared top-level `threads.displayMode`, beside the other Settings preferences; profiles hold only bot identity and the paired owner. The old `profiles.<name>.threadDisplayMode` key is not migrated and is ignored, so configs without the new key use the Letters default until Settings saves a choice.

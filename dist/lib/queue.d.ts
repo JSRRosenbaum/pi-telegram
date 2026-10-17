@@ -506,10 +506,14 @@ export interface TelegramAgentEndRuntimeDeps<TTurn extends PendingTelegramTurn, 
     }) => Promise<void>;
     sendGuestReply?: (guestQueryId: string, markdown: string) => Promise<void>;
     /** Replaces the early guest ACK with the final text. */
-    editGuestReply?: (inlineMessageId: string, markdown: string) => Promise<void>;
+    editGuestReply?: (inlineMessageId: string, markdown: string, options?: {
+        assertAuthority?: () => void;
+    }) => Promise<void>;
     /** Cancels the animated guest placeholder before the final edit. */
     stopGuestPlaceholder?: (inlineMessageId: string) => Promise<void>;
-    sendGuestAttachment?: (turn: TTurn, attachment: QueuedAttachment, caption?: string) => Promise<void>;
+    sendGuestAttachment?: (turn: TTurn, attachment: QueuedAttachment, caption?: string, options?: {
+        isDeliveryActive?: () => boolean;
+    }) => Promise<void>;
     sendGuestVoiceReply?: (turn: TTurn, plan: TelegramAgentEndOutboundReplyPlan<TReplyMarkup>, caption?: string) => Promise<void>;
     planOutboundReply?: (markdown: string) => TelegramAgentEndOutboundReplyPlan<TReplyMarkup>;
     sendOutboundReplyArtifacts?: (turn: TTurn, plan: TelegramAgentEndOutboundReplyPlan, options?: {

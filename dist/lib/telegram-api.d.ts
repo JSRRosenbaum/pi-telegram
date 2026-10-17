@@ -343,6 +343,12 @@ export interface TelegramAnswerGuestQueryOptions {
     result?: TelegramGuestCachedMediaResult;
 }
 export interface TelegramEditGuestInlineMessageContent {
+    /** Cached media only: inline edits cannot upload a new local file. */
+    media?: {
+        type: "photo" | "document" | "audio";
+        media: string;
+        caption?: string;
+    };
     text?: string;
     richMessage?: TelegramInputRichMessage;
     parseMode?: "HTML";
@@ -465,13 +471,12 @@ export interface TelegramBridgeApiRuntime extends Pick<TelegramApiClient, "call"
     answerCallbackQuery: (callbackQueryId: string, text?: string, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     answerGuestQuery: (guestQueryId: string, text?: string, options?: TelegramAnswerGuestQueryOptions) => Promise<void>;
     /**
-     * Temporary Guest Mode ACK experiment: answers the guest query and returns
-     * the sent inline message id so the final answer can edit that early reply.
-     * Requires direct transport ownership; Telegram does not document editing
-     * guest answers, so this exists only to falsify that behavior live.
+     * Answers the guest query and retains the sent inline message id for final
+     * text or cached-media replacement. Requires direct transport ownership;
+     * actual guest-media rendering remains live-client gated.
      */
     answerGuestQueryForInlineMessage: (guestQueryId: string, text?: string, options?: TelegramAnswerGuestQueryOptions) => Promise<string | undefined>;
-    editGuestInlineMessage: (inlineMessageId: string, content: TelegramEditGuestInlineMessageContent) => Promise<void>;
+    editGuestInlineMessage: (inlineMessageId: string, content: TelegramEditGuestInlineMessageContent, options?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<void>;
     deleteMessage: (chatId: number, messageId: number) => Promise<void>;
     prepareTempDir: () => Promise<number>;
 }

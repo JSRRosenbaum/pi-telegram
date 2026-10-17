@@ -536,9 +536,10 @@ export function createTelegramBusAwareApiRuntime(
     editGuestInlineMessage(
       inlineMessageId: string,
       content: TelegramEditGuestInlineMessageContent,
+      options?: Pick<TelegramApiCallOptions, "assertAuthority">,
     ): Promise<void> {
       return deps.ownsDirect()
-        ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content)
+        ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content, options)
         : rejectTelegramDirectOwnership("editGuestInlineMessage");
     },
     async deleteMessage(chatId: number, messageId: number): Promise<void> {

@@ -2706,7 +2706,7 @@ for (const fault of ["clear", "local-model", "tools", "messages", "control", "di
         resume.resolve();
         const observation = await task;
         const rejected = early || ["admission-context", "after-context", "after-generation", "after-session", "after-epoch", "after-operator", "after-profile", "after-local", "after-canonical", "after-port"].includes(fault) ||
-          (mode === "cleanup" && ["command-render", "command-api", "command-unknown", "local-model", "tools", "messages", "control", "dispatch", "compaction", "admission-work", "old-active", "old-queue", "publication", "logical-delivery", "api-chat", "unknown-queue", "unstarted", "after-work", "after-delivery", "after-claim", "admission-claim", "after-veto-port", "veto-unknown", "after-provision"].includes(fault));
+          (mode === "cleanup" && ["command-render", "command-api", "command-unknown", "local-model", "tools", "messages", "control", "dispatch", "compaction", "admission-work", "old-active", "old-queue", "publication", "logical-delivery", "api-chat", "unknown-queue", "unstarted", "after-work", "after-delivery", "after-claim", "admission-claim", "after-veto-port", "veto-unknown"].includes(fault));
         // Issuance finishes inside admission, so a change after admission cannot revoke the issued deletion or its record.
         const issueNotReady = ["command-render", "command-api", "command-unknown", "local-model", "tools", "messages", "control", "dispatch", "compaction",
           "admission-work", "old-active", "old-queue", "publication", "logical-delivery", "api-chat", "unknown-queue", "unstarted", "admission-claim", "veto-unknown"].includes(fault);
@@ -7697,7 +7697,7 @@ type AllCommandScenario = (typeof ALL_COMMAND_SCENARIOS)[keyof typeof ALL_COMMAN
   "visibility-local" | "visibility-follower-ipc-worker" | "visibility-follower-ipc-worker-lost-reply";
 
 function createAllCommandFixture(scenario: AllCommandScenario,
-  { threads, open, path }: Parameters<Parameters<typeof fixture>[0]>[0], journalPath = `${path}.all`, expiryClock?: () => number) {
+  { threads, open, path }: Parameters<Parameters<typeof fixture>[0]>[0], journalPath = `${path}.all`, expiryClock?: () => number, commandText?: string) {
   const asFollower = scenario.includes("-follower"), realIpc = scenario.includes("-ipc"), drainRecipient = scenario.includes("-worker"), loseDeliveryReply = scenario.includes("-lost-reply");
   const restoreReplyBoundary = scenario === "restore-sibling-follower-ipc-apply-before-reply" ? "before" :
     scenario === "restore-sibling-follower-ipc-apply-after-reply" || scenario === "restore-sibling-follower-ipc-inspect-after-reply" ? "after" : undefined;
@@ -7729,7 +7729,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     scenario === "membership-media-group" || scenario === "membership-text-real-gate" || scenario === "forward-prompt-then-cancel";
   const appendOriginal = () => journal.appendBatch([{ update_id: 123, message: { message_id: 12,
     date: Math.floor(Date.now() / 1000) - (expired ? 7200 : 0), chat: { id: 7, type: "private" },
-    from: { id: scenario === "foreign-sender" ? 8 : 7, is_bot: false }, text: queuedCommand ? "/continue" : scenario === "restore-local-compact" ? "/compact" : "/start" } }]);
+    from: { id: scenario === "foreign-sender" ? 8 : 7, is_bot: false }, text: commandText ?? (queuedCommand ? "/continue" : scenario === "restore-local-compact" ? "/compact" : "/start") } }]);
   if (!arrivesLive) appendOriginal();
   const store = open();
   let acceptancePublications = 0, queuePublicationFault = scenario === "restore-queue-cold";
@@ -7975,7 +7975,7 @@ function createAllCommandFixture(scenario: AllCommandScenario,
     ...(expiryClock ? { getNowMs: expiryClock, spendHistoricalInput: true,
       expireRoutingInput: (source, ctx, signal) => harness.routeRuntime.expireRoutingInput(source, ctx, signal) } : {}),
     ...(reviewHistorical ? { shouldReviewHistoricalInput: (entry, ctx, signal) => harness.routeRuntime.shouldReviewHistoricalInput(entry, ctx, signal) } : {}), getJournalBindingKey: () => bindingKey, hasAuthority: () => true,
-    getQueueOwnerIdentity: queueOwnedRestore ? () => ({ instanceId: "old", processId: process.pid,
+    getQueueOwnerIdentity: queueOwnedRestore || commandText !== undefined ? () => ({ instanceId: "old", processId: process.pid,
       processBirthId: `${process.pid}:temp-queue`, sessionGeneration: 1 }) : undefined,
     beforeQueueReceiptPublished: queueOwnedRestore ? harness.routeRuntime.beforeQueueReceiptPublished : undefined,
     onQueueReceiptCommitted: queueOwnedRestore ? (receipt, ctx) => harness.routeRuntime.onQueueReceiptCommitted(receipt, ctx) : undefined,
@@ -8125,6 +8125,142 @@ function createAllCommandFixture(scenario: AllCommandScenario,
   };
 }
 type AllCommandFixture = ReturnType<typeof createAllCommandFixture>;
+
+for (const scenario of ["clear", "unrelated-ambiguous", "busy-ambiguous", "delete-unknown"] as const) {
+  test(`All /start Restore keeps its new tab and disposes only the old binding before menu release (${scenario})`, async () => {
+    await fixture(async frame => {
+      const pending: Threads.TelegramThreadPendingProvision = { id: "other-create", owner: "manual-follower",
+        instanceId: "other", workspaceBindingKey: "other-binding", slot: "X", status: "ambiguous", startedAtMs: 1 };
+      if (scenario !== "clear") { frame.threads.upsertPendingProvision(pending); await frame.threads.persist(); }
+      const f = createAllCommandFixture("cancel", frame, undefined, undefined, "/start");
+      let identity: Parameters<NonNullable<RouteHarnessOptions["setCurrentLeaderIdentity"]>>[0] = { target: { chatId: 7, threadId: 10 }, slot: "A", threadName: "Amber" };
+      const calls: string[] = [];
+      const originalApi = f.harness.routingDeps.callApi!;
+      const publication = Activity.createTelegramActivityPublicationRuntime();
+      let observe: ReturnType<typeof Bindings.createTelegramLiveTargetWorkObserver<TestContext>>;
+      f.harness = f.createHarness({
+        hasWorkspaceRestoreAuthority: () => true, hasWorkspaceLiveRebindAuthority: () => true,
+        canUsePreDispatchRebind: () => true,
+        liveRebindCommandCompletionTimeoutMs: 100,
+        liveRebindCleanupSchedule: { delaysMs: [1], intervalMs: 10, windowMs: 30 },
+        beginCommandEffectWork: publication.beginWork,
+        setCurrentLeaderIdentity(value) { identity = structuredClone(value); calls.push("binding"); },
+        workspaceRestoreRecipient: { getSessionId: () => "session", getCwd: () => "/repo", getLeaderIdentity: () => identity,
+          followerRegistry: Bus.createTelegramBusFollowerRegistry(), async runFollower() { assert.fail("Local Restore cannot use follower delivery"); },
+          observeLeaderWork: (target, ctx) => observe(target, ctx) },
+        async sendStatusMessage() { calls.push("menu"); assert.equal(identity.target.threadId, 55); },
+        async callApi<T>(method: string, body: Record<string, unknown>, options?: Parameters<typeof originalApi>[2]) {
+          if (method === "deleteForumTopic") {
+            assert.equal(body.message_thread_id, 10, "Restore must never delete its new tab");
+            assert.equal(frame.store.listLiveRebindings()[0]?.inputRelease, "held");
+            assert.equal(frame.store.listLiveRebindings()[0]?.cleanup, "issued");
+            assert.ok(f.journal.read().entries.some(entry => entry.updateId === 123), "The command stays held during deletion");
+            assert.deepEqual(frame.threads.listWorkspaceBindings()[0]?.target, { chatId: 7, threadId: 55 });
+            assert.equal(calls.includes("menu"), false);
+            calls.push("delete");
+            options?.assertAuthority?.();
+            if (scenario === "delete-unknown") throw new Error("Fixture delete response lost");
+          }
+          return originalApi<T>(method, body, options);
+        },
+      });
+      observe = Bindings.createTelegramLiveTargetWorkObserver({ queue: f.harness.telegramQueueStore,
+        activeTurn: f.harness.activeTurnRuntime, lifecycle: f.harness.bridgeRuntime.lifecycle,
+        isIdle: () => scenario !== "busy-ambiguous", hasPendingMessages: () => false, hasPendingControl: () => false,
+        publication, activity: { hasPending: () => false }, delivery: { hasPendingTarget: () => false }, api: { hasPendingTarget: () => false } });
+      f.worker = f.createWorker();
+      try {
+        await f.start();
+        const chooser = f.routeOf(0).split(":")[1];
+        await f.click(`rerouterestore:${chooser}`);
+        await f.click(`reroutenew:${chooser}:10`);
+        assert.deepEqual(calls, scenario === "busy-ambiguous" ? ["binding", "menu"] : ["binding", "delete", "menu"], f.diagnose());
+        assert.deepEqual(frame.threads.listWorkspaceBindings()[0]?.target, { chatId: 7, threadId: 55 });
+        assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), false);
+        if (scenario !== "clear") assert.deepEqual(frame.threads.listPendingProvisions(), [pending]);
+        const retained = frame.store.listLiveRebindings()[0];
+        if (scenario === "delete-unknown") assert.equal(retained?.cleanup, "unknown");
+        else if (scenario !== "busy-ambiguous") assert.equal(retained?.cleanup, "confirmed");
+        await f.click(`reroutenew:${chooser}:10`);
+        assert.equal(calls.filter(call => call === "menu").length, 1);
+        assert.equal(calls.filter(call => call === "delete").length, scenario === "busy-ambiguous" ? 0 : 1);
+      } finally { await f.stop(); }
+    }, "leader");
+  });
+}
+
+for (const boundary of ["sibling", "delete-unknown", "recipient-lost", "completion-before", "completion-after"] as const) {
+  test(`Temporary Reroute menu acceptance remains one-shot across ${boundary}`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("cancel", frame, undefined, undefined, "/start");
+      const callApi = f.harness.routingDeps.callApi!;
+      let menus = 0, deletions = 0;
+      f.harness = f.createHarness({
+        liveRebindCommandCompletionTimeoutMs: 10,
+        async sendStatusMessage() { menus++; },
+        async callApi<TResponse>(method: string, body: Record<string, unknown>, options?: Parameters<typeof callApi>[2]) {
+          const deleting = method === "deleteForumTopic" && body.message_thread_id === 55;
+          if (deleting) {
+            deletions++;
+            assert.equal(menus, 0, "Execution stays held while deletion is in flight");
+            await new Promise(resolve => setTimeout(resolve, 2));
+            assert.equal(menus, 0);
+          }
+          const result = await callApi<TResponse>(method, body, options);
+          if (deleting && boundary === "delete-unknown") throw new Error("Fixture lost delete acknowledgement");
+          if (deleting && boundary === "recipient-lost") f.temporaryAuthority = false;
+          return result;
+        },
+      });
+      const sourceJournal = boundary.startsWith("completion-") ? { ...f.journal,
+        removeCompletedExact(...input: Parameters<NonNullable<typeof f.journal.removeCompletedExact>>) {
+          if (boundary === "completion-after") f.journal.removeCompletedExact!(...input);
+          throw new Error("Fixture lost source-removal acknowledgement");
+        },
+      } : f.journal;
+      f.worker = f.createWorker(false, sourceJournal);
+      try {
+        await f.start();
+        if (boundary === "sibling") await f.typeInTab(150, "independent pending input");
+        await f.click(f.routeOf(0));
+        assert.equal(menus, boundary === "sibling" || boundary === "delete-unknown" ? 1 : 0);
+        assert.equal(deletions, boundary === "delete-unknown" || boundary === "recipient-lost" ? 1 : 0);
+        assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), boundary === "completion-before");
+        if (boundary === "sibling") assert.equal(f.journal.read().entries.find(entry => entry.updateId === 150)?.state, "pending");
+        if (deletions) assert.equal(f.store.listTemporaryThreads()[0]?.cleanupIssued, true, "Uncertain cleanup retains its one-shot grant");
+        const before = { menus, deletions };
+        await f.click(f.routeOf(0));
+        assert.deepEqual({ menus, deletions }, before, "Repeated controls cannot replay acceptance, effects or deletion");
+      } finally { await f.stop(); }
+    });
+  });
+}
+
+for (const command of ["start", "help", "status", "model", "thinking", "queue", "settings"] as const) {
+  test(`Temporary Reroute settles source and deletes its tab before local /${command} menu execution`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("cancel", frame, undefined, undefined, `/${command}`);
+      const observations: number[] = [];
+      const observeMenu = async () => {
+        observations.push(f.deletions().length);
+        assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), false);
+      };
+      f.harness = f.createHarness({
+        menuActions: { ...f.harness.routingDeps.menuActions, sendStatusMessage: observeMenu,
+          openModelMenu: observeMenu, openThinkingMenu: observeMenu },
+        openQueueMenu: observeMenu, openSettingsMenu: observeMenu,
+      });
+      f.worker = f.createWorker();
+      try {
+        await f.start();
+        await f.click(f.routeOf(0));
+        assert.deepEqual(observations, [1], `The accepted destination command must not render before source cleanup: ${JSON.stringify(f.harness.events)}`);
+        await f.click(f.routeOf(0));
+        assert.deepEqual(observations, [1], "A repeated chooser cannot execute the accepted command twice");
+      } finally { await f.stop(); }
+    });
+  });
+}
 
 for (const mode of ["unselected", "restart", "cold-leader", "multiple-choosers", "partial-cohort", "metadata-before", "metadata-after", "metadata-permanent", "expiry-delete-unknown", "lost-forward", "lost-restore", "restore-queued", "independent-work"] as const) {
   test(`Chooser expiry ends donor custody without archiving or cancelling recipient work (${mode})`,
@@ -8392,6 +8528,102 @@ for (const mode of ["new-world", "last-cancel"] as const) for (const fault of ["
       if (ownerJournal) assert.deepEqual(ownerJournal.read().entries, ownerOriginals, "Whole receipt, owner/acquisition and handoff stay exact without disposition or replay");
       if (fault === "unclassified") assert.equal(await readFile(unknown, "utf8"), "unclassified source");
       await f.threads.load(); assert.deepEqual(f.threads.listWorkspaceBindings(), bindings, "Cleanup changes no Workspace binding");
+    });
+  });
+}
+
+for (const ownerState of ["dead", "dead-ambiguous", "alive-ambiguous", "alive", "unverifiable", "revived", "offered", "authority-lost", "corrupt", "missing-reference"] as const) {
+  test(`Completed command Reroute rechecks historical queue custody before temporary cleanup (${ownerState})`, async () => {
+    await fixture(async frame => {
+      const agentDir = join(await realpath(dirname(frame.path)), "agent");
+      const directory = Paths.resolveTelegramTempDir(agentDir);
+      const pollingPath = Paths.resolveTelegramSessionPollingJournalPath("leader", agentDir);
+      const historical = Paths.resolveTelegramSessionJournalPath("predecessor", "manual:recipient", agentDir);
+      const botIdentity = Journal.createTelegramUpdateJournalBotIdentity({ botToken: "fixture:all" });
+      const key = (path: string) => Journal.createTelegramUpdateJournalBindingKey({ path, botIdentity });
+      const old = Journal.createTelegramUpdateJournalStore({ path: historical, botIdentity });
+      old.appendBatch([300, 301].map(update_id => ({ update_id, message: {
+        message_id: update_id, message_thread_id: 999, chat: { id: 7, type: "private" },
+        from: { id: 7, is_bot: false }, text: "historical prompt",
+      } })));
+      old.markQueued({ queueKind: "prompt", receiptId: "historical", sourceUpdateIds: [300, 301],
+        owner: { instanceId: "old", processId: 999999, processBirthId: "old-birth", sessionGeneration: 1 } });
+      if (ownerState === "offered") old.offerQueuedHandoff({
+        queueKind: "prompt", receiptId: "historical", sourceUpdateIds: [300, 301],
+        expectedOwner: old.read().entries[0]!.queueOwner!,
+        recipientOwner: { instanceId: "recipient", processId: 999998, processBirthId: "recipient-birth", sessionGeneration: 1 },
+        handoffToken: Journal.createTelegramUpdateQueueHandoffToken(),
+      });
+      const original = old.read().entries;
+      const references = Journal.createTelegramUpdateJournalReferenceRegistry();
+      const serialize = Journal.createTelegramJournalSourceSerialization(() => join(agentDir, "journals.transaction"));
+      let active = true, livenessCalls = 0, recovered = 0;
+      const input = (target: Queue.TelegramQueueTarget, requiredJournalBindingKeys: readonly string[], ownInputs?: readonly Threads.TelegramTemporaryThreadInput[]) => ({
+        directory, profile: "default", botIdentity, pollingPath,
+        requiredJournalBindingKeys: ownerState === "missing-reference"
+          ? [...requiredJournalBindingKeys, key(Paths.resolveTelegramSessionJournalPath("missing", "manual:missing", agentDir))]
+          : requiredJournalBindingKeys,
+        cleanup: { target: { chatId: target.chatId, threadId: target.threadId! }, ownInputs: ownInputs ?? [] },
+        limits: { maxDirectoryEntries: 10000, maxFiles: 4096, maxBytes: 64 * 1024 * 1024, maxEntries: 10000, maxWork: 100000 },
+        withSourceReference<T>(path: string, operation: () => T): T {
+          return references.withReference({ referenceClass: "operator-disposition", recoveryKey: key(path) }, operation);
+        },
+      });
+      const ambiguous = ownerState.endsWith("-ambiguous");
+      const canRecover = ownerState === "dead" || ownerState === "dead-ambiguous";
+      const unresolvedProvision: Threads.TelegramThreadPendingProvision = {
+        id: "unrelated-create", owner: "manual-follower", instanceId: "unrelated-instance",
+        status: "ambiguous", startedAtMs: 1, slot: "X", threadName: "Xenon",
+      };
+      if (ambiguous) {
+        frame.threads.upsertPendingProvision(unresolvedProvision);
+        await frame.threads.persist();
+      }
+      const f = createAllCommandFixture("cancel", frame, pollingPath, undefined, "/start");
+      const menuObservations: number[] = [];
+      f.harness = f.createHarness({
+        async sendStatusMessage() { menuObservations.push(f.deletions().length); },
+        inspectTemporaryThreadSources: (target, required, own) => serialize(() =>
+          Journal.isTelegramThreadCleanupJournalNamespaceClear(input(target, required, own)) ? [] : undefined),
+        recoverTemporaryThreadDeadQueueOwners: (target, required, own, current) => {
+          const removed = Journal.recoverTelegramThreadCleanupDeadQueueOwners({
+            ...input(target, required, own), isCurrent: () => active && current(),
+            withSourceSerialization: serialize,
+            recoveryOwner: { instanceId: "current", processId: process.pid, processBirthId: "current-birth", sessionGeneration: 1 },
+            getQueueProcessLiveness() {
+              livenessCalls++;
+              if (ownerState === "authority-lost") active = false;
+              if (ownerState === "corrupt") writeFileSync(historical, "malformed");
+              return ownerState === "alive" || ownerState === "alive-ambiguous" || ownerState === "revived" && livenessCalls > 1 ? "alive"
+                : ownerState === "unverifiable" ? "unverifiable" : "dead";
+            },
+          });
+          recovered += removed;
+          return removed;
+        },
+      });
+      f.worker = f.createWorker();
+      try {
+        await f.start();
+        await f.click(f.routeOf(0));
+        await f.harness.routeRuntime.waitForRestoreSettlement();
+        assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), false, "The original command completed");
+        assert.equal(f.deletions().length, canRecover ? 1 : 0, f.diagnose());
+        assert.equal(recovered, canRecover ? 2 : 0);
+        assert.deepEqual(menuObservations, [canRecover ? 1 : 0], "The live menu runs after the cleanup attempt");
+        if (ambiguous) {
+          await frame.threads.load();
+          assert.deepEqual(frame.threads.listPendingProvisions(), [unresolvedProvision], "The unrelated uncertain creation is never reset or deleted");
+        }
+        if (canRecover) {
+          assert.deepEqual(old.read().entries, []);
+          assert.equal(f.store.listTemporaryThreads().length, 0);
+          assert.ok(livenessCalls >= 2, "Preflight and journal CAS each prove death");
+        } else if (ownerState === "corrupt") {
+          assert.equal(await readFile(historical, "utf8"), "malformed", "Strict recovery must never repair or reset");
+        } else assert.deepEqual(old.read().entries, original, "Protected receipt remains unchanged");
+        assert.deepEqual(references.list(), []);
+      } finally { active = false; await f.stop(); }
     });
   });
 }

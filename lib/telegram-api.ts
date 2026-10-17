@@ -473,6 +473,8 @@ export interface TelegramAnswerGuestQueryOptions {
 }
 
 export interface TelegramEditGuestInlineMessageContent {
+  /** Cached media only: inline edits cannot upload a new local file. */
+  media?: { type: "photo" | "document" | "audio"; media: string; caption?: string };
   text?: string;
   richMessage?: TelegramInputRichMessage;
   parseMode?: "HTML";
@@ -917,10 +919,9 @@ export interface TelegramBridgeApiRuntime extends Pick<
     options?: TelegramAnswerGuestQueryOptions,
   ) => Promise<void>;
   /**
-   * Temporary Guest Mode ACK experiment: answers the guest query and returns
-   * the sent inline message id so the final answer can edit that early reply.
-   * Requires direct transport ownership; Telegram does not document editing
-   * guest answers, so this exists only to falsify that behavior live.
+   * Answers the guest query and retains the sent inline message id for final
+   * text or cached-media replacement. Requires direct transport ownership;
+   * actual guest-media rendering remains live-client gated.
    */
   answerGuestQueryForInlineMessage: (
     guestQueryId: string,
@@ -930,6 +931,7 @@ export interface TelegramBridgeApiRuntime extends Pick<
   editGuestInlineMessage: (
     inlineMessageId: string,
     content: TelegramEditGuestInlineMessageContent,
+    options?: Pick<TelegramApiCallOptions, "assertAuthority">,
   ) => Promise<void>;
   deleteMessage: (chatId: number, messageId: number) => Promise<void>;
   prepareTempDir: () => Promise<number>;
@@ -2404,14 +2406,29 @@ export function createTelegramBridgeApiRuntime(
     editGuestInlineMessage: async (
       inlineMessageId: string,
       content: TelegramEditGuestInlineMessageContent,
+      options?: Pick<TelegramApiCallOptions, "assertAuthority">,
     ) => {
+      if (content.media) {
+        try {
+          const result = await callRecorded("editMessageMedia", {
+            inline_message_id: inlineMessageId,
+            media: content.media,
+          }, { ...options, maxAttempts: 1, retryRateLimit: false });
+          if (result !== true) throw new Error("Missing inline edit acknowledgement.");
+        } catch (error) {
+          // Only a parsed rejection permits replacing this attempt with a failure notice.
+          if (isTelegramApiRequestRejected(error, "editMessageMedia")) throw error;
+          throw new TelegramApiCommitUnknownError("editMessageMedia", error);
+        }
+        return;
+      }
       await callRecorded("editMessageText", {
         inline_message_id: inlineMessageId,
         ...(content.richMessage
           ? { rich_message: content.richMessage }
           : { text: content.text }),
         ...(content.parseMode ? { parse_mode: content.parseMode } : {}),
-      });
+      }, options);
     },
     prepareTempDir: () =>
       prepareTelegramTempDir(deps.tempDir, deps.tempFileMaxAgeMs),

@@ -2723,10 +2723,16 @@ function liveRebindOldTargetUnknown(value: TelegramWorkspaceLiveRebindIntent): b
 function retainLiveRebind(value: TelegramWorkspaceLiveRebindIntent): boolean {
   return liveRebindActive(value) || liveRebindOldTargetUnknown(value) || value.oldTargetProtected === true;
 }
-function protectedLiveRebindOldTargets(snapshot: TelegramWorkspaceRestoreSnapshot | undefined): TelegramTarget[] {
+function provisioningProtectionIntents(snapshot: TelegramWorkspaceRestoreSnapshot): readonly Pick<TelegramWorkspaceRestoreIntent, "request">[] {
+  return [...snapshot.operations, ...(snapshot.liveRebindings ?? []).filter(retainLiveRebind)];
+}
+function protectedLiveRebindOldTargetIntents(snapshot: TelegramWorkspaceRestoreSnapshot | undefined): TelegramWorkspaceLiveRebindIntent[] {
   return (snapshot?.liveRebindings ?? []).filter(value =>
     value.oldTargetProtected === true || liveRebindOldTargetUnknown(value) || value.inputRelease !== undefined && value.cleanup === "issued",
-  ).map(value => ({ ...value.request.binding.target }));
+  );
+}
+function protectedLiveRebindOldTargets(snapshot: TelegramWorkspaceRestoreSnapshot | undefined): TelegramTarget[] {
+  return protectedLiveRebindOldTargetIntents(snapshot).map(value => ({ ...value.request.binding.target }));
 }
 function pendingWorkspaceRelocationRequests(
   snapshot: TelegramWorkspaceRestoreSnapshot | undefined,
@@ -2821,10 +2827,11 @@ function assertWorkspaceRestoreBindingProtection(
       throw new Error("Protected Workspace Restore owner target changed.");
     }
   }
-  for (const old of protectedLiveRebindOldTargets(file.workspaceRestore)) {
+  for (const { request } of protectedLiveRebindOldTargetIntents(file.workspaceRestore)) {
+    const old = request.binding.target;
     if (file.workspaceBindings?.some(value => targetMatches(value.target, old)) ||
       file.threads?.some(value => targetMatches(value.target, old) && ["active", "starting", "pending", "probe-required"].includes(value.status)) ||
-      file.pendingProvisions?.some(value => !value.target || targetMatches(value.target, old)) ||
+      file.pendingProvisions?.some(value => conflictsWithWorkspaceRestoreProvision(request, value)) ||
       file.reservations?.some(value => targetMatches(value.target, old)))
       throw new Error("Unknown live cleanup target remains protected.");
   }
@@ -3840,7 +3847,7 @@ export function createTelegramTopicTargetStore(
   };
   const assertRestoreRecoveryProtection = (
     path: string,
-    operations: readonly TelegramWorkspaceRestoreIntent[],
+    operations: readonly Pick<TelegramWorkspaceRestoreIntent, "request">[],
     provisions: readonly TelegramThreadPendingProvision[],
     requireKnownTargets = false,
     recoveryEvidence?: TelegramProvisionRecoveryFile,
@@ -5061,7 +5068,7 @@ export function createTelegramTopicTargetStore(
       assertWorkspaceRestoreBindingProtection(file);
       assertRestoreRecoveryProtection(
         path,
-        file.workspaceRestore!.operations,
+        provisioningProtectionIntents(file.workspaceRestore!),
         file.pendingProvisions ?? [],
       );
       observe({
@@ -5117,7 +5124,7 @@ export function createTelegramTopicTargetStore(
         assertWorkspaceRestoreBindingProtection(file);
         assertRestoreRecoveryProtection(
           path,
-          file.workspaceRestore!.operations,
+          provisioningProtectionIntents(file.workspaceRestore!),
           file.pendingProvisions ?? [],
         );
         const canonical = file.workspaceBindings ?? [],
@@ -5175,9 +5182,9 @@ export function createTelegramTopicTargetStore(
             (row) => currentRow(row) && targetMatches(row.target, old),
           ) ||
           reserved.some((value) => targetMatches(value.target, old)) ||
-          provisions.some(
-            (value) => !value.target || targetMatches(value.target, old),
-          ) ||
+          // Use the same binding/slot/owner/target conflicts as rebind admission. An unrelated unlocated
+          // create must not globally veto cleanup of this exact former binding (nor its issued marker).
+          provisions.some((value) => conflictsWithWorkspaceRestoreProvision(request, value)) ||
           cleanups.some((value) => targetMatches(value.target, old));
         if (
           protectedTarget(
@@ -5390,8 +5397,11 @@ export function createTelegramTopicTargetStore(
           file.reservations?.some((value) =>
             targetMatches(value.target, target),
           ) ||
+          // This exact created frame already proves a separately created routing tab (API ACK or authenticated
+          // implicit creation). An unlocated Workspace create is not its owner; keep that intent unresolved,
+          // but veto a concrete target collision. Generic unknown-target/Restore cleanup keeps its own guards.
           file.pendingProvisions?.some(
-            (value) => !value.target || targetMatches(value.target, target),
+            (value) => !!value.target && targetMatches(value.target, target),
           ) ||
           file.pendingCleanups?.some((value) =>
             targetMatches(value.target, target),
@@ -5557,7 +5567,7 @@ export function createTelegramTopicTargetStore(
                 parseTopicTargetFile(before.file).pendingProvisions ?? [];
               assertRestoreRecoveryProtection(
                 path,
-                before.state.operations,
+                provisioningProtectionIntents(before.state),
                 provisions,
               );
               const after = { ...before.file, workspaceRestore: next };
@@ -5573,7 +5583,7 @@ export function createTelegramTopicTargetStore(
                   return false;
                 assertRestoreRecoveryProtection(
                   path,
-                  [...before.state.operations, ...next.operations],
+                  [...provisioningProtectionIntents(before.state), ...provisioningProtectionIntents(next)],
                   provisions,
                 );
                 committedBefore = before;
@@ -5598,7 +5608,7 @@ export function createTelegramTopicTargetStore(
                     );
                   assertRestoreRecoveryProtection(
                     path,
-                    [...before.state.operations, ...next.operations],
+                    [...provisioningProtectionIntents(before.state), ...provisioningProtectionIntents(next)],
                     provisions,
                   );
                   if (!currentScope() || !isCurrent()) return;
@@ -6775,7 +6785,7 @@ export function createTelegramTopicTargetStore(
           conflictsWithWorkspaceRestoreProvision(request, provision),
         ) ||
         conflictsWithTemporaryThread(workspaceRestore, provision.target) ||
-        protectedLiveRebindOldTargets(workspaceRestore).some(old => !provision.target || targetMatches(old, provision.target))
+        protectedLiveRebindOldTargetIntents(workspaceRestore).some(({ request }) => conflictsWithWorkspaceRestoreProvision(request, provision))
       ) {
         throw new Error("Protected Workspace Restore provisioning conflict.");
       }

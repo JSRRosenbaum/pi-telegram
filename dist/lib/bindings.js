@@ -657,7 +657,7 @@ export function registerTelegramCommandsAndTools({ pi, agentDir, configStore, pe
         },
     });
 }
-export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onSteerTurnEnd, onPromptHandedOff, answerGuestQuery, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive = () => true, getSessionGeneration, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }) {
+export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, activityRuntime, activityVerbosityRuntime, diagnostics, assistantOutputRuntime, sessionLifecycleRuntime, configStore, abort, typing, lifecycle, activeTurnRuntime, telegramQueueStore, modelSwitchController, previewRuntime, promptDispatchRuntime, deferredQueueDispatchRuntime, modelContextAvailabilityRuntime, disconnectOnQuit, onSessionStarted, shutdownGenerativeAppLiveSurfaces, resolveAutomaticThreadCleanupEnabled, buttonActionStore, callMultipart, sendChatAction, sendRecordVoiceAction, sendMarkdownReply, sendTextReply, dispatchNextQueuedTelegramTurn, onSteerTurnEnd, onPromptHandedOff, answerGuestQuery, editGuestInlineMessage, deleteMessage, sendGuestReply, editGuestReply, stopGuestPlaceholder, preparePreviewDelivery, finalizeMarkdownPreview, proactivePushTargetGetter, getAssistantRenderingMode, recordMessageOwnership, canSendAgentActivity, isSessionContextActive = () => true, getSessionGeneration, isTurnTransportActive, updateStatus, recordRuntimeEvent, onSessionSettled, }) {
     const agentEndResetter = Runtime.createTelegramAgentEndResetter({
         abort,
         typing,
@@ -677,7 +677,7 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         recordOwnership: recordMessageOwnership,
         recordRuntimeEvent,
     });
-    const sendGuestAttachment = async (turn, attachment, caption) => {
+    const sendGuestAttachment = async (turn, attachment, caption, options) => {
         const stagingTarget = proactivePushTargetGetter();
         const stagingChatId = stagingTarget?.chatId;
         if (stagingChatId === undefined) {
@@ -685,11 +685,19 @@ export function registerTelegramLifecycleRuntimeHooks({ pi, publicationRuntime, 
         }
         await OutboundAttachments.deliverTelegramGuestCachedAttachment({
             guestQueryId: turn.guestQueryId,
+            guestInlineMessageId: turn.guestInlineMessageId,
+            editGuestInlineMessage,
+            isDeliveryActive: options?.isDeliveryActive,
             stagingChatId,
             stagingTarget,
             attachment,
             caption,
-            sendMultipart: callMultipart,
+            sendMultipart: (method, fields, fileField, path, name) => callMultipart(method, fields, fileField, path, name, {
+                assertAuthority() {
+                    if (options?.isDeliveryActive?.() === false)
+                        throw new Error("Guest attachment upload lost authority.");
+                },
+            }),
             answerGuestQuery: (guestQueryId, result) => answerGuestQuery(guestQueryId, undefined, { result }),
             answerGuestText: (guestQueryId, text) => answerGuestQuery(guestQueryId, text),
             fallbackText: caption ||

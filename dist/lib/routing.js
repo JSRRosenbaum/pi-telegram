@@ -4574,6 +4574,100 @@ export function createTelegramInboundRouteRuntime(deps) {
         }
         await promptEnqueue(messages, ctx);
     };
+    /** Local menu acceptance owns a one-shot effect; source removal and cleanup precede its release, never its replay. */
+    const stageTemporaryRerouteMenu = async (pending, command, messages, ctx, assertRecipientCurrent, completion) => {
+        const original = pending.messages[0];
+        const cap = captureTemporaryThreadAuthority(ctx);
+        const temporary = pending.temporaryThread ?? findCreatedTemporaryThread(pending.sourceTarget);
+        if (!cap?.isCurrent() || !temporary)
+            return undefined;
+        let accept, resume;
+        const accepted = new Promise(resolve => { accept = resolve; });
+        const released = new Promise(resolve => { resume = resolve; });
+        const admission = {
+            assertSourceCurrent() {
+                if (!completion.isCurrent())
+                    throw new Error("Rerouted menu source authority changed.");
+            },
+            assertRecipientCurrent,
+            reportCompleted() {
+                const result = completion.reportCompleted();
+                accept(result);
+                return result;
+            },
+            async beforeEffects() {
+                if (!(await released))
+                    throw new Error("Rerouted menu execution was not released.");
+            },
+        };
+        const prepare = command.name === "start" ? commandHandler.prepareSelectedStartCommand
+            : command.name === "help" ? commandHandler.prepareSelectedHelpCommand : commandHandler.prepareSelectedMenuCommand;
+        const dispatch = prepare(command, messages, ctx, admission);
+        if (!dispatch)
+            return undefined;
+        const execution = dispatch().catch(error => {
+            deps.recordRuntimeEvent?.("routing", error, { phase: "reroute-menu-execution" });
+            return false;
+        });
+        if (!(await Promise.race([accepted, execution.then(() => false)]))) {
+            resume(false);
+            await execution;
+            return undefined;
+        }
+        return async () => {
+            let allowEffects = false;
+            try {
+                const confirmed = await new Promise(resolve => {
+                    let done = false, unsubscribe;
+                    const signal = Updates.getTelegramUpdateExecutionFence(original)?.signal;
+                    const finish = (result) => {
+                        if (done)
+                            return;
+                        done = true;
+                        clearTimeout(timer);
+                        unsubscribe?.();
+                        signal?.removeEventListener("abort", abort);
+                        resolve(result);
+                    };
+                    const abort = () => finish(false);
+                    const observe = () => {
+                        if (!cap.isCurrent() || !completion.isCurrent())
+                            finish(false);
+                        else if (completion.inspectCompletion())
+                            finish(true);
+                    };
+                    const timer = setTimeout(abort, deps.liveRebindCommandCompletionTimeoutMs ?? 8_000);
+                    timer.unref?.();
+                    unsubscribe = Updates.subscribeTelegramDeferredSourceCompletion(original, observe);
+                    signal?.addEventListener("abort", abort, { once: true });
+                    if (signal?.aborted)
+                        abort();
+                    else
+                        observe();
+                });
+                if (!confirmed)
+                    throw new Error("Rerouted menu source removal is unconfirmed; execution remains suppressed.");
+                assertRecipientCurrent();
+                cancelTemporaryThreadCleanup(temporary.token);
+                try {
+                    await runTemporaryThreadCleanup(temporary.token, cap, false);
+                }
+                catch (error) {
+                    // Cleanup uncertainty retains its canonical grant, not command execution authority or a retry license.
+                    deps.recordRuntimeEvent?.("routing", error, { phase: "reroute-menu-cleanup" });
+                }
+                assertRecipientCurrent();
+                allowEffects = true;
+            }
+            catch (error) {
+                deps.recordRuntimeEvent?.("routing", error, { phase: "reroute-menu-release" });
+            }
+            finally {
+                resume(allowEffects);
+                await execution;
+            }
+        };
+    };
     const finalizePendingReroute = async (rerouteId, pending, query, successMessage, assertExecutionCurrent = Updates.createTelegramUpdateExecutionFenceGuard(query), retainRecord = false) => {
         assertExecutionCurrent();
         const dismissed = await dismissRerouteChooserMessage(query, assertExecutionCurrent);
@@ -4888,9 +4982,17 @@ export function createTelegramInboundRouteRuntime(deps) {
             if (!cancelledCurrent())
                 return;
             entry = cap.adopt(entry);
-            if (!entry ||
-                !cap.isCurrent() ||
-                isRerouteTargetProtected(target, undefined, entry))
+            if (!entry || !cap.isCurrent())
+                return;
+            if (isRerouteTargetProtected(target, undefined, entry) && deps.recoverTemporaryThreadDeadQueueOwners &&
+                store.inspectTemporaryThreadTarget(entry, cap.authority)?.kind === "temporary") {
+                const inputs = Threads.getTelegramTemporaryThreadInputs(entry);
+                const removed = deps.recoverTemporaryThreadDeadQueueOwners(target, [cap.journalBindingKey, ...inputs.map(input => input.journalBindingKey)], inputs, cap.isCurrent);
+                if (removed > 0)
+                    deps.recordRuntimeEvent?.("routing", "Discarded historical queue receipts from confirmed-dead owners before temporary Thread cleanup.", { phase: "temporary-thread-dead-owner-recovery", removedUpdateCount: removed });
+            }
+            // Recovery is not deletion authority: recapture every ordinary protection after the journal CAS.
+            if (!cap.isCurrent() || isRerouteTargetProtected(target, undefined, entry))
                 return;
             const issued = store.issueTemporaryThreadCleanup(entry, cap.authority);
             if (!issued || !cap.isCurrent())
@@ -5911,7 +6013,7 @@ export function createTelegramInboundRouteRuntime(deps) {
         await deps.answerCallbackQuery(query.id);
         return true;
     };
-    const executeUnboundRerouteCallbackOperation = async (query, ctx) => {
+    const executeUnboundRerouteCallbackOperation = async (query, ctx, afterAdmission) => {
         const parsed = parseTelegramUnboundRerouteCallbackData(query.data);
         if (!parsed)
             return false;
@@ -6432,7 +6534,21 @@ export function createTelegramInboundRouteRuntime(deps) {
         const localMessages = pending.rerouteCopies
             ? cloneTelegramMessagesForThread(pending.messages, parsed.threadId, pending.rerouteCopies.bySourceUpdateId)
             : reroutedMessages;
-        await dispatchPendingRerouteMessages(pending, localMessages, ctx);
+        const command = pending.dispatchKind === "command"
+            ? getLiveRebindMenu(localMessages) ?? getLiveRebindHelp(localMessages) : undefined;
+        const completion = pending.rerouteCopies && command
+            ? Updates.prepareTelegramDeferredSourceCompletion(pending.messages[0]) : undefined;
+        if (command && completion) {
+            const release = await stageTemporaryRerouteMenu(pending, command, localMessages, ctx, assertRerouteCurrent, completion);
+            if (!release) {
+                await deps.answerCallbackQuery(query.id, "Command acceptance unconfirmed; not resending");
+                return true;
+            }
+            afterAdmission(release);
+        }
+        else {
+            await dispatchPendingRerouteMessages(pending, localMessages, ctx);
+        }
         assertRerouteCurrent();
         pending.messages = [];
         return completeRoutedReroute();
@@ -6441,14 +6557,22 @@ export function createTelegramInboundRouteRuntime(deps) {
         const parsed = parseTelegramUnboundRerouteCallbackData(query.data);
         if (!parsed)
             return false;
-        return withPendingRerouteSelection(parsed.rerouteId, query, () => {
-            if (!deps.runWorkspaceOperation)
-                return executeUnboundRerouteCallbackOperation(query, ctx);
-            return deps.runWorkspaceOperation({
-                operationId: `workspace-reroute:${query.id}`,
-                operationKind: "workspace.route-unbound-thread",
-                scopes: [{ kind: "profile" }],
-            }, () => executeUnboundRerouteCallbackOperation(query, ctx));
+        return withPendingRerouteSelection(parsed.rerouteId, query, async () => {
+            let release;
+            const operation = () => executeUnboundRerouteCallbackOperation(query, ctx, value => { release = value; });
+            try {
+                if (!deps.runWorkspaceOperation)
+                    return await operation();
+                return await deps.runWorkspaceOperation({
+                    operationId: `workspace-reroute:${query.id}`,
+                    operationKind: "workspace.route-unbound-thread",
+                    scopes: [{ kind: "profile" }],
+                }, operation);
+            }
+            finally {
+                // Keep the exact source references, but release the non-reentrant Workspace gate before cleanup.
+                await release?.();
+            }
         });
     };
     const handleUnboundRerouteCallback = async (query, ctx) => {

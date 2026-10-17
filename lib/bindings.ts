@@ -1171,7 +1171,7 @@ interface TelegramLifecycleBindingDeps {
   shutdownGenerativeAppLiveSurfaces?: () => void;
   resolveAutomaticThreadCleanupEnabled?: () => boolean | Promise<boolean>;
   buttonActionStore: OutboundHandlers.TelegramButtonActionStore;
-  callMultipart: OutboundHandlers.TelegramVoiceReplySenderDeps["sendMultipart"];
+  callMultipart: (...args: Parameters<TelegramApi.TelegramBridgeApiRuntime["callMultipart"]>) => Promise<unknown>;
   sendChatAction: NonNullable<
     OutboundHandlers.TelegramVoiceReplySenderDeps["sendChatAction"]
   >;
@@ -1198,6 +1198,7 @@ interface TelegramLifecycleBindingDeps {
     ctx: Pi.ExtensionContext,
   ) => void;
   answerGuestQuery: TelegramApi.TelegramBridgeApiRuntime["answerGuestQuery"];
+  editGuestInlineMessage?: TelegramApi.TelegramBridgeApiRuntime["editGuestInlineMessage"];
   deleteMessage: TelegramApi.TelegramBridgeApiRuntime["deleteMessage"];
   sendGuestReply: NonNullable<
     Queue.TelegramAgentEndHookRuntimeDeps<
@@ -1276,6 +1277,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   onSteerTurnEnd,
   onPromptHandedOff,
   answerGuestQuery,
+  editGuestInlineMessage,
   deleteMessage,
   sendGuestReply,
   editGuestReply,
@@ -1318,6 +1320,7 @@ export function registerTelegramLifecycleRuntimeHooks({
     turn: Queue.PendingTelegramTurn,
     attachment: Queue.QueuedAttachment,
     caption?: string,
+    options?: { isDeliveryActive?: () => boolean },
   ): Promise<void> => {
     const stagingTarget = proactivePushTargetGetter();
     const stagingChatId = stagingTarget?.chatId;
@@ -1328,11 +1331,19 @@ export function registerTelegramLifecycleRuntimeHooks({
     }
     await OutboundAttachments.deliverTelegramGuestCachedAttachment({
       guestQueryId: turn.guestQueryId!,
+      guestInlineMessageId: turn.guestInlineMessageId,
+      editGuestInlineMessage,
+      isDeliveryActive: options?.isDeliveryActive,
       stagingChatId,
       stagingTarget,
       attachment,
       caption,
-      sendMultipart: callMultipart,
+      sendMultipart: (method, fields, fileField, path, name) =>
+        callMultipart(method, fields, fileField, path, name, {
+          assertAuthority() {
+            if (options?.isDeliveryActive?.() === false) throw new Error("Guest attachment upload lost authority.");
+          },
+        }),
       answerGuestQuery: (guestQueryId, result) =>
         answerGuestQuery(guestQueryId, undefined, { result }),
       answerGuestText: (guestQueryId, text) =>
