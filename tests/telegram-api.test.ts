@@ -57,6 +57,9 @@ import { isTelegramTopicTargetStaleError } from "../lib/threads.ts";
 import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
 import { createTelegramAssistantPreviewRuntime } from "../lib/preview.ts";
 import { createTelegramBusAwareApiRuntime } from "../lib/bus-api.ts";
+import { createGuestMarkdownReplyEditor } from "../lib/replies.ts";
+import { handleTelegramAgentEndRuntime, type PendingTelegramTurn } from "../lib/queue.ts";
+import { deliverTelegramGuestCachedAttachment } from "../lib/outbound-attachments.ts";
 
 test("Target activity tracks exact JSON and multipart transport until settlement", async () => {
   const activity = createTelegramApiTargetActivityRuntime();
@@ -2419,6 +2422,87 @@ test("Telegram bridge API runtime records structured failures", async () => {
       details: { method: "answerCallbackQuery" },
     },
   ]);
+});
+
+for (const outcome of ["success", "rejected", "unknown"] as const) {
+  test(`Guest ACK completion composes cached upload and inline edit (${outcome})`, async () => {
+    const events: string[] = [];
+    const restore = setApiTestFetch(async (input, init) => {
+      const method = String(input).split("/").at(-1);
+      const body = JSON.parse(String(init?.body));
+      assert.equal(body.inline_message_id, "inline");
+      events.push(method!);
+      if (method === "editMessageMedia") {
+        assert.deepEqual(body.media, { type: "photo", media: "cached-photo", caption: "done" });
+        if (outcome === "unknown") throw new Error("lost response");
+        if (outcome === "rejected") return new Response(JSON.stringify({ ok: false, error_code: 400, description: "fixture rejection" }), { status: 400 });
+      } else {
+        assert.equal(method, "editMessageText");
+        assert.match(body.rich_message.markdown, /could not deliver.*attachment/);
+      }
+      return new Response(JSON.stringify({ ok: true, result: true }));
+    });
+    try {
+      const api = createDefaultTelegramBridgeApiRuntime({ getBotToken: () => "123:fixture", recordRuntimeEvent() {} });
+      const turn: PendingTelegramTurn = {
+        kind: "prompt", chatId: 0, replyToMessageId: 0,
+        queueOrder: 1, queueLane: "default", laneOrder: 1,
+        content: [], historyText: "", sourceMessageIds: [], statusSummary: "guest",
+        guestQueryId: "answered", guestInlineMessageId: "inline",
+        queuedAttachments: [{ path: "photo.png", fileName: "photo.png" }],
+      };
+      await handleTelegramAgentEndRuntime({
+        turn, assistant: { text: "done" }, foldQueuedPromptsIntoHistory: false,
+        resetRuntimeState() {}, updateStatus() {}, clearPreview: async () => {},
+        setPreviewPendingText() {}, finalizeMarkdownPreview: async () => false,
+        dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+        sendMarkdownReply: async () => {}, sendTextReply: async () => {}, sendQueuedAttachments: async () => {},
+        stopGuestPlaceholder: async () => { events.push("stop"); },
+        editGuestReply: createGuestMarkdownReplyEditor({ editGuestInlineMessage: api.editGuestInlineMessage }),
+        sendGuestAttachment: (captured, attachment, caption, options) => deliverTelegramGuestCachedAttachment({
+          guestQueryId: captured.guestQueryId!, guestInlineMessageId: captured.guestInlineMessageId,
+          stagingChatId: 7, stagingTarget: { chatId: 7, threadId: 9 }, attachment, caption,
+          isDeliveryActive: options?.isDeliveryActive, editGuestInlineMessage: api.editGuestInlineMessage,
+          sendMultipart: async () => { events.push("upload"); return { message_id: 11, photo: [{ file_id: "cached-photo" }] }; },
+          answerGuestQuery: async () => assert.fail("Already answered"),
+          deleteMessage: async () => { events.push("delete"); },
+        }),
+      });
+      assert.deepEqual(events, ["stop", "upload", "editMessageMedia", "delete",
+        ...(outcome === "rejected" ? ["editMessageText"] : []), "dispatch"]);
+    } finally { restore(); }
+  });
+}
+
+test("Guest inline media edits use cached media, exact authority and one checked acknowledgement", async () => {
+  const calls: unknown[] = [];
+  let current = true;
+  let response: unknown = true;
+  const runtime = createTelegramBridgeApiRuntime({
+    tempDir: "/tmp/telegram", maxFileSizeBytes: 123, tempFileMaxAgeMs: 60_000,
+    recordRuntimeEvent() {},
+    client: createApiRuntimeClient({
+      call: async <T>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => {
+        options?.assertAuthority?.();
+        assert.equal(options?.maxAttempts, 1);
+        assert.equal(options?.retryRateLimit, false);
+        calls.push({ method, body });
+        return response as T;
+      },
+    }),
+  });
+  const content = { media: { type: "photo" as const, media: "cached-id", caption: "caption" } };
+  const options = { assertAuthority() { if (!current) throw new Error("retired"); } };
+  await runtime.editGuestInlineMessage("inline-1", content, options);
+  assert.deepEqual(calls, [{ method: "editMessageMedia", body: {
+    inline_message_id: "inline-1", media: content.media,
+  } }]);
+  current = false;
+  await assert.rejects(runtime.editGuestInlineMessage("inline-1", content, options), isTelegramApiCommitUnknownError);
+  assert.equal(calls.length, 1);
+  current = true;
+  response = undefined;
+  await assert.rejects(runtime.editGuestInlineMessage("inline-1", content, options), isTelegramApiCommitUnknownError);
 });
 
 test("Telegram bridge API runtime captures guest inline message ids and edits them", async () => {

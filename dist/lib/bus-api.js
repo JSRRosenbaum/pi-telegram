@@ -339,9 +339,9 @@ export function createTelegramBusAwareApiRuntime(deps) {
                 ? deps.directRuntime.answerGuestQueryForInlineMessage(guestQueryId, text, options)
                 : rejectTelegramDirectOwnership("answerGuestQueryForInlineMessage");
         },
-        editGuestInlineMessage(inlineMessageId, content) {
+        editGuestInlineMessage(inlineMessageId, content, options) {
             return deps.ownsDirect()
-                ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content)
+                ? deps.directRuntime.editGuestInlineMessage(inlineMessageId, content, options)
                 : rejectTelegramDirectOwnership("editGuestInlineMessage");
         },
         async deleteMessage(chatId, messageId) {

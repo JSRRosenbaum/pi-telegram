@@ -211,6 +211,8 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     canUsePreDispatchRebind?: (recipient?: Threads.TelegramWorkspaceRestoreRecipient) => boolean;
     /** Strict complete namespace plus exact current/historical references; only an empty result clears journal protection. */
     inspectTemporaryThreadSources?: (target: Queue.TelegramQueueTarget, requiredJournalBindingKeys: readonly string[], ownInputs?: readonly Threads.TelegramTemporaryThreadInput[]) => readonly number[] | undefined;
+    /** Explicit cleanup-only recovery; never called by a read-only protection observer. */
+    recoverTemporaryThreadDeadQueueOwners?: (target: Queue.TelegramQueueTarget, requiredJournalBindingKeys: readonly string[], ownInputs: readonly Threads.TelegramTemporaryThreadInput[], isCurrent: () => boolean) => number;
     /** Quiet period after the last cancelled input before one cleanup attempt; defaults to 0 ms. */
     temporaryThreadCleanupDelayMs?: number;
     /** Live-rebind cleanup attempt pacing; the bounded window ends in `not-issued`, never a time-based deletion. */

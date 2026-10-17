@@ -627,6 +627,8 @@ export interface TelegramSelectedCommandAdmission {
     /** Independent exact recipient/target lifetime, including inside captured menu transport adapters. */
     assertRecipientCurrent(): void;
     reportCompleted(): boolean;
+    /** Optional recipient release barrier after acceptance; rejection suppresses effects without replay. */
+    beforeEffects?(): Promise<void>;
 }
 export declare function createTelegramCommandHandler<TMessage extends TelegramCommandRuntimeMessage, TContext>(deps: TelegramCommandRuntimeDeps<TMessage, TContext>): ((commandName: string | undefined, message: TMessage, ctx: TContext, commandArgs?: string) => Promise<boolean>) & {
     /** Command-only producer execution; Routing must supply the captured plan and released exact-source authority. */

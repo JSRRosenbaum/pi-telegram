@@ -107,7 +107,9 @@ export interface RouteHarnessOptions {
   inspectRestoreQueuedReceipt?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectRestoreQueuedReceipt"];
   hasWorkspaceRestoreAuthority?: () => boolean;
   hasWorkspaceLiveRebindAuthority?: () => boolean;
+  canUsePreDispatchRebind?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["canUsePreDispatchRebind"];
   inspectTemporaryThreadSources?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["inspectTemporaryThreadSources"];
+  recoverTemporaryThreadDeadQueueOwners?: Routing.TelegramInboundRouteRuntimeDeps<TestMessage, TestCallbackQuery, TestContext, TestModel>["recoverTemporaryThreadDeadQueueOwners"];
   onItemsDiscarded?: Queue.TelegramQueueMutationControllerDeps<TestContext>["onItemsDiscarded"];
   queueAdmission?: Parameters<typeof Bindings.createTelegramQueueBindingRuntime<TestContext>>[0]["admission"];
   hasPendingMessages?: (ctx: TestContext) => boolean;
@@ -253,7 +255,9 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     inspectRestoreQueuedReceipt: options.inspectRestoreQueuedReceipt,
     hasWorkspaceRestoreAuthority: options.hasWorkspaceRestoreAuthority,
     hasWorkspaceLiveRebindAuthority: options.hasWorkspaceLiveRebindAuthority,
+    canUsePreDispatchRebind: options.canUsePreDispatchRebind,
     inspectTemporaryThreadSources: options.inspectTemporaryThreadSources,
+    recoverTemporaryThreadDeadQueueOwners: options.recoverTemporaryThreadDeadQueueOwners,
     temporaryThreadCleanupDelayMs: options.temporaryThreadCleanupDelayMs,
     liveRebindCleanupSchedule: options.liveRebindCleanupSchedule,
     liveRebindCommandCompletionTimeoutMs: options.liveRebindCommandCompletionTimeoutMs,

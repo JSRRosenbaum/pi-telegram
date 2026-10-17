@@ -511,6 +511,30 @@ test("Bus-aware API runtime keeps the guest ACK experiment on direct transport",
   assert.deepEqual(busCalls, []);
 });
 
+test("Guest inline media edit forwards its guard only through current direct ownership", async () => {
+  let owns = true;
+  let edits = 0;
+  const guard = { assertAuthority() {} };
+  const content = { media: { type: "document" as const, media: "cached-id" } };
+  const runtime = createTelegramBusAwareApiRuntime({
+    directRuntime: {
+      ...createDirectRuntime([]),
+      editGuestInlineMessage: async (id, received, options) => {
+        assert.equal(id, "inline");
+        assert.equal(received, content);
+        assert.equal(options, guard);
+        edits++;
+      },
+    },
+    ownsDirect: () => owns,
+    callFollowerApi: async () => assert.fail("Inline ownership cannot fall back to follower transport"),
+  });
+  await runtime.editGuestInlineMessage("inline", content, guard);
+  owns = false;
+  await assert.rejects(runtime.editGuestInlineMessage("inline", content, guard), /requires direct transport ownership/);
+  assert.equal(edits, 1);
+});
+
 test("Bus-aware polling methods fail closed without direct ownership", async () => {
   const directCalls: unknown[] = [];
   const busCalls: unknown[] = [];

@@ -2717,40 +2717,83 @@ test("Agent end runtime records Guest Mode ACK edit failure without rejecting th
   assert.deepEqual(events, ["record:guest-ack-edit", "dispatch"]);
 });
 
-test("Agent end runtime records a Guest Mode ACK turn without editable text", async () => {
-  const events: string[] = [];
-  const turn: PendingTelegramTurn = createQueueTestPromptTurn({
-    chatId: 0,
-    replyToMessageId: 0,
-    guestQueryId: "guest-1",
-    guestInlineMessageId: "inline-1",
-    queuedAttachments: [{ path: "/tmp/demo.txt", fileName: "demo.txt" }],
+for (const text of [undefined, "final caption"]) {
+  test(`Agent end runtime delivers a Guest Mode ACK attachment before text (caption=${!!text})`, async () => {
+    const events: unknown[] = [];
+    const turn: PendingTelegramTurn = createQueueTestPromptTurn({
+      chatId: 0,
+      replyToMessageId: 0,
+      guestQueryId: "guest-1",
+      guestInlineMessageId: "inline-1",
+      queuedAttachments: [{ path: "/tmp/photo.png", fileName: "photo.png" }],
+    });
+    await handleTelegramAgentEndRuntime({
+      turn,
+      assistant: { text },
+      foldQueuedPromptsIntoHistory: false,
+      resetRuntimeState: () => {},
+      updateStatus: () => {},
+      dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+      clearPreview: async () => {},
+      setPreviewPendingText: () => {},
+      finalizeMarkdownPreview: async () => false,
+      sendMarkdownReply: async () => assert.fail("Guest media cannot use chat delivery"),
+      sendTextReply: async () => {},
+      sendQueuedAttachments: async () => assert.fail("Guest media cannot use chat uploads"),
+      answerGuestQuery: async () => assert.fail("The guest query is already answered"),
+      stopGuestPlaceholder: async (id) => { events.push(["stop", id]); },
+      sendGuestAttachment: async (capturedTurn, attachment, caption) => {
+        assert.equal(capturedTurn, turn);
+        events.push(["attachment", capturedTurn.guestInlineMessageId, attachment.path, caption]);
+      },
+      editGuestReply: async () => assert.fail("Text must not replace queued media"),
+      recordRuntimeEvent: (_category, _error, details) => { events.push(`record:${details?.phase}`); },
+    });
+    assert.deepEqual(events, [
+      ["stop", "inline-1"],
+      ["attachment", "inline-1", "/tmp/photo.png", text],
+      "dispatch",
+    ]);
   });
-  await handleTelegramAgentEndRuntime({
-    turn,
-    assistant: {},
-    foldQueuedPromptsIntoHistory: false,
-    resetRuntimeState: () => {},
-    updateStatus: () => {},
-    dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
-    clearPreview: async () => {},
-    setPreviewPendingText: () => {},
-    finalizeMarkdownPreview: async () => false,
-    sendMarkdownReply: async () => {},
-    sendTextReply: async () => {},
-    sendQueuedAttachments: async () => {},
-    sendGuestAttachment: async () => {
-      events.push("unexpected:attachment");
-    },
-    editGuestReply: async () => {
-      events.push("unexpected:edit");
-    },
-    recordRuntimeEvent: (_category, _error, details) => {
-      events.push(`record:${details?.phase}`);
-    },
+}
+
+for (const scenario of ["upload-failure", "unknown-edit", "voice", "retired-placeholder", "missing-sender"] as const) {
+  test(`Guest ACK completion handles ${scenario} explicitly`, async () => {
+    const events: string[] = [];
+    let active = true;
+    await handleTelegramAgentEndRuntime({
+      turn: createQueueTestPromptTurn({
+        guestQueryId: "guest", guestInlineMessageId: "inline",
+        queuedAttachments: scenario === "voice" ? [] : [{ path: "photo.png", fileName: "photo.png" }],
+      }),
+      assistant: { text: "result" }, foldQueuedPromptsIntoHistory: false,
+      resetRuntimeState() {}, updateStatus() {}, isSessionActive: () => active,
+      dispatchNextQueuedTelegramTurn: () => events.push("dispatch"),
+      clearPreview: async () => {}, setPreviewPendingText() {}, finalizeMarkdownPreview: async () => false,
+      sendMarkdownReply: async () => {}, sendTextReply: async () => {}, sendQueuedAttachments: async () => {},
+      answerGuestQuery: async () => assert.fail("Already answered"),
+      planOutboundReply: () => scenario === "voice" ? { markdown: "", voiceText: "spoken" } : { markdown: "result" },
+      sendGuestVoiceReply: async () => assert.fail("Inline voice edit is unsupported"),
+      stopGuestPlaceholder: async () => { if (scenario === "retired-placeholder") active = false; },
+      sendGuestAttachment: scenario === "missing-sender" ? undefined : async (_turn, _file, _caption, options) => {
+        assert.equal(options?.isDeliveryActive?.(), true);
+        events.push("attachment");
+        if (scenario === "unknown-edit") throw new TelegramApiCommitUnknownError("editMessageMedia", new Error("timeout"));
+        throw new Error("upload failed");
+      },
+      editGuestReply: async (_id, text) => {
+        assert.match(text, scenario === "voice" ? /cannot replace.*voice note/ : /could not deliver.*attachment/);
+        events.push("notice");
+      },
+      recordRuntimeEvent: (_category, _error, details) => events.push(`record:${details?.phase}`),
+    });
+    assert.deepEqual(events, scenario === "retired-placeholder" ? []
+      : scenario === "unknown-edit" ? ["attachment", "record:guest-attachment", "dispatch"]
+      : scenario === "voice" ? ["notice", "record:guest-ack-edited", "dispatch"]
+      : scenario === "missing-sender" ? ["record:guest-attachment", "notice", "record:guest-ack-edited", "dispatch"]
+      : ["attachment", "record:guest-attachment", "notice", "record:guest-ack-edited", "dispatch"]);
   });
-  assert.deepEqual(events, ["record:guest-ack-edit-empty", "dispatch"]);
-});
+}
 
 for (const [boundary, stage] of [
   ["turn", "synthesis"], ["session", "synthesis"],

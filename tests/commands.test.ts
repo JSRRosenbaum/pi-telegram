@@ -3470,6 +3470,38 @@ for (const mode of ["current", "response"] as const) {
 }
 
 for (const command of ["status", "model", "thinking", "queue", "settings"] as const) {
+  for (const outcome of ["release", "reject", "recipient-lost"] as const) {
+    test(`Selected menu ${command} holds its captured release barrier (${outcome})`, async () => {
+      const f = createFencedCommandTargetFixture(), gate = Promise.withResolvers<void>();
+      f.deps.openSettingsMenu = async () => { f.effects.push("settings"); };
+      let reports = 0, recipientCurrent = true;
+      const admission = {
+        assertSourceCurrent() { assert.equal(reports, 0); },
+        assertRecipientCurrent() { if (!recipientCurrent) throw new Error("Recipient ended"); },
+        reportCompleted() { reports++; f.revoke(); return true; },
+        beforeEffects: () => gate.promise,
+      };
+      const dispatch = createTelegramCommandHandlerTargetRuntime(f.deps).prepareSelectedMenuCommand(
+        { name: command, args: "" }, [f.message], f.ctx, admission)!;
+      admission.beforeEffects = async () => assert.fail("A replacement admission port cannot release the prepared command");
+      const running = dispatch();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(reports, 1);
+      assert.deepEqual(f.effects, [], "Acceptance cannot issue menu effects before release");
+      assert.equal(await dispatch(), false, "An accepted but held command is already one-shot");
+      if (outcome === "reject") gate.reject(new Error("Release refused"));
+      else { recipientCurrent = outcome !== "recipient-lost"; gate.resolve(); }
+      if (outcome === "release") assert.equal(await running, true);
+      else await assert.rejects(running, /Release refused|Recipient ended/);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(f.effects, outcome === "release" ? [command] : []);
+      assert.equal(reports, 1);
+      assert.equal(await dispatch(), false);
+    });
+  }
+}
+
+for (const command of ["status", "model", "thinking", "queue", "settings"] as const) {
   test(`Selected menu command separates completion from detached recipient authority (${command})`, async () => {
     const f = createFencedCommandTargetFixture();
     f.deps.openSettingsMenu = async () => { f.effects.push("settings"); };
