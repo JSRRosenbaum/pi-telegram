@@ -4681,7 +4681,8 @@ export function createTelegramTopicTargetStore(options) {
         },
         captureWorkspaceSlotOccupancy(getExternalProtection, options) {
             const nowMs = getNowMs();
-            const bindings = Array.from(workspaceBindings.values()).map((binding) => {
+            const inSnapshot = getExternalProtection.withSnapshot ?? ((capture) => capture());
+            const bindings = inSnapshot(() => Array.from(workspaceBindings.values()).map((binding) => {
                 const slot = binding.slot?.toLowerCase() ?? "";
                 const locallyProtected = isWorkspaceBindingLocallyProtected(binding, nowMs, {
                     requireBindingSlot: true,
@@ -4711,7 +4712,7 @@ export function createTelegramTopicTargetStore(options) {
                         : {}),
                     protection,
                 };
-            });
+            }));
             const localReservedSlots = [
                 ...Array.from(workspaceClaims.values()).map((claim) => claim.identity.slot),
                 ...Array.from(records.values())

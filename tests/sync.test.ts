@@ -1833,6 +1833,7 @@ test("Manual disconnect stops the transport when Workspace admission reports cor
 });
 
 test("Manual disconnect fences cleanup and fallback stop across connection replacement", async () => {
+  // Forum chat id: its close step before delete is the race window this test injects into.
   for (const replaceAt of ["admission", "intent-persist", "api-reply"] as const) {
     let generation = 1;
     let captures = 0;
@@ -1856,7 +1857,7 @@ test("Manual disconnect fences cleanup and fallback stop across connection repla
       },
       getCurrentThreadRecord() {
         reads++;
-        return { owner: { kind: "leader" }, instanceId: "leader-runtime:1", target: { chatId: 7, threadId: 42 } };
+        return { owner: { kind: "leader" }, instanceId: "leader-runtime:1", target: { chatId: -1007, threadId: 42 } };
       },
       topicTargetStore: {
         list: () => [],
@@ -1871,7 +1872,7 @@ test("Manual disconnect fences cleanup and fallback stop across connection repla
         return { ok: true } as TResponse;
       },
       getCurrentLeaderEpoch: () => 1,
-      getLeaderTarget: () => ({ chatId: 7, threadId: 42 }),
+      getLeaderTarget: () => ({ chatId: -1007, threadId: 42 }),
       clearLeaderTarget: () => { mutations.push("clear-target"); },
       getSyncState: createUnknownTelegramSyncState,
       setSyncState: () => { mutations.push("sync"); },
@@ -2113,6 +2114,7 @@ test("Confirmed leader disconnect and restart cleanup preserve pressure-reclaima
 });
 
 test("Manual leader disconnect releases transport after cleanup loses epoch", async () => {
+  // Forum chat id: its close step before delete is the race window this test injects into.
   const trace: string[] = [];
   let currentEpoch: number | undefined = 1;
   let syncState = createUnknownTelegramSyncState();
@@ -2121,7 +2123,7 @@ test("Manual leader disconnect releases transport after cleanup loses epoch", as
     getCurrentThreadRecord: () => ({
       owner: { kind: "leader" },
       instanceId: "leader-runtime:1",
-      target: { chatId: 7, threadId: 42 },
+      target: { chatId: -1007, threadId: 42 },
     }),
     topicTargetStore: {
       markStaleByTarget: () => {
@@ -2148,7 +2150,7 @@ test("Manual leader disconnect releases transport after cleanup loses epoch", as
     getCurrentLeaderEpoch: () => currentEpoch,
     getLeaderTarget: () => {
       trace.push("get-leader-target");
-      return { chatId: 7, threadId: 42 };
+      return { chatId: -1007, threadId: 42 };
     },
     clearLeaderTarget: () => {
       trace.push("clear-leader-target");
@@ -2238,7 +2240,6 @@ test("Promoted leader deletes its inherited follower thread under owned epoch", 
   assert.deepEqual(trace, [
     "upsert-intent",
     "persist",
-    "closeForumTopic",
     "deleteForumTopic",
     "mark-stale",
     "remove-intent",
@@ -2309,7 +2310,6 @@ test("Promoted leader disconnect releases leadership when deletion is unconfirme
   assert.deepEqual(trace, [
     "upsert-intent",
     "persist",
-    "closeForumTopic",
     "deleteForumTopic",
     "clear-leader-target",
     "set-sync-state",

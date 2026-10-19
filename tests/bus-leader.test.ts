@@ -1563,7 +1563,8 @@ test(`Confirmed-dead cleanup preserves Workspace identity despite registration n
       lastHeartbeatMs: 900,
       target: { chatId: 7, threadId: 42 },
     });
-    assert.deepEqual(cleanupCalls, ["closeForumTopic", "deleteForumTopic"]);
+    // Private-chat topics cannot be closed, so graceful cleanup deletes directly.
+    assert.deepEqual(cleanupCalls, ["deleteForumTopic"]);
     assert.equal(store.getByProfileKey("manual:worker"), undefined);
     assert.deepEqual(store.listPendingCleanups(), []);
     assert.equal(store.listSyncObservations()[0]?.syncStatus, "deleted");
@@ -1577,17 +1578,22 @@ test(`Confirmed-dead cleanup preserves Workspace identity despite registration n
     });
 
     const reopenCalls: string[] = [];
+    const probeEvents: unknown[] = [];
+    let probeErrorExpected: boolean | undefined;
     const provision = createTelegramBusFollowerTargetProvisioner({
       getAllowedUserId: () => 7,
       topicTargetStore: store,
-      async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      async callApi<TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) {
         reopenCalls.push(`${method}:${body.message_thread_id ?? "new"}`);
         if (method === "sendMessage" && body.message_thread_id === 42) {
           assert.match(String(body.text), /Cedar/);
-          throw new TelegramApiStaleTargetError(
+          const error = new TelegramApiStaleTargetError(
             "Telegram API sendMessage failed: message thread not found",
             { chatId: 7, threadId: 42 },
           );
+          // The probe owns this expected answer, so the generic API log must stay quiet.
+          probeErrorExpected = options?.isExpectedError?.(error);
+          throw error;
         }
         if (method === "createForumTopic") {
           return { message_thread_id: 43 } as TResponse;
@@ -1599,7 +1605,9 @@ test(`Confirmed-dead cleanup preserves Workspace identity despite registration n
       setSyncState: (state) => {
         syncState = state;
       },
-      recordRuntimeEvent() {},
+      recordRuntimeEvent(_category, _error, details) {
+        probeEvents.push(details);
+      },
     });
     assert.deepEqual(
       await provision({
@@ -1610,6 +1618,12 @@ test(`Confirmed-dead cleanup preserves Workspace identity despite registration n
       }),
       { chatId: 7, threadId: 43, slot: "C", threadName: "Cedar" },
     );
+    assert.equal(probeErrorExpected, true);
+    assert.ok(probeEvents.some((details) =>
+      (details as { phase?: string; staleThreadId?: number; threadId?: number } | undefined)?.phase ===
+        "topic-lifecycle-restore-probe-recreated" &&
+      (details as { staleThreadId?: number }).staleThreadId === 42 &&
+      (details as { threadId?: number }).threadId === 43));
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.deepEqual(reopenCalls, [
       "sendMessage:42",
@@ -1682,8 +1696,8 @@ test("Successor leader replays durable cleanup intent before provisioning its ow
   try {
     await provision({ cwd: "/repo/new" });
     assert.deepEqual(
-      calls.slice(0, 3).map((call) => call.method),
-      ["closeForumTopic", "deleteForumTopic", "createForumTopic"],
+      calls.slice(0, 2).map((call) => call.method),
+      ["deleteForumTopic", "createForumTopic"],
     );
     assert.deepEqual(store.listPendingCleanups(), []);
     assert.equal(store.getByProfileKey("leader:old"), undefined);

@@ -4,6 +4,15 @@
  * Owns small session-local runtime primitives that are shared by orchestration but are not specific to queueing, rendering, polling, or Telegram transport
  */
 import * as Machine from "./machine.ts";
+/**
+ * Structural port for run-collapsing diagnostics: a repeated identical failure extends its run instead of logging
+ * again, and the closing success records one outcome. The composition root owns the collapsed implementation.
+ */
+export interface TelegramRepeatedFailureLogPort {
+    record: (error: unknown, details?: Record<string, unknown>) => void;
+    settled: () => void;
+    reset: () => void;
+}
 export interface TelegramRuntimeQueueCounters {
     nextQueuedTelegramItemOrder: number;
     nextQueuedTelegramControlOrder: number;
@@ -103,6 +112,8 @@ export interface TelegramRuntimeEventRecorderPort {
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
 }
 export interface TelegramTypingLoopStarterDeps<TContext> extends TelegramRuntimeEventRecorderPort {
+    /** Collapses one sustained presence failure run; the caller supplies its owner. */
+    failureLog: TelegramRepeatedFailureLogPort;
     typing: TelegramRuntimeTypingPort;
     getDefaultChatId: () => number | undefined;
     sendTypingAction: (chatId: number, options?: {

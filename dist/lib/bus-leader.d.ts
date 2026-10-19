@@ -66,7 +66,7 @@ export interface TelegramBusFollowerTargetProvisionerDeps {
     getLiveFollowers?: () => readonly TelegramBusFollowerView[];
     isFollowerProcessAlive?: (pid: number) => boolean;
     topicTargetStore: Threads.TelegramTopicTargetStore;
-    callApi: <TResponse>(method: string, body: Record<string, unknown>) => Promise<TResponse>;
+    callApi: <TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApiCallOptions) => Promise<TResponse>;
     getCurrentLeaderEpoch?: () => number | string | undefined;
     getSyncState: () => Sync.TelegramSyncState;
     setSyncState: (state: Sync.TelegramSyncState) => void;

@@ -6,6 +6,16 @@
 
 import * as Machine from "./machine.ts";
 
+/**
+ * Structural port for run-collapsing diagnostics: a repeated identical failure extends its run instead of logging
+ * again, and the closing success records one outcome. The composition root owns the collapsed implementation.
+ */
+export interface TelegramRepeatedFailureLogPort {
+  record: (error: unknown, details?: Record<string, unknown>) => void;
+  settled: () => void;
+  reset: () => void;
+}
+
 const TELEGRAM_TYPING_ACTION_INTERVAL_MS = 3_000;
 const TELEGRAM_TYPING_IDLE_DRAIN_MAX_MS = 250;
 
@@ -344,6 +354,8 @@ function updateTelegramRuntimeStatusSafely<TContext>(
 export interface TelegramTypingLoopStarterDeps<
   TContext,
 > extends TelegramRuntimeEventRecorderPort {
+  /** Collapses one sustained presence failure run; the caller supplies its owner. */
+  failureLog: TelegramRepeatedFailureLogPort;
   typing: TelegramRuntimeTypingPort;
   getDefaultChatId: () => number | undefined;
   sendTypingAction: (
@@ -374,6 +386,31 @@ export function createTelegramTypingLoopStarter<TContext>(
     threadId: number | undefined;
     canContinue: () => boolean;
   } | undefined;
+  // An unreachable transport repeats one identical presence failure every tick; the port collapses the run.
+  // Running it through one guard keeps a faulty diagnostics port from escaping the in-flight action owner.
+  const typingFailureLog: TelegramRepeatedFailureLogPort = {
+    record(error, details) {
+      try {
+        deps.failureLog.record(error, details);
+      } catch {
+        // Typing diagnostics cannot escape the in-flight action owner.
+      }
+    },
+    settled() {
+      try {
+        deps.failureLog.settled();
+      } catch {
+        // A successful presence outranks its own diagnostic.
+      }
+    },
+    reset() {
+      try {
+        deps.failureLog.reset();
+      } catch {
+        // Typing diagnostics cannot fail a loop stop.
+      }
+    },
+  };
   return (ctx, chatId, options) => {
     const sessionGeneration = deps.getSessionGeneration?.();
     const transportAuthority = deps.getTransportAuthority?.();
@@ -422,24 +459,20 @@ export function createTelegramTypingLoopStarter<TContext>(
               if (!active || !canContinue()) throw new Error("Typing context authority changed.");
             },
           });
+          typingFailureLog.settled();
         } catch (error) {
           if (!active) return;
           if (!canContinue()) {
             deps.typing.stop();
             return;
           }
-          try {
-            deps.recordRuntimeEvent?.("typing", error, {
-              chatId: targetChatId,
-            });
-          } catch {
-            // Typing diagnostics cannot escape the in-flight action owner.
-          }
+          typingFailureLog.record(error, { chatId: targetChatId });
         }
       },
       shouldContinue: canContinue,
       onStopped: () => {
         active = false;
+        typingFailureLog.reset();
         if (currentOwner === owner) currentOwner = undefined;
       },
     });

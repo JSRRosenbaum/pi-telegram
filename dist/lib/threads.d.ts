@@ -157,6 +157,10 @@ export interface TelegramWorkspaceExternalProtectionEvidence {
     acceptedWork: TelegramWorkspaceProtectionState;
     deliveryAuthority: TelegramWorkspaceProtectionState;
 }
+/** Per-binding probe; `withSnapshot` lets one occupancy capture share binding-independent evidence reads. */
+export type TelegramWorkspaceExternalProtectionCapture = ((binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceExternalProtectionEvidence) & {
+    withSnapshot?: <T>(capture: () => T) => T;
+};
 export interface TelegramWorkspaceSlotOccupancySnapshot {
     bindings: TelegramWorkspaceSlotOccupancy[];
     reservedSlots: string[];
@@ -549,7 +553,7 @@ export interface TelegramTopicTargetStore {
         bindingUpdatedAtMs: number;
     }, isCurrent: () => boolean) => Promise<boolean>;
     /** Caller must separately prove no external live owner, accepted work, or delivery authority. */
-    captureWorkspaceSlotOccupancy: (getExternalProtection: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceExternalProtectionEvidence, options?: {
+    captureWorkspaceSlotOccupancy: (getExternalProtection: TelegramWorkspaceExternalProtectionCapture, options?: {
         expectedRetirement?: TelegramWorkspaceRetirementIntent;
     }) => TelegramWorkspaceSlotOccupancySnapshot;
     hasWorkspaceBinding: (cwd: string, sessionId?: string) => boolean;

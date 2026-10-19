@@ -14,6 +14,7 @@ import { captureTelegramStaleTargetRequestRecovery, type TelegramSyncState } fro
 import type { TelegramTopicTargetRecord } from "../lib/threads.ts";
 import { createTelegramTypingLoop, createTelegramTypingLoopStarter } from "../lib/runtime.ts";
 import { createTelegramSessionContextStore } from "../lib/lifecycle.ts";
+import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
 
 for (const direct of [true, false]) for (const threaded of [true, false]) for (const failure of ["http", "network"] as const) {
   test(`Typing cannot replay HTTP after its captured generation ends (direct=${direct}, threaded=${threaded}, failure=${failure})`, async (t) => {
@@ -41,7 +42,9 @@ for (const direct of [true, false]) for (const threaded of [true, false]) for (c
         const wire = structuredClone(args); payloads.push(wire);
         return proxy(method, wire);
       } });
-    const start = createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+    const start = createTelegramTypingLoopStarter({
+      failureLog: createPassthroughFailureLog(error => errors.push(error)),
+      typing, getDefaultChatId: () => 7,
       isContextActive: context.isCurrent, getSessionGeneration: context.getGeneration, getTransportAuthority: () => "unchanged", isThreadedMode: () => threaded,
       async sendTypingAction(chatId, options) { try { return await api.sendTypingAction(chatId, options); } finally { finish(); } },
       updateStatus() {}, recordRuntimeEvent(_category, error) { errors.push(error); } });

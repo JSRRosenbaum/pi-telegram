@@ -45,6 +45,8 @@ import {
   TelegramPollingBatchValidationError,
   TelegramPollingCursorBootstrapError,
 } from "../lib/polling.ts";
+import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
+import { createTelegramFailureRunLog } from "../lib/logging.ts";
 
 const TEST_CONTEXT = "ctx";
 const NOOP_JOURNAL_ADMISSION = {
@@ -391,6 +393,7 @@ test("Thread capability probes require direct or registered follower authority",
 test("Thread capability monitor stays passive before transport authorization", async () => {
   let calls = 0;
   const monitor = createTelegramThreadCapabilityMonitor({
+    failureLog: createPassthroughFailureLog(),
     getAllowedUserId: () => 7,
     callApi: async <TResponse>() => {
       calls += 1;
@@ -429,11 +432,17 @@ test("Thread capability monitor stops after synchronous stale-context preflight"
   let ownershipReads = 0;
   let records = 0;
   let apiCalls = 0;
+  const recordEvent = (_category: string, error: unknown) => {
+    assert.match(String(error), /ctx is stale/);
+    records += 1;
+    throw new Error("diagnostic sink failed");
+  };
   const staleContext = { get cwd(): string {
     ownershipReads += 1;
     throw new Error("This extension ctx is stale after session replacement or reload.");
   } };
   const monitor = createTelegramThreadCapabilityMonitor({
+    failureLog: createPassthroughFailureLog((error) => recordEvent("bus", error)),
     getAllowedUserId: () => 7,
     callApi: async <TResponse>() => { apiCalls += 1; return {} as TResponse; },
     topicTargetStore: { load: async () => {}, persist: async () => {},
@@ -445,11 +454,7 @@ test("Thread capability monitor stops after synchronous stale-context preflight"
     stopFollowerRegistration: () => {}, startClassicPolling: () => {},
     stopClassicPolling: () => {}, startBusPolling: () => {}, stopBusPolling: () => {},
     startLeaderHealth: () => {}, stopLeaderHealth: () => {}, updateStatus: () => {},
-    recordEvent: (_category, error) => {
-      assert.match(String(error), /ctx is stale/);
-      records += 1;
-      throw new Error("diagnostic sink failed");
-    },
+    recordEvent,
     intervalMs: 1,
   });
   monitor.start(staleContext);
@@ -460,12 +465,64 @@ test("Thread capability monitor stops after synchronous stale-context preflight"
   monitor.stop();
 });
 
+test("Thread capability monitor collapses a sustained probe failure and reports its recovery", async () => {
+  const events: Array<{ details?: Record<string, unknown> }> = [];
+  let failing = true;
+  let probes = 0;
+  const monitor = createTelegramThreadCapabilityMonitor({
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "capability-monitor",
+      outcomePhase: "capability-monitor-recovered",
+      label: "Threaded Mode capability probe",
+      record: (_category, _errorOrMessage, details) => events.push({ details }),
+    }),
+    getAllowedUserId: () => 7,
+    callApi: async <TResponse>() => {
+      probes += 1;
+      if (failing) throw Object.assign(new Error("connect ENOENT"), { code: "ENOENT" });
+      return { has_topics_enabled: true } as TResponse;
+    },
+    topicTargetStore: { load: async () => {}, persist: async () => {},
+      getBotState: () => ({}), setBotState: () => {} },
+    ownsLock: () => true,
+    isFollowerRegistered: () => false,
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus: () => {}, setTopicModeUnavailable: () => {},
+    stopFollowerRegistration: () => {}, startClassicPolling: () => {},
+    stopClassicPolling: () => {}, startBusPolling: () => {}, stopBusPolling: () => {},
+    startLeaderHealth: () => {}, stopLeaderHealth: () => {}, updateStatus: () => {},
+    recordEvent: (_category, _error, details) => events.push({ details }),
+    intervalMs: 5,
+  });
+  const failures = () => events.filter((event) => event.details?.phase === "capability-monitor");
+  const recovered = () => events.find((event) => event.details?.phase === "capability-monitor-recovered");
+  try {
+    monitor.start(TEST_CONTEXT);
+    for (let tick = 0; tick < 50 && (probes < 3 || failures().length === 0); tick += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(probes >= 3, `expected repeated probes, saw ${probes}`);
+    assert.equal(failures().length, 1, "a repeated identical probe failure is logged once");
+    assert.equal(failures()[0]?.details?.failureSignature, "ENOENT");
+    failing = false;
+    for (let tick = 0; tick < 50 && !recovered(); tick += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(recovered(), "a successful probe closes the failure run");
+    assert.ok(Number(recovered()?.details?.failedAttempts) >= 3);
+  } finally {
+    monitor.stop();
+  }
+});
+
 test("Thread capability monitor invalidates a replaced session before reading its context", async () => {
   const reads = { old: 0, current: 0 };
   let records = 0;
   const oldContext = { session: "old" as const };
   const currentContext = { session: "current" as const };
   const monitor = createTelegramThreadCapabilityMonitor({
+    failureLog: createPassthroughFailureLog(),
     getAllowedUserId: () => 7, callApi: async <TResponse>() => ({} as TResponse),
     topicTargetStore: { load: async () => {}, persist: async () => {},
       getBotState: () => ({}), setBotState: () => {} },
@@ -495,6 +552,7 @@ test("Thread capability monitor serializes probes across lifecycle generations",
   let state: { threadMode?: "enabled" | "disabled" | "unknown" } = {};
   const releases: Array<(value: unknown) => void> = [];
   const monitor = createTelegramThreadCapabilityMonitor({
+    failureLog: createPassthroughFailureLog(),
     getAllowedUserId: () => 7,
     callApi: <TResponse>() =>
       new Promise<TResponse>((resolve) => {
@@ -587,6 +645,7 @@ function createCapabilityLifecycleFixture(hooks: {
   let bot: TelegramThreadCapabilityState = hooks.initialBot ?? {};
   const calls: string[] = [];
   const runtime = createTelegramThreadCapabilityOrchestration<string, unknown>({
+    failureLog: createPassthroughFailureLog(),
     state, getAllowedUserId: () => 1,
     callApi: async <TResponse,>() => ({ has_topics_enabled: await hooks.getMe() }) as TResponse,
     topicTargetStore: {
@@ -947,6 +1006,7 @@ test("Thread capability downgrade retries classic restore after failure", async 
     },
   };
   const deps = {
+    failureLog: createPassthroughFailureLog(),
     getAllowedUserId: () => 42,
     callApi: async <TResponse,>(): Promise<TResponse> => ({}) as TResponse,
     topicTargetStore: store,

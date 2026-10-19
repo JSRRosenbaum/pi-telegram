@@ -30,6 +30,7 @@ import {
   createTelegramBridgeRuntime,
   createTelegramTypingLoopStarter,
 } from "../lib/runtime.ts";
+import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
 
 for (const change of ["none", "clear", "reused-context", "authority", "queued-clear", "sink-fails"] as const)
 test(`Session drain observer cannot borrow replacement authority (${change})`, async () => {
@@ -56,7 +57,9 @@ for (const change of ["distinct-context", "reused-context", "clear"] as const) {
     const context = createTelegramSessionContextStore<ExtensionContext>(), old = createLifecycleContext(), next = change === "reused-context" ? old : createLifecycleContext();
     const runtime = createTelegramBridgeRuntime(), calls: number[] = [];
     context.set(old);
-    const start = createTelegramTypingLoopStarter({ typing: runtime.typing, getDefaultChatId: () => 7,
+    const start = createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing: runtime.typing, getDefaultChatId: () => 7,
       isContextActive: context.isCurrent, getSessionGeneration: context.getGeneration, getTransportAuthority: () => "same-epoch", isThreadedMode: () => true,
       sendTypingAction: async (_chat, options) => { calls.push(options?.message_thread_id ?? 0); }, updateStatus() {} });
     const hooks = createTelegramMessageActivityTypingHooks({ hasActiveTurn: () => true,
@@ -82,7 +85,9 @@ test("Held message activity cannot re-arm typing after the same context object e
   context.set(ctx); const calls: number[] = [];
   let finish!: () => void;
   const held = new Promise<void>(resolve => { finish = resolve; });
-  const start = createTelegramTypingLoopStarter({ typing: runtime.typing, getDefaultChatId: () => 7,
+  const start = createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing: runtime.typing, getDefaultChatId: () => 7,
     isContextActive: context.isCurrent, getSessionGeneration: context.getGeneration, getTransportAuthority: () => "same-epoch",
     sendTypingAction: async (_chat, options) => { calls.push(options?.message_thread_id ?? 0); }, updateStatus() {} });
   const hooks = createTelegramMessageActivityTypingHooks({ hasActiveTurn: () => true,
@@ -739,6 +744,7 @@ test("Compaction observer sends native typing only to the resolved thread", asyn
   const runtime = createTelegramBridgeRuntime();
   const actions: Array<string> = [];
   const startTyping = createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 77,
     sendTypingAction: async (chatId, options) => {
@@ -769,6 +775,7 @@ test("Compaction observer sends native typing only to the resolved thread", asyn
 test("Compaction observer preserves an existing agent typing loop", async () => {
   const runtime = createTelegramBridgeRuntime();
   const startTyping = createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 77,
     sendTypingAction: async () => {},
@@ -797,6 +804,7 @@ test("Compaction observer preserves an existing agent typing loop", async () => 
 test("Compaction observer keeps ownership of its own typing loop across a repeated start", async () => {
   const runtime = createTelegramBridgeRuntime();
   const startTyping = createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 77,
     sendTypingAction: async () => {},

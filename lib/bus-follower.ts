@@ -111,6 +111,7 @@ import * as WorkspaceIdentity from "./workspace-identity.ts";
 const TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS = 2_500;
 const TELEGRAM_FOLLOWER_SESSION_HANDOFF_TTL_MS = 30_000;
 const TELEGRAM_BUS_FOLLOWER_CLIENT_TIMEOUT_MS = 30_000;
+const TELEGRAM_BUS_FOLLOWER_API_SLOW_CALL_MS = 1_500;
 const TELEGRAM_BUS_FOLLOWER_REGISTRATION_WAIT_MS = 30_000;
 export const TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS =
   TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS;
@@ -326,6 +327,20 @@ export interface TelegramBusFollowerClientRuntimeDeps<TMessage = unknown> {
   timeoutMs?: number;
 }
 
+/** Structural port for run-collapsing diagnostics, implemented by the logging domain. */
+export interface TelegramFailureRunLogPort {
+  record: (error: unknown, details?: Record<string, unknown>) => boolean;
+  settled: () => TelegramFailureRunSummaryPort | undefined;
+  reset: () => void;
+}
+
+export interface TelegramFailureRunSummaryPort {
+  signature: string;
+  failedAttempts: number;
+  suppressedFailures: number;
+  failedForMs: number;
+}
+
 export interface TelegramBusFollowerApiCallerDeps {
   socketPath: TelegramBusSocketPathSource;
   instanceId: string;
@@ -337,11 +352,23 @@ export interface TelegramBusFollowerApiCallerDeps {
   ) => Promise<string | undefined>;
   getNowMs?: () => number;
   timeoutMs?: number;
+  /** Receives one diagnostic per call slower than `slowCallMs`; observation only. */
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+  slowCallMs?: number;
 }
 
 export interface TelegramBusFollowerRegistrationRuntimeDeps<
   TContext extends { cwd?: string },
 > {
+  /**
+   * Collapses one sustained heartbeat failure run. Optional at this unit boundary, where an absent port records
+   * every failure; the runtime assembly requires it so production always supplies the logging domain's owner.
+   */
+  failureLog?: TelegramFailureRunLogPort;
   instanceId: string;
   createRequestId: () => string;
   protocolIdentity: TelegramBusProtocolIdentity;
@@ -673,6 +700,8 @@ export interface TelegramBusFollowerRuntimeAssemblyPorts<
   TContext extends { cwd?: string },
 > {
   instanceId: string;
+  /** Collapses one sustained heartbeat failure run; the composition root supplies the logging domain's owner. */
+  failureLog: TelegramFailureRunLogPort;
   registrationState: TelegramBusFollowerRegistrationState;
   recordRuntimeEvent: (
     category: string,
@@ -789,6 +818,7 @@ export function createTelegramBusFollowerRuntimeAssembly<
   });
   registration = createTelegramBusFollowerRegistrationRuntime({
     ...ports.registration,
+    failureLog: ports.failureLog,
     ...sharedRuntimeDeps,
     startReceiving: receiver.start,
     stopReceiving: receiver.stop,
@@ -1495,6 +1525,7 @@ export function createTelegramBusFollowerClientRuntime<
       instanceId: deps.instanceId,
       getAuthSecret: deps.getApiAuthSecret,
       getRegistrationGeneration: deps.getRegistrationGeneration,
+      recordRuntimeEvent: deps.recordRuntimeEvent,
     }),
     agentMessages: createTelegramBusAgentMessageClient({
       ...sharedClientDeps,
@@ -1881,7 +1912,13 @@ export function createTelegramBusFollowerApiCaller(
 ): (method: string, args: unknown[], localOptions?: Pick<TelegramApiCallOptions, "assertAuthority">) => Promise<unknown> {
   const getNowMs = deps.getNowMs ?? Date.now;
   const timeoutMs = deps.timeoutMs ?? TELEGRAM_BUS_FOLLOWER_CLIENT_TIMEOUT_MS;
-  return async (method, args, localOptions) => {
+  const slowCallMs = deps.slowCallMs ?? TELEGRAM_BUS_FOLLOWER_API_SLOW_CALL_MS;
+  const caller = async (
+    method: string,
+    args: unknown[],
+    localOptions: Pick<TelegramApiCallOptions, "assertAuthority"> | undefined,
+    timing: { registeredAtMs?: number },
+  ): Promise<unknown> => {
     const assertion = localOptions?.assertAuthority;
     const assertCurrent = () => assertTelegramApiCallAuthority(assertion, false);
     assertCurrent();
@@ -1889,6 +1926,7 @@ export function createTelegramBusFollowerApiCaller(
       deps,
       timeoutMs,
     );
+    timing.registeredAtMs = getNowMs();
     assertCurrent();
     const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
     let response: TelegramBusEnvelope | undefined;
@@ -1949,6 +1987,45 @@ export function createTelegramBusFollowerApiCaller(
       );
     }
     throw new Error(message ?? "Telegram bus API call failed.");
+  };
+  return async (method, args, localOptions) => {
+    const startedAtMs = getNowMs();
+    const timing: { registeredAtMs?: number } = {};
+    let outcome = "ok";
+    try {
+      return await caller(method, args, localOptions, timing);
+    } catch (error) {
+      outcome = "error";
+      throw error;
+    } finally {
+      const elapsedMs = getNowMs() - startedAtMs;
+      if (elapsedMs >= slowCallMs) {
+        const apiMethod =
+          (method === "call" || method === "callMultipart") &&
+          typeof args[0] === "string"
+            ? args[0]
+            : method;
+        try {
+          deps.recordRuntimeEvent?.(
+            "bus",
+            `Telegram bus follower API call was slow (${elapsedMs}ms).`,
+            {
+              phase: "follower-api-slow",
+              method: apiMethod,
+              elapsedMs,
+              registrationWaitMs:
+                (timing.registeredAtMs ?? getNowMs()) - startedAtMs,
+              ...(timing.registeredAtMs === undefined
+                ? {}
+                : { transportMs: getNowMs() - timing.registeredAtMs }),
+              outcome,
+            },
+          );
+        } catch {
+          // Diagnostics cannot change the API call outcome.
+        }
+      }
+    }
   };
 }
 
@@ -2521,10 +2598,16 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
       election: TelegramBusFollowerElection,
     ) => {
       if (!isCurrent()) return;
-      const activeCtx = deps.getActiveContext?.();
-      if (deps.getActiveContext && activeCtx !== ctx) {
-        scheduleRecovery(reason, ctx, binding);
-        return;
+      if (deps.getActiveContext) {
+        // Pi hands every event and command a fresh context object, so a manually connected follower never holds
+        // the stored session object. Promote through the live session context instead of rescheduling: heartbeat
+        // failures re-request recovery faster than the retry grace, so a reschedule-only path never fires.
+        const activeCtx = deps.getActiveContext();
+        if (!activeCtx) {
+          scheduleRecovery(reason, ctx, binding);
+          return;
+        }
+        ctx = activeCtx;
       }
       deps.setLifecyclePhase("electing");
       safeUpdateStatus(ctx);
@@ -2765,6 +2848,8 @@ export function createTelegramBusFollowerRegistrationRuntime<
     (!deps.registrationState ||
       deps.registrationState.getGeneration() === generation);
   const stopHeartbeat = () => {
+    // A stopped heartbeat ends the current failure run, so a later run logs its own first failure.
+    heartbeatFailureLog.reset();
     if (!heartbeatInterval) return;
     clearInterval(heartbeatInterval);
     heartbeatInterval = undefined;
@@ -2793,6 +2878,22 @@ export function createTelegramBusFollowerRegistrationRuntime<
       }
     });
   };
+  /** A sustained leader outage repeats one identical failure every interval; the port collapses the run. */
+  const heartbeatFailureLog: TelegramFailureRunLogPort =
+    deps.failureLog ?? {
+      record(error) {
+        try {
+          deps.recordRuntimeEvent?.("bus", error, {
+            phase: "follower-heartbeat",
+          });
+        } catch {
+          // Diagnostics cannot replace heartbeat recovery.
+        }
+        return true;
+      },
+      settled: () => undefined,
+      reset: () => undefined,
+    };
   const sendHeartbeat = async () => {
     const leaderSocketPath = activeLeaderSocketPath;
     const registrationGeneration = activeRegistrationGeneration;
@@ -2818,6 +2919,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
       );
       if (!isCurrentHeartbeat()) return;
       if (response?.kind === "bus.ack" && response.ok) {
+        heartbeatFailureLog.settled();
         const heartbeatResult = isRecord(response.result)
           ? response.result
           : undefined;
@@ -2850,13 +2952,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
       }
     } catch (error) {
       if (!isCurrentHeartbeat()) return;
-      try {
-        deps.recordRuntimeEvent?.("bus", error, {
-          phase: "follower-heartbeat",
-        });
-      } catch {
-        // Diagnostics cannot replace heartbeat recovery.
-      }
+      heartbeatFailureLog.record(error);
       if (!heartbeatContext) return;
       try {
         await deps.onHeartbeatFailure?.(error, heartbeatContext);
@@ -3120,11 +3216,11 @@ export function createTelegramBusFollowerRegistrationRuntime<
       return false;
     },
     setContext(ctx) {
+      // Pi hands every event a fresh context object. Only a replaced session drops an in-flight attempt.
       if (
         registrationAttempt &&
-        (registrationAttempt.ctx !== ctx ||
-          registrationAttempt.sessionGeneration !==
-            deps.getSessionGeneration?.() ||
+        (registrationAttempt.sessionGeneration !==
+          deps.getSessionGeneration?.() ||
           registrationAttempt.sessionId !== deps.getSessionId?.(ctx))
       )
         registrationAttempt = undefined;

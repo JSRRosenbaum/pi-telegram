@@ -131,6 +131,18 @@ export interface TelegramBusFollowerClientRuntimeDeps<TMessage = unknown> {
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
     timeoutMs?: number;
 }
+/** Structural port for run-collapsing diagnostics, implemented by the logging domain. */
+export interface TelegramFailureRunLogPort {
+    record: (error: unknown, details?: Record<string, unknown>) => boolean;
+    settled: () => TelegramFailureRunSummaryPort | undefined;
+    reset: () => void;
+}
+export interface TelegramFailureRunSummaryPort {
+    signature: string;
+    failedAttempts: number;
+    suppressedFailures: number;
+    failedForMs: number;
+}
 export interface TelegramBusFollowerApiCallerDeps {
     socketPath: TelegramBusSocketPathSource;
     instanceId: string;
@@ -140,10 +152,18 @@ export interface TelegramBusFollowerApiCallerDeps {
     waitForRegistrationGeneration?: (timeoutMs?: number) => Promise<string | undefined>;
     getNowMs?: () => number;
     timeoutMs?: number;
+    /** Receives one diagnostic per call slower than `slowCallMs`; observation only. */
+    recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
+    slowCallMs?: number;
 }
 export interface TelegramBusFollowerRegistrationRuntimeDeps<TContext extends {
     cwd?: string;
 }> {
+    /**
+     * Collapses one sustained heartbeat failure run. Optional at this unit boundary, where an absent port records
+     * every failure; the runtime assembly requires it so production always supplies the logging domain's owner.
+     */
+    failureLog?: TelegramFailureRunLogPort;
     instanceId: string;
     createRequestId: () => string;
     protocolIdentity: TelegramBusProtocolIdentity;
@@ -291,6 +311,8 @@ export interface TelegramBusFollowerRuntimeAssemblyPorts<TContext extends {
     cwd?: string;
 }> {
     instanceId: string;
+    /** Collapses one sustained heartbeat failure run; the composition root supplies the logging domain's owner. */
+    failureLog: TelegramFailureRunLogPort;
     registrationState: TelegramBusFollowerRegistrationState;
     recordRuntimeEvent: (category: string, error: unknown, details?: Record<string, unknown>) => void;
     receiver: Omit<TelegramBusForwardedUpdateReceiverRuntimeDeps<TContext>, "instanceId" | "recordRuntimeEvent" | "getRegistrationGeneration">;

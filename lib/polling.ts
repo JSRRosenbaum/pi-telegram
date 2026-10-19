@@ -6,6 +6,16 @@
 
 type MaybePromise<T> = T | Promise<T>;
 
+/**
+ * Structural port for run-collapsing diagnostics: a repeated identical failure extends its run instead of logging
+ * again, and the closing success records one outcome. The composition root owns the collapsed implementation.
+ */
+export interface TelegramRepeatedFailureLogPort {
+  record: (error: unknown, details?: Record<string, unknown>) => void;
+  settled: () => void;
+  reset: () => void;
+}
+
 export interface TelegramPollingConfig {
   botToken?: string;
 }
@@ -682,6 +692,8 @@ export interface TelegramStartupThreadCapabilityProbeDeps extends TelegramThread
 export interface TelegramThreadCapabilityRuntimeDeps<
   TContext,
 > extends TelegramThreadCapabilityReaderDeps {
+  /** Collapses one sustained probe failure run; the caller supplies its owner. */
+  failureLog: TelegramRepeatedFailureLogPort;
   lifecycle?: TelegramThreadCapabilityLifecycle;
   topicTargetStore: TelegramThreadCapabilityStore;
   ownsLock: (ctx: TContext) => boolean;
@@ -803,6 +815,8 @@ export interface TelegramThreadCapabilityOrchestrationDeps<TContext, TOwner>
   extends
     TelegramThreadCapabilityReaderDeps,
     TelegramThreadAwarePollingControls<TContext, TOwner> {
+  /** Collapses one sustained probe failure run; the composition root supplies its owner. */
+  failureLog: TelegramRepeatedFailureLogPort;
   state: TelegramThreadCapabilityStateRuntime;
   topicTargetStore: TelegramThreadCapabilityStore;
   ownsLock: (ctx: TContext) => boolean;
@@ -882,6 +896,7 @@ export function createTelegramThreadCapabilityOrchestration<TContext, TOwner>(
     isTopicModeUnavailableError: deps.isTopicModeUnavailableError,
     updateStatus: deps.updateStatus,
     recordEvent: deps.recordEvent,
+    failureLog: deps.failureLog,
   };
   return {
     monitor: createTelegramThreadCapabilityMonitor(capabilityDeps),
@@ -1269,8 +1284,34 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
   let generation = 0;
   let transitionPromise: Promise<void> | undefined;
   let consecutiveDisabledProbes = 0;
+  // An absent leader endpoint repeats one identical probe failure every interval; the port collapses the run.
+  // Running it through one guard keeps a faulty diagnostics port from breaking probes or the interval callback.
+  const capabilityFailureLog: TelegramRepeatedFailureLogPort = {
+    record(error, details) {
+      try {
+        deps.failureLog.record(error, details);
+      } catch {
+        // Monitor diagnostics cannot create an uncaught interval exception.
+      }
+    },
+    settled() {
+      try {
+        deps.failureLog.settled();
+      } catch {
+        // Monitor diagnostics cannot fail a completed probe.
+      }
+    },
+    reset() {
+      try {
+        deps.failureLog.reset();
+      } catch {
+        // Monitor diagnostics cannot fail a monitor stop.
+      }
+    },
+  };
   const stop = (): void => {
     generation += 1;
+    capabilityFailureLog.reset();
     if (interval) clearInterval(interval);
     interval = undefined;
     deps.lifecycle?.invalidate();
@@ -1287,6 +1328,7 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
     tracked = readTelegramThreadCapability(deps)
       .then(async (threadModeEnabled) => {
         if (!isCurrent()) return;
+        capabilityFailureLog.settled();
         if (threadModeEnabled === undefined) {
           if (
             deps.topicTargetStore.getBotState().threadMode !== "enabled" &&
@@ -1357,11 +1399,7 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
       })
       .catch((error) => {
         if (!isCurrent()) return;
-        try {
-          deps.recordEvent("bus", error, { phase: "capability-monitor" });
-        } catch {
-          // Monitor diagnostics cannot create an unhandled interval rejection.
-        }
+        capabilityFailureLog.record(error);
       })
       .finally(() => {
         if (transitionPromise === tracked) transitionPromise = undefined;
@@ -1384,11 +1422,7 @@ export function createTelegramThreadCapabilityMonitor<TContext>(
           } catch {
             /* Timer shutdown must not escape the callback. */
           }
-          try {
-            deps.recordEvent("bus", error, { phase: "capability-monitor" });
-          } catch {
-            // Monitor diagnostics cannot create an uncaught interval exception.
-          }
+          capabilityFailureLog.record(error);
         }
       }, intervalMs);
       interval.unref?.();

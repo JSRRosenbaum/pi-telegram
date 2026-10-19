@@ -1200,7 +1200,9 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
                         message_thread_id: connectedAnnouncement.target.threadId,
                         text: connectedAnnouncement.text,
                         parse_mode: connectedAnnouncement.parseMode,
-                    });
+                    }, 
+                    // A deleted Thread is this probe's expected answer; the recovery below records it.
+                    { isExpectedError: Threads.isTelegramTopicTargetStaleError });
                     assertRestoreRegistration();
                     if (recoverableTarget || probeRequiredRecord) {
                         const activatedRecord = deps.topicTargetStore.upsert({
@@ -1240,7 +1242,15 @@ export function createTelegramBusFollowerTargetProvisioner(deps) {
                     if (Threads.isTelegramTopicTargetStaleError(error)) {
                         deps.topicTargetStore.markStaleByTarget(result.target, "deleted", error instanceof Error ? error.message : String(error));
                         await deps.topicTargetStore.persist();
+                        const staleTarget = result.target;
                         result = await provisionTarget();
+                        deps.recordRuntimeEvent("telegram", "Telegram follower restore probe found its Thread deleted; re-created it.", {
+                            phase: "topic-lifecycle-restore-probe-recreated",
+                            instanceId: registration.instanceId,
+                            chatId: staleTarget.chatId,
+                            staleThreadId: staleTarget.threadId,
+                            threadId: result.target.threadId,
+                        });
                         connectedAnnouncement =
                             createTelegramBusInstanceLifecycleAnnouncement({
                                 target: result.target,

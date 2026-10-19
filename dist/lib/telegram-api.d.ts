@@ -299,6 +299,8 @@ export interface TelegramApiCallOptions {
     sleep?: (ms: number) => Promise<void>;
     /** Observability hook fired before a 429 retry wait, never for 5xx waits. */
     onRetryWait?: (wait: TelegramApiRetryWait) => void;
+    /** Caller-owned expected failure: still thrown, but the caller records the outcome instead of the API log. */
+    isExpectedError?: (error: unknown) => boolean;
 }
 export declare class TelegramApiAuthorityError extends Error {
     readonly requestIssued: boolean;
