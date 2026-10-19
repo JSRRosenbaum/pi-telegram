@@ -63,6 +63,8 @@ import {
   type TelegramApiClient,
   type TelegramBridgeApiRuntime,
 } from "../lib/telegram-api.ts";
+import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
+import { createTelegramFailureRunLog } from "../lib/logging.ts";
 
 // Production timers are unref'd so they never hold Pi open; a live Pi process keeps the loop alive. Mirror that so
 // Node 22's runner does not abort runtime tests that await those timers.
@@ -2403,11 +2405,8 @@ test("Graceful follower disconnect persists intent and deletes through its live 
     );
     assert.equal(await follower.disconnectFromLeader?.(), true);
 
+    // Private-chat topics cannot be closed, so graceful cleanup deletes directly.
     assert.deepEqual(calls, [
-      {
-        method: "closeForumTopic",
-        body: { chat_id: 77, message_thread_id: 43 },
-      },
       {
         method: "deleteForumTopic",
         body: { chat_id: 77, message_thread_id: 43 },
@@ -2833,7 +2832,9 @@ for (const mode of ["thread", "classic", "thread-unavailable"] as const) {
     const bodies: Array<Record<string, unknown>> = [], failures: unknown[] = [];
     const restoreFetch = setRuntimeTestFetch(async (_input, init) => { bodies.push(parseJsonRequestBody(init) ?? {}); return createRuntimeTelegramApiResponse(true); });
     const client = createTelegramApiClient(() => "123:fixture", { isThreadedMode: () => threaded });
-    const prompt = Runtime.createTelegramPromptDispatchRuntime({ lifecycle: runtime.lifecycle, typing: runtime.typing,
+    const prompt = Runtime.createTelegramPromptDispatchRuntime({
+      failureLog: createPassthroughFailureLog(error => failures.push(error)),
+      lifecycle: runtime.lifecycle, typing: runtime.typing,
       getDefaultChatId: () => 7, isThreadedMode: () => threaded, getTransportAuthority: () => authority,
       isContextActive: value => value === ctx, updateStatus() {}, recordRuntimeEvent(_category, error) { failures.push(error); },
       async sendTypingAction(chatId, options) { apiCalls++; return client.call("sendChatAction", { chat_id: chatId, action: "typing",
@@ -4002,7 +4003,19 @@ for (const boundary of ["current", "context", "canonical", "local", "follower", 
         if (boundary === "follower" || boundary === "classic") {
           assert.equal(captured.routingDeps.captureThreadNameRecipientAuthority(boundary === "classic" ? { chatId: 77 } : target, ctx), undefined);
         } else {
-          const statePath = Paths.resolveTelegramStatePath(dir);
+          // Pi creates a fresh context object per event and command; Thread-name authority follows the session.
+          const sameSessionCtx = createRuntimeExtensionContext({ cwd: "/root-dialog", sessionManager: ctx.sessionManager });
+          const sameSessionAuthority = captured.routingDeps.captureThreadNameRecipientAuthority({ ...target }, sameSessionCtx);
+          assert.equal(typeof sameSessionAuthority, "function");
+          assert.doesNotThrow(sameSessionAuthority, "A fresh context object of the same session keeps Thread-name authority");
+          // A replaced session cannot even capture the authority: the session, not the context object, is authoritative.
+          assert.throws(
+            () => captured.routingDeps.captureThreadNameRecipientAuthority(
+              { ...target },
+              createRuntimeExtensionContext({ cwd: "/root-dialog" }),
+            ),
+            /context|authority/,
+          );          const statePath = Paths.resolveTelegramStatePath(dir);
           Locks.mutateTelegramRuntimeStateSection(statePath, "other", "runtime", () => ({ value: { sentinel: "unrelated-profile" }, result: true }), { isCurrent: () => true });
           const other = Locks.readTelegramRuntimeState(statePath).profiles.other;
           const textBoundary = boundary.startsWith("text-"), callbackBoundary = boundary.startsWith("callback-");
@@ -5414,6 +5427,13 @@ strictFileTest(`Telegram new gateway composes follower suspension, session regis
   const leader = Bus.createTelegramBusLocalServer({ socketPath: leaderPath,
     handleEnvelope: leaderHandler });
   const assembly = BusFollower.createTelegramBusFollowerRuntimeAssembly({ instanceId: "fixture-follower", registrationState,
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "follower-heartbeat",
+      outcomePhase: "follower-heartbeat-recovered",
+      label: "follower heartbeat",
+      record: () => {},
+    }),
     recordRuntimeEvent: () => {}, receiver: { socketPath: followerPath, getAuthSecret: () => "fixture", getContext: () => contexts.get(),
       getRecipientBindingKey: () => recipientKey,
       durableAdmission: BusFollower.createTelegramBusFollowerDurableAdmissionRuntime({ journal: workers, signalWorker: workers.signal }) },
@@ -5554,6 +5574,13 @@ strictFileTest(`Follower registration fences native binding readiness (${outcome
   let contextActive = true;
   let failRefresh = false;
   const assembly = BusFollower.createTelegramBusFollowerRuntimeAssembly({ instanceId: "fixture-follower", registrationState,
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "follower-heartbeat",
+      outcomePhase: "follower-heartbeat-recovered",
+      label: "follower heartbeat",
+      record: () => {},
+    }),
     recordRuntimeEvent: () => {},
     receiver: { socketPath: followerPath, getAuthSecret: () => "fixture", getContext: () => activeCtx,
       getRecipientBindingKey: () => "fixture:recipient",
@@ -8557,8 +8584,8 @@ test("Extension runtime skips proactive local result without Telegram lock owner
   }
 });
 
-for (const draftPreviews of [false, true]) {
-test(`Extension runtime delivers anchored Telegram commentary once before final with preview ${draftPreviews ? "on" : "off"}`, async (t) => {
+for (const [draftPreviews, activity] of [[false, "quiet"], [true, "quiet"], [false, "thinking"], [true, "verbose"]] as const) {
+test(`Extension runtime delivers anchored Telegram commentary once before final with preview ${draftPreviews ? "on" : "off"} (${activity})`, async (t) => {
   const telegramConfig = await createRuntimeTelegramConfigFixture();
   const sentMessages: RuntimeHarnessMessage[] = [];
   const deliveredMarkdown: string[] = [];
@@ -8603,7 +8630,8 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
     if (method === "sendChatAction") {
       return createRuntimeTelegramApiResponse(true);
     }
-    if (method === "sendRichMessageDraft") return createRuntimeTelegramApiResponse(true);
+    if (method === "sendRichMessageDraft" || method === "sendMessageDraft" || method === "editMessageText") return createRuntimeTelegramApiResponse(true);
+    if (method === "sendRichMessage" && !String((body.rich_message as { markdown?: string } | undefined)?.markdown ?? "").includes("Checkpoint") && !String((body.rich_message as { markdown?: string } | undefined)?.markdown ?? "").includes("Final")) return createRuntimeTelegramApiResponse({ message_id: 300 });
     if (method === "sendRichMessage") {
       replyAnchors.push(body.reply_parameters);
       deliveredMarkdown.push(
@@ -8626,7 +8654,7 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       botToken: "123:abc",
       allowedUserId: 77,
       lastUpdateId: 0,
-      assistant: { activity: "quiet", proactivePush: true, draftPreviews },
+      assistant: { activity, proactivePush: true, draftPreviews, rendering: "rich" },
     });
     await writeRuntimeTelegramLocks({});
     (await getRuntimeTelegramExtension())(pi);
@@ -8649,6 +8677,10 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       content: [{ type: "text", text: "Checkpoint **visible**" }],
     };
     await handlers.get("message_start")?.({ message: checkpointMessage }, activeCtx);
+    await handlers.get("message_update")?.({ message: checkpointMessage, assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "planning the tool call", partial: checkpointMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: checkpointMessage, assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "planning the tool call", partial: checkpointMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: checkpointMessage, assistantMessageEvent: { type: "text_start", contentIndex: 1, partial: checkpointMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: checkpointMessage, assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "Checkpoint **visible**", partial: checkpointMessage } }, activeCtx);
     await handlers.get("message_update")?.(
       {
         message: checkpointMessage,
@@ -8673,7 +8705,9 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
       activeCtx,
     );
     await handlers.get("message_end")?.({ message: { ...checkpointMessage, stopReason: "toolUse" } }, activeCtx);
-    await waitForRuntimeState(t, "anchored commentary", () => deliveredMarkdown.length === 1);
+    await handlers.get("tool_execution_start")?.({ toolCallId: "probe", toolName: "bash", args: { command: "sleep 30" } }, activeCtx);
+    await waitForRuntimeState(t, "anchored commentary before tool end", () => deliveredMarkdown.length === 1);
+    await handlers.get("tool_execution_end")?.({ toolCallId: "probe", toolName: "bash", result: { content: [] }, isError: false }, activeCtx);
     const finalMessage = {
       role: "assistant",
       content: [{ type: "text", text: "Final **answer**" }],
@@ -8729,6 +8763,70 @@ test(`Extension runtime delivers anchored Telegram commentary once before final 
   }
 }, 20_000);
 
+}
+
+for (const [draftPreviews, activity] of [[false, "thinking"], [true, "quiet"]] as const) {
+test(`Extension runtime delivers the final answer before automatic compaction completes (${activity}, preview ${draftPreviews ? "on" : "off"})`, async (t) => {
+  const telegramConfig = await createRuntimeTelegramConfigFixture();
+  const deliveredMarkdown: string[] = [];
+  let dispatched = false;
+  let shutdownContext: ReturnType<typeof createRuntimeExtensionContext> | undefined;
+  const { handlers, commands, pi } = createRuntimePiHarness({ sendUserMessage: () => { dispatched = true; } });
+  let getUpdatesCalls = 0;
+  const restoreFetch = setRuntimeTestFetch(async (input, init) => {
+    const method = getRuntimeTelegramApiMethod(input);
+    const body = parseJsonRequestBody(init) ?? {};
+    if (method === "deleteWebhook" || method === "setMyCommands" || method === "sendChatAction") return createRuntimeTelegramApiResponse(true);
+    if (method === "sendRichMessageDraft" || method === "sendMessageDraft" || method === "editMessageText") return createRuntimeTelegramApiResponse(true);
+    if (method === "getUpdates") {
+      getUpdatesCalls += 1;
+      if (getUpdatesCalls === 1) return createRuntimeTelegramApiResponse([{ _: "other", update_id: 1, message: { message_id: 10,
+        chat: { id: 77, type: "private" }, from: { id: 77, is_bot: false, first_name: "Test" }, text: "finish then compact" } }]);
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("stop", "AbortError")));
+      });
+    }
+    if (method === "sendRichMessage" || method === "sendMessage") {
+      deliveredMarkdown.push(String((body.rich_message as { markdown?: string } | undefined)?.markdown ?? body.text ?? ""));
+      return createRuntimeTelegramApiResponse({ message_id: 100 + deliveredMarkdown.length });
+    }
+    throw new Error(`Unexpected Telegram API method: ${method}`);
+  });
+  try {
+    await telegramConfig.write({ botToken: "123:abc", allowedUserId: 77, lastUpdateId: 0,
+      assistant: { activity, proactivePush: true, draftPreviews, rendering: "rich" } });
+    await writeRuntimeTelegramLocks({});
+    (await getRuntimeTelegramExtension())(pi);
+    const idleCtx = createRuntimeExtensionContext();
+    shutdownContext = idleCtx;
+    const activeCtx = createRuntimeExtensionContext({ sessionManager: idleCtx.sessionManager, isIdle: () => false });
+    await handlers.get("session_start")?.({}, idleCtx);
+    await commands.get("telegram-connect")?.handler("", idleCtx);
+    await waitForRuntimeState(t, "initial prompt dispatch", () => dispatched);
+    await handlers.get("agent_start")?.({}, activeCtx);
+    const finalMessage = { role: "assistant", content: [{ type: "text", text: "Final **before compaction**" }] };
+    await handlers.get("message_start")?.({ message: finalMessage }, activeCtx);
+    await handlers.get("message_update")?.({ message: finalMessage, assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: finalMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: finalMessage, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Final **before compaction**", partial: finalMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: finalMessage, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: "Final **before compaction**", partial: finalMessage } }, activeCtx);
+    await handlers.get("message_update")?.({ message: finalMessage, assistantMessageEvent: { type: "done", reason: "stop", message: finalMessage } }, activeCtx);
+    await handlers.get("message_end")?.({ message: { ...finalMessage, stopReason: "stop" } }, activeCtx);
+    await handlers.get("agent_end")?.({ messages: [{ ...finalMessage, stopReason: "stop" }] }, activeCtx);
+    // Pi runs automatic compaction after agent_end and before agent_settled.
+    await handlers.get("session_before_compact")?.({ reason: "threshold", signal: new AbortController().signal }, activeCtx);
+    await waitForRuntimeState(t, "final answer while compaction is still running",
+      () => deliveredMarkdown.includes("Final **before compaction**"));
+    await handlers.get("session_compact")?.({ reason: "threshold" }, activeCtx);
+    await handlers.get("agent_settled")?.({ aborted: false }, activeCtx);
+  } finally {
+    try {
+      if (shutdownContext) await handlers.get("session_shutdown")?.({}, shutdownContext);
+    } finally {
+      restoreFetch();
+      await telegramConfig.restore();
+    }
+  }
+}, 20_000);
 }
 
 test("Extension runtime preserves both busy Next notices through follower queue admission", async (t) => {

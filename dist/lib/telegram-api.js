@@ -1134,7 +1134,8 @@ export function createTelegramBridgeApiRuntime(deps) {
                     "Telegram API deleteMessage failed: HTTP 400: Bad Request: message to delete not found") {
                 return true;
             }
-            deps.recordRuntimeEvent("api", error, withTelegramTransportDiagnostics(error, { method }));
+            if (!options?.isExpectedError?.(error))
+                deps.recordRuntimeEvent("api", error, withTelegramTransportDiagnostics(error, { method }));
             throw error;
         }
     };

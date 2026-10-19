@@ -401,6 +401,8 @@ export interface TelegramApiCallOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Observability hook fired before a 429 retry wait, never for 5xx waits. */
   onRetryWait?: (wait: TelegramApiRetryWait) => void;
+  /** Caller-owned expected failure: still thrown, but the caller records the outcome instead of the API log. */
+  isExpectedError?: (error: unknown) => boolean;
 }
 
 export class TelegramApiAuthorityError extends Error {
@@ -2197,11 +2199,12 @@ export function createTelegramBridgeApiRuntime(
       ) {
         return true as TResponse;
       }
-      deps.recordRuntimeEvent(
-        "api",
-        error,
-        withTelegramTransportDiagnostics(error, { method }),
-      );
+      if (!options?.isExpectedError?.(error))
+        deps.recordRuntimeEvent(
+          "api",
+          error,
+          withTelegramTransportDiagnostics(error, { method }),
+        );
       throw error;
     }
   };

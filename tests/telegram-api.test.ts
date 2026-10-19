@@ -776,6 +776,25 @@ test("Telegram bridge API runtime includes thread target on chat actions", async
   ]);
 });
 
+test("Telegram bridge API runtime leaves caller-owned expected failures to the caller's diagnostics", async () => {
+  const logged: unknown[] = [];
+  const runtime = createTelegramBridgeApiRuntime({
+    client: createApiRuntimeClient({
+      call: async () => {
+        throw new Error("Telegram API sendMessage failed: HTTP 400: Bad Request: message thread not found");
+      },
+    }),
+    tempDir: "/tmp",
+    maxFileSizeBytes: 1,
+    tempFileMaxAgeMs: 1,
+    recordRuntimeEvent: (_category, error) => logged.push(error),
+  });
+  await assert.rejects(runtime.call("sendMessage", { chat_id: 7 }, { isExpectedError: () => true }), /thread not found/);
+  assert.deepEqual(logged, [], "an expected failure is still thrown but not logged as an API error");
+  await assert.rejects(runtime.call("sendMessage", { chat_id: 7 }, { isExpectedError: () => false }), /thread not found/);
+  assert.equal(logged.length, 1, "an unexpected failure keeps the API diagnostic");
+});
+
 test("Telegram bridge API runtime owns reply-markup edits", async () => {
   const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
   const runtime = createTelegramBridgeApiRuntime({

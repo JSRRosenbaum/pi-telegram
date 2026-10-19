@@ -162,6 +162,34 @@ function updateTelegramRuntimeStatusSafely(updateStatus, ctx, options) {
 }
 export function createTelegramTypingLoopStarter(deps) {
     let currentOwner;
+    // An unreachable transport repeats one identical presence failure every tick; the port collapses the run.
+    // Running it through one guard keeps a faulty diagnostics port from escaping the in-flight action owner.
+    const typingFailureLog = {
+        record(error, details) {
+            try {
+                deps.failureLog.record(error, details);
+            }
+            catch {
+                // Typing diagnostics cannot escape the in-flight action owner.
+            }
+        },
+        settled() {
+            try {
+                deps.failureLog.settled();
+            }
+            catch {
+                // A successful presence outranks its own diagnostic.
+            }
+        },
+        reset() {
+            try {
+                deps.failureLog.reset();
+            }
+            catch {
+                // Typing diagnostics cannot fail a loop stop.
+            }
+        },
+    };
     return (ctx, chatId, options) => {
         const sessionGeneration = deps.getSessionGeneration?.();
         const transportAuthority = deps.getTransportAuthority?.();
@@ -214,6 +242,7 @@ export function createTelegramTypingLoopStarter(deps) {
                                 throw new Error("Typing context authority changed.");
                         },
                     });
+                    typingFailureLog.settled();
                 }
                 catch (error) {
                     if (!active)
@@ -222,19 +251,13 @@ export function createTelegramTypingLoopStarter(deps) {
                         deps.typing.stop();
                         return;
                     }
-                    try {
-                        deps.recordRuntimeEvent?.("typing", error, {
-                            chatId: targetChatId,
-                        });
-                    }
-                    catch {
-                        // Typing diagnostics cannot escape the in-flight action owner.
-                    }
+                    typingFailureLog.record(error, { chatId: targetChatId });
                 }
             },
             shouldContinue: canContinue,
             onStopped: () => {
                 active = false;
+                typingFailureLog.reset();
                 if (currentOwner === owner)
                     currentOwner = undefined;
             },

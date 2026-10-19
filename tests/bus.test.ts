@@ -2016,6 +2016,32 @@ test("Bus local client transport events include request diagnostics", async () =
   }
 });
 
+test("Bus local client logs the first failure and the outcome, not every retry attempt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-client-retry-log-"));
+  const socketPath = join(dir, "bus.sock");
+  const envelope = { kind: "follower.heartbeat" as const, requestId: "inst-a:retry-log", instanceId: "inst-a", sentAtMs: 2000 };
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (request) => ({ kind: "bus.ack", requestId: request.requestId, ok: true }),
+  });
+  try {
+    const failed: string[] = [];
+    await assert.rejects(sendTelegramBusLocalEnvelope({ socketPath, envelope, retry: { attempts: 6, delayMs: 1 },
+      recordTransportEvent: (phase, details) => failed.push(`${phase}:${details.attempt}`) }));
+    assert.deepEqual(failed, ["client-failed:1", "client-retry:1", "client-failed:6"]);
+    const recovered: string[] = [];
+    setTimeout(() => void server.start(), 30);
+    await sendTelegramBusLocalEnvelope({ socketPath, envelope, retry: { attempts: 200, delayMs: 5 },
+      recordTransportEvent: (phase, details) => recovered.push(`${phase}:${details.attempt}`) });
+    assert.deepEqual(recovered.slice(0, 2), ["client-failed:1", "client-retry:1"]);
+    assert.equal(recovered.length, 3);
+    assert.match(recovered[2]!, /^client-recovered:\d+$/);
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus local client classifies response timeouts as transport timeouts", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-client-timeout-"));
   const socketPath = join(dir, "bus.sock");

@@ -23,6 +23,7 @@ import * as WorkspaceIdentity from "./workspace-identity.js";
 const TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS = 2_500;
 const TELEGRAM_FOLLOWER_SESSION_HANDOFF_TTL_MS = 30_000;
 const TELEGRAM_BUS_FOLLOWER_CLIENT_TIMEOUT_MS = 30_000;
+const TELEGRAM_BUS_FOLLOWER_API_SLOW_CALL_MS = 1_500;
 const TELEGRAM_BUS_FOLLOWER_REGISTRATION_WAIT_MS = 30_000;
 export const TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_MS = TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS;
 const TELEGRAM_BUS_FOLLOWER_REGISTRATION_RETRY_ATTEMPTS = TELEGRAM_BUS_REGISTRATION_RETRY.attempts;
@@ -213,6 +214,7 @@ export function createTelegramBusFollowerRuntimeAssembly(ports) {
     });
     registration = createTelegramBusFollowerRegistrationRuntime({
         ...ports.registration,
+        failureLog: ports.failureLog,
         ...sharedRuntimeDeps,
         startReceiving: receiver.start,
         stopReceiving: receiver.stop,
@@ -677,6 +679,7 @@ export function createTelegramBusFollowerClientRuntime(deps) {
             instanceId: deps.instanceId,
             getAuthSecret: deps.getApiAuthSecret,
             getRegistrationGeneration: deps.getRegistrationGeneration,
+            recordRuntimeEvent: deps.recordRuntimeEvent,
         }),
         agentMessages: createTelegramBusAgentMessageClient({
             ...sharedClientDeps,
@@ -947,11 +950,13 @@ export function createTelegramBusFollowerSelectedMenuCaller(deps) {
 export function createTelegramBusFollowerApiCaller(deps) {
     const getNowMs = deps.getNowMs ?? Date.now;
     const timeoutMs = deps.timeoutMs ?? TELEGRAM_BUS_FOLLOWER_CLIENT_TIMEOUT_MS;
-    return async (method, args, localOptions) => {
+    const slowCallMs = deps.slowCallMs ?? TELEGRAM_BUS_FOLLOWER_API_SLOW_CALL_MS;
+    const caller = async (method, args, localOptions, timing) => {
         const assertion = localOptions?.assertAuthority;
         const assertCurrent = () => assertTelegramApiCallAuthority(assertion, false);
         assertCurrent();
         const registration = await resolveTelegramBusFollowerRegistration(deps, timeoutMs);
+        timing.registeredAtMs = getNowMs();
         assertCurrent();
         const socketPath = resolveTelegramBusSocketPath(deps.socketPath);
         let response;
@@ -998,6 +1003,42 @@ export function createTelegramBusFollowerApiCaller(deps) {
             throw new TelegramApiCommitUnknownError(response.error.method ?? method, new Error(message ?? "Telegram bus API call result is ambiguous."));
         }
         throw new Error(message ?? "Telegram bus API call failed.");
+    };
+    return async (method, args, localOptions) => {
+        const startedAtMs = getNowMs();
+        const timing = {};
+        let outcome = "ok";
+        try {
+            return await caller(method, args, localOptions, timing);
+        }
+        catch (error) {
+            outcome = "error";
+            throw error;
+        }
+        finally {
+            const elapsedMs = getNowMs() - startedAtMs;
+            if (elapsedMs >= slowCallMs) {
+                const apiMethod = (method === "call" || method === "callMultipart") &&
+                    typeof args[0] === "string"
+                    ? args[0]
+                    : method;
+                try {
+                    deps.recordRuntimeEvent?.("bus", `Telegram bus follower API call was slow (${elapsedMs}ms).`, {
+                        phase: "follower-api-slow",
+                        method: apiMethod,
+                        elapsedMs,
+                        registrationWaitMs: (timing.registeredAtMs ?? getNowMs()) - startedAtMs,
+                        ...(timing.registeredAtMs === undefined
+                            ? {}
+                            : { transportMs: getNowMs() - timing.registeredAtMs }),
+                        outcome,
+                    });
+                }
+                catch {
+                    // Diagnostics cannot change the API call outcome.
+                }
+            }
+        }
     };
 }
 async function resolveTelegramBusFollowerRegistration(deps, timeoutMs) {
@@ -1447,10 +1488,16 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler(deps) {
         const promoteToLeader = async (reason, ctx, binding, election) => {
             if (!isCurrent())
                 return;
-            const activeCtx = deps.getActiveContext?.();
-            if (deps.getActiveContext && activeCtx !== ctx) {
-                scheduleRecovery(reason, ctx, binding);
-                return;
+            if (deps.getActiveContext) {
+                // Pi hands every event and command a fresh context object, so a manually connected follower never holds
+                // the stored session object. Promote through the live session context instead of rescheduling: heartbeat
+                // failures re-request recovery faster than the retry grace, so a reschedule-only path never fires.
+                const activeCtx = deps.getActiveContext();
+                if (!activeCtx) {
+                    scheduleRecovery(reason, ctx, binding);
+                    return;
+                }
+                ctx = activeCtx;
             }
             deps.setLifecyclePhase("electing");
             safeUpdateStatus(ctx);
@@ -1629,6 +1676,8 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
         (!deps.registrationState ||
             deps.registrationState.getGeneration() === generation);
     const stopHeartbeat = () => {
+        // A stopped heartbeat ends the current failure run, so a later run logs its own first failure.
+        heartbeatFailureLog.reset();
         if (!heartbeatInterval)
             return;
         clearInterval(heartbeatInterval);
@@ -1659,6 +1708,22 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
             }
         });
     };
+    /** A sustained leader outage repeats one identical failure every interval; the port collapses the run. */
+    const heartbeatFailureLog = deps.failureLog ?? {
+        record(error) {
+            try {
+                deps.recordRuntimeEvent?.("bus", error, {
+                    phase: "follower-heartbeat",
+                });
+            }
+            catch {
+                // Diagnostics cannot replace heartbeat recovery.
+            }
+            return true;
+        },
+        settled: () => undefined,
+        reset: () => undefined,
+    };
     const sendHeartbeat = async () => {
         const leaderSocketPath = activeLeaderSocketPath;
         const registrationGeneration = activeRegistrationGeneration;
@@ -1681,6 +1746,7 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
             if (!isCurrentHeartbeat())
                 return;
             if (response?.kind === "bus.ack" && response.ok) {
+                heartbeatFailureLog.settled();
                 const heartbeatResult = isRecord(response.result)
                     ? response.result
                     : undefined;
@@ -1707,14 +1773,7 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
         catch (error) {
             if (!isCurrentHeartbeat())
                 return;
-            try {
-                deps.recordRuntimeEvent?.("bus", error, {
-                    phase: "follower-heartbeat",
-                });
-            }
-            catch {
-                // Diagnostics cannot replace heartbeat recovery.
-            }
+            heartbeatFailureLog.record(error);
             if (!heartbeatContext)
                 return;
             try {
@@ -1956,10 +2015,10 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
             return false;
         },
         setContext(ctx) {
+            // Pi hands every event a fresh context object. Only a replaced session drops an in-flight attempt.
             if (registrationAttempt &&
-                (registrationAttempt.ctx !== ctx ||
-                    registrationAttempt.sessionGeneration !==
-                        deps.getSessionGeneration?.() ||
+                (registrationAttempt.sessionGeneration !==
+                    deps.getSessionGeneration?.() ||
                     registrationAttempt.sessionId !== deps.getSessionId?.(ctx)))
                 registrationAttempt = undefined;
             activeContext = ctx;

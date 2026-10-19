@@ -8,6 +8,8 @@ import testRoot, { type TestContext } from "node:test";
 
 import * as Runtime from "../lib/runtime.ts";
 import { createTelegramThreadTarget } from "../lib/target.ts";
+import { createPassthroughFailureLog } from "./fixtures/failure-log.ts";
+import { createTelegramFailureRunLog } from "../lib/logging.ts";
 
 type RuntimeTestHandler = (context: TestContext) => void | Promise<void>;
 function test(name: string, fn: RuntimeTestHandler): void {
@@ -441,6 +443,7 @@ test("Prompt dispatch runtime binds typing starter and dispatch lifecycle", asyn
   const promptRuntime = Runtime.createTelegramPromptDispatchRuntime<{
     id: string;
   }>({
+    failureLog: createPassthroughFailureLog(),
     lifecycle: runtime.lifecycle,
     typing: runtime.typing,
     getDefaultChatId: () => 7,
@@ -466,6 +469,7 @@ test("Typing loop starter uses a conservative native keepalive interval", () => 
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter<{
     id: string;
   }>({
+    failureLog: createPassthroughFailureLog(),
     typing: {
       start: (deps) => {
         capturedIntervalMs = deps.intervalMs;
@@ -491,6 +495,7 @@ test("Typing loop starter sends one exact thread action", async () => {
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter<{
     id: string;
   }>({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => undefined,
     sendTypingAction: async (chatId, options) => {
@@ -509,11 +514,64 @@ test("Typing loop starter sends one exact thread action", async () => {
   assert.equal(runtime.typing.stop(), true);
 });
 
+test("Typing loop starter collapses one sustained presence failure into a failure and an outcome record", async () => {
+  const runtime = Runtime.createTelegramBridgeRuntime();
+  const events: Array<{ category: string; details?: Record<string, unknown> }> = [];
+  let failing = true;
+  let attempts = 0;
+  const startTypingLoop = Runtime.createTelegramTypingLoopStarter<{ id: string }>({
+    failureLog: createTelegramFailureRunLog({
+      category: "typing",
+      failurePhase: "typing-presence",
+      outcomePhase: "typing-presence-recovered",
+      label: "typing presence",
+      record: (category, errorOrMessage, details) =>
+        events.push({ category, details: { ...details, message: String(errorOrMessage) } }),
+    }),
+    typing: runtime.typing,
+    getDefaultChatId: () => 7,
+    sendTypingAction: async () => {
+      attempts += 1;
+      if (failing) throw Object.assign(new Error("connect ENOENT"), { code: "ENOENT" });
+    },
+    updateStatus: () => {},
+    recordRuntimeEvent: (category, errorOrMessage, details) =>
+      events.push({ category, details: { ...details, message: String(errorOrMessage) } }),
+    intervalMs: 5,
+  });
+  const failures = () => events.filter((event) => event.details?.phase === "typing-presence");
+  const recovered = () => events.find((event) => event.details?.phase === "typing-presence-recovered");
+  try {
+    startTypingLoop({ id: "ctx" }, 7);
+    for (let tick = 0; tick < 50 && (attempts < 3 || failures().length === 0); tick += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(attempts >= 3, `expected repeated failing ticks, saw ${attempts}`);
+    assert.equal(failures().length, 1, "a repeated identical presence failure is logged once");
+    assert.equal(failures()[0]?.category, "typing");
+    assert.equal(failures()[0]?.details?.chatId, 7);
+    assert.equal(failures()[0]?.details?.failureSignature, "ENOENT");
+    // Liveness is untouched: every failed tick still ran through the loop.
+    assert.ok(attempts > failures().length);
+    failing = false;
+    for (let tick = 0; tick < 50 && !recovered(); tick += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(recovered(), "a working presence closes the failure run");
+    assert.match(String(recovered()?.details?.message), /recovered after \d+ failed attempts/u);
+    assert.ok(Number(recovered()?.details?.failedAttempts) >= 3);
+  } finally {
+    runtime.typing.stop();
+  }
+});
+
 for (const threaded of [false, true]) {
   test(`Prompt dispatch starts typing in its exact queued destination (threaded=${threaded})`, async () => {
     const runtime = Runtime.createTelegramBridgeRuntime();
     const calls: Array<{ chatId: number; threadId?: number }> = [];
-    const prompt = Runtime.createTelegramPromptDispatchRuntime({ lifecycle: runtime.lifecycle, typing: runtime.typing,
+    const prompt = Runtime.createTelegramPromptDispatchRuntime({
+   failureLog: createPassthroughFailureLog(),
+   lifecycle: runtime.lifecycle, typing: runtime.typing,
       getDefaultChatId: () => 7, isThreadedMode: () => threaded,
       sendTypingAction: async (chatId, options) => { calls.push({ chatId, threadId: options?.message_thread_id }); }, updateStatus() {} });
     const target = threaded ? { chatId: 7, threadId: 42 } : { chatId: 7 };
@@ -528,7 +586,9 @@ for (const threaded of [false, true]) {
 for (const threadId of [undefined, 0, -1, 1.5, NaN]) {
   test(`Threaded typing refuses an unavailable or invalid Thread before starting (thread=${threadId})`, async () => {
     const typing = Runtime.createTelegramTypingLoop(); let calls = 0;
-    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7, isThreadedMode: () => true,
+    const start = Runtime.createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing, getDefaultChatId: () => 7, isThreadedMode: () => true,
       sendTypingAction: async () => { calls++; }, updateStatus() {} });
     try {
       assert.equal(start({}, 7, { target: { chatId: 7, ...(threadId === undefined ? {} : { threadId }) } }), false);
@@ -541,7 +601,9 @@ test("A Classic typing loop stops when Threaded Mode activates, without replacin
   ctx.mock.timers.enable({ apis: ["setInterval"] });
   const typing = Runtime.createTelegramTypingLoop(); let threaded = false;
   const calls: Array<{ chatId: number; threadId?: number }> = [];
-  const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7, isThreadedMode: () => threaded,
+  const start = Runtime.createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing, getDefaultChatId: () => 7, isThreadedMode: () => threaded,
     sendTypingAction: async (chatId, options) => { calls.push({ chatId, threadId: options?.message_thread_id }); }, updateStatus() {} });
   try {
     assert.equal(start({}), true); await flushMicrotasks(); assert.deepEqual(calls, [{ chatId: 7, threadId: undefined }]);
@@ -562,6 +624,7 @@ test("Typing loop skips interval ticks while the previous action is in flight", 
   });
   let calls = 0;
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: async () => {
@@ -594,9 +657,20 @@ test("Typing loop records failures without changing bridge status", async () => 
   const sentChatIds: number[] = [];
   const statusErrors: string[] = [];
   const runtimeEvents: string[] = [];
+  const recordTypingEvent = (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => {
+    const message = error instanceof Error ? error.message : String(error);
+    runtimeEvents.push(`${category}:${message}:${details?.chatId}`);
+  };
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter<{
     id: string;
   }>({
+    failureLog: createPassthroughFailureLog((error, details) =>
+      recordTypingEvent("typing", error, details),
+    ),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: async (chatId) => {
@@ -605,10 +679,7 @@ test("Typing loop records failures without changing bridge status", async () => 
     updateStatus: (_ctx: { id: string }, error?: string) => {
       if (error) statusErrors.push(error);
     },
-    recordRuntimeEvent: (category, error, details) => {
-      const message = error instanceof Error ? error.message : String(error);
-      runtimeEvents.push(`${category}:${message}:${details?.chatId}`);
-    },
+    recordRuntimeEvent: recordTypingEvent,
     intervalMs: 1000,
   });
   startTypingLoop({ id: "ctx" });
@@ -620,6 +691,9 @@ test("Typing loop records failures without changing bridge status", async () => 
   const startFailingTypingLoop = Runtime.createTelegramTypingLoopStarter<{
     id: string;
   }>({
+    failureLog: createPassthroughFailureLog((error, details) =>
+      recordTypingEvent("typing", error, details),
+    ),
     typing: runtime.typing,
     getDefaultChatId: () => undefined,
     sendTypingAction: async () => {
@@ -628,10 +702,7 @@ test("Typing loop records failures without changing bridge status", async () => 
     updateStatus: (_ctx: { id: string }, error?: string) => {
       if (error) failingStatusErrors.push(error);
     },
-    recordRuntimeEvent: (category, error, details) => {
-      const message = error instanceof Error ? error.message : String(error);
-      runtimeEvents.push(`${category}:${message}:${details?.chatId}`);
-    },
+    recordRuntimeEvent: recordTypingEvent,
     intervalMs: 1000,
   });
   startFailingTypingLoop({ id: "ctx" }, 8);
@@ -645,6 +716,7 @@ test("Typing loop does not start without Telegram transport authority", async ()
   const runtime = Runtime.createTelegramBridgeRuntime();
   let calls = 0;
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: async () => {
@@ -666,6 +738,7 @@ test("Typing loop stops after authority loss even when a request never settles",
   let available = true;
   let calls = 0;
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: () => {
@@ -693,6 +766,7 @@ test("Typing loop observes authority loss between successful timer ticks", async
   let available = true;
   let calls = 0;
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: async () => {
@@ -718,6 +792,7 @@ test("Typing loop replacement detaches a permanently pending old request", async
   const runtime = Runtime.createTelegramBridgeRuntime();
   const calls: number[] = [];
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: (chatId) => {
@@ -744,6 +819,7 @@ test("Typing loop restarts after authority loss with an old request pending", as
   let available = true;
   const calls: number[] = [];
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: (chatId) => {
@@ -776,6 +852,7 @@ test("Typing loop replacement fences late failures from the old loop", async (ct
   const statusErrors: string[] = [];
   const runtimeEvents: string[] = [];
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: (chatId) => {
@@ -815,6 +892,7 @@ test("Typing loop stops quietly when Telegram transport authority is lost", asyn
   const statusErrors: string[] = [];
   const runtimeEvents: string[] = [];
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: () =>
@@ -848,6 +926,7 @@ test("Typing loop fences late failures across transport authority generations", 
   const statusErrors: string[] = [];
   const runtimeEvents: string[] = [];
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: (chatId) => {
@@ -887,7 +966,9 @@ for (const threaded of [false, true]) {
   test(`Stale context cannot start or replace current typing with the same transport epoch (threaded=${threaded})`, async (t) => {
     t.mock.timers.enable({ apis: ["setInterval"] });
     const typing = Runtime.createTelegramTypingLoop(), current = {}, stale = {}, calls: number[] = [];
-    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+    const start = Runtime.createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing, getDefaultChatId: () => 7,
       isThreadedMode: () => threaded, getTransportAuthority: () => "unchanged", isContextActive: ctx => ctx === current,
       sendTypingAction: async (_chat, options) => { calls.push(options?.message_thread_id ?? 0); }, updateStatus() {} });
     try {
@@ -906,7 +987,9 @@ for (const pending of [false, true]) {
   test(`Typing stops after context loss under the same transport epoch (pending=${pending})`, async (t) => {
     t.mock.timers.enable({ apis: ["setInterval"] });
     const typing = Runtime.createTelegramTypingLoop(); let active = true, calls = 0;
-    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+    const start = Runtime.createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing, getDefaultChatId: () => 7,
       isThreadedMode: () => true, getTransportAuthority: () => "unchanged", isContextActive: () => active,
       sendTypingAction: async () => { calls++; if (pending) await new Promise(() => {}); }, updateStatus() {} });
     try {
@@ -922,7 +1005,9 @@ for (const pending of [false, true]) {
     t.mock.timers.enable({ apis: ["setInterval"] });
     const typing = Runtime.createTelegramTypingLoop(), ctx = {}, calls: number[] = [], failures: unknown[] = [];
     let generation = 1, rejectOld: ((error: Error) => void) | undefined;
-    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+    const start = Runtime.createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing, getDefaultChatId: () => 7,
       isThreadedMode: () => true, getTransportAuthority: () => "unchanged", isContextActive: () => true,
       getSessionGeneration: () => generation,
       sendTypingAction: async (_chat, options) => { const threadId = options?.message_thread_id ?? 0; calls.push(threadId);
@@ -941,7 +1026,9 @@ for (const pending of [false, true]) {
 for (const replace of [false, true]) test(`Context loss before the scheduled first action refuses sending (replacement=${replace})`, async () => {
   const typing = Runtime.createTelegramTypingLoop(), old = {}, replacement = {}, calls: number[] = [];
   let current = old;
-  const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+  const start = Runtime.createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing, getDefaultChatId: () => 7,
     isContextActive: ctx => ctx === current, getTransportAuthority: () => "unchanged", isThreadedMode: () => true,
     sendTypingAction: async (_chat, options) => { calls.push(options?.message_thread_id ?? 0); }, updateStatus() {} });
   try {
@@ -959,6 +1046,7 @@ for (const stage of ["before-issuance", "after-issuance"] as const) {
     let release!: () => void, issued = 0, completed = 0;
     const held = new Promise<void>(resolve => { release = resolve; });
     const start = Runtime.createTelegramTypingLoopStarter({
+      failureLog: createPassthroughFailureLog(),
       typing, getDefaultChatId: () => 7, isContextActive: value => value === ctx,
       getSessionGeneration: () => 1, getTransportAuthority: () => "unchanged", isThreadedMode: () => true,
       async sendTypingAction(_chat, options) {
@@ -990,6 +1078,7 @@ for (const withGeneration of [true, false]) {
     let release!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const start = Runtime.createTelegramTypingLoopStarter<typeof first>({
+      failureLog: createPassthroughFailureLog(),
       typing, getDefaultChatId: () => 7, isContextActive: ctx => ctx.sessionManager === sessionManager,
       ...(withGeneration ? { getSessionGeneration: () => 1 } : {}),
       getTransportAuthority: () => "unchanged", isThreadedMode: () => true,
@@ -1014,6 +1103,7 @@ for (const changed of ["context", "generation", "transport", "chat", "thread", "
     let current = firstContext, generation = 1, authority = "first", release!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const start = Runtime.createTelegramTypingLoopStarter({
+      failureLog: createPassthroughFailureLog(),
       typing, getDefaultChatId: () => 7, isContextActive: ctx => ctx === current,
       getSessionGeneration: () => generation, getTransportAuthority: () => authority, isThreadedMode: () => true,
       async sendTypingAction(_chat, options) { guards.push(options!.assertAuthority!); if (guards.length === 1) await held; },
@@ -1039,7 +1129,9 @@ for (const end of ["stop", "same-target-replacement"] as const) {
     t.mock.timers.enable({ apis: ["setInterval"] });
     const typing = Runtime.createTelegramTypingLoop(), ctx = {}, guards: Array<() => void> = [], failures: unknown[] = [];
     let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
-    const start = Runtime.createTelegramTypingLoopStarter({ typing, getDefaultChatId: () => 7,
+    const start = Runtime.createTelegramTypingLoopStarter({
+   failureLog: createPassthroughFailureLog(),
+   typing, getDefaultChatId: () => 7,
       isContextActive: value => value === ctx, getSessionGeneration: () => 1, getTransportAuthority: () => "unchanged", isThreadedMode: () => true,
       async sendTypingAction(_chat, options) { guards.push(options!.assertAuthority!); if (guards.length === 1) await held; options!.assertAuthority!(); },
       recordRuntimeEvent(_category, error) { failures.push(error); }, updateStatus() {} });
@@ -1062,6 +1154,7 @@ test("Typing loop ignores late failures from a replaced session context", async 
   const statusErrors: string[] = [];
   const runtimeEvents: string[] = [];
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter({
+    failureLog: createPassthroughFailureLog(),
     typing: runtime.typing,
     getDefaultChatId: () => 7,
     sendTypingAction: () =>
@@ -1091,9 +1184,22 @@ test("Typing loop failure diagnostics do not invoke status updates", async () =>
   const state = Runtime.createTelegramBridgeRuntimeState();
   const runtime = Runtime.createTelegramBridgeRuntime(state);
   const runtimeEvents: string[] = [];
+  const recordTypingEvent = (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => {
+    const message = error instanceof Error ? error.message : String(error);
+    runtimeEvents.push(
+      `${category}:${message}:${details?.phase ?? details?.chatId}`,
+    );
+  };
   const startTypingLoop = Runtime.createTelegramTypingLoopStarter<{
     id: string;
   }>({
+    failureLog: createPassthroughFailureLog((error, details) =>
+      recordTypingEvent("typing", error, details),
+    ),
     typing: runtime.typing,
     getDefaultChatId: () => undefined,
     sendTypingAction: async () => {
@@ -1102,12 +1208,7 @@ test("Typing loop failure diagnostics do not invoke status updates", async () =>
     updateStatus: () => {
       throw new Error("stale ctx");
     },
-    recordRuntimeEvent: (category, error, details) => {
-      const message = error instanceof Error ? error.message : String(error);
-      runtimeEvents.push(
-        `${category}:${message}:${details?.phase ?? details?.chatId}`,
-      );
-    },
+    recordRuntimeEvent: recordTypingEvent,
     intervalMs: 1000,
   });
 

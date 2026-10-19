@@ -861,6 +861,12 @@ export default function (pi: Pi.ExtensionAPI) {
   const promptDispatchRuntime = Runtime.createTelegramPromptDispatchRuntime({
     lifecycle,
     typing,
+    failureLog: runtimeDiagnostics.createFailureLog({
+      category: "typing",
+      failurePhase: "typing-presence",
+      outcomePhase: "typing-presence-recovered",
+      label: "typing presence",
+    }),
     getDefaultChatId: proactivePushChatIdGetter,
     isThreadedMode() {
       return deliveryTargetPolicyRuntime.getTargetPolicyView().threaded === true;
@@ -1576,12 +1582,14 @@ export default function (pi: Pi.ExtensionAPI) {
         target.threadId === undefined
       )
         return undefined;
+      // Pi creates a fresh context object per event and command, so authority follows the session, not the object.
+      const sessionGeneration = telegramSessionContextStore.getGeneration();
       return Threads.createTelegramWorkspaceThreadRenameRecipient({
         store: threadStore,
         instanceId: telegramInstanceId,
         target,
         assertAuthority() {
-          if (telegramSessionContextStore.get() !== ctx)
+          if (!telegramSessionContextStore.isCurrent(ctx, sessionGeneration))
             throw new Error("Telegram Thread name dialog lost Pi context.");
         },
         getAuthority: threadNameRecipientAuthority.getAuthority,
@@ -1968,6 +1976,12 @@ export default function (pi: Pi.ExtensionAPI) {
   const telegramBusFollowerAssembly: BusFollower.TelegramBusFollowerRuntimeAssembly<Pi.ExtensionContext> =
     BusFollower.createTelegramBusFollowerRuntimeAssembly<Pi.ExtensionContext>({
       instanceId: telegramInstanceId,
+      failureLog: runtimeDiagnostics.createFailureLog({
+        category: "bus",
+        failurePhase: "follower-heartbeat",
+        outcomePhase: "follower-heartbeat-recovered",
+        label: "follower heartbeat",
+      }),
       registrationState: telegramBusFollowerRegistrationState,
       recordRuntimeEvent,
       receiver: {
@@ -2370,6 +2384,12 @@ export default function (pi: Pi.ExtensionAPI) {
       Locks.TelegramLockEntry
     >({
       state: telegramThreadCapabilityState,
+      failureLog: runtimeDiagnostics.createFailureLog({
+        category: "bus",
+        failurePhase: "capability-monitor",
+        outcomePhase: "capability-monitor-recovered",
+        label: "Threaded Mode capability probe",
+      }),
       getAllowedUserId: configStore.getAllowedUserId,
       callApi: callTelegramApi,
       topicTargetStore: threadStore,

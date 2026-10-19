@@ -1960,32 +1960,43 @@ export async function sendTelegramBusLocalEnvelope(options) {
     };
     const attempts = Math.max(1, resolvedOptions.retry?.attempts ?? 1);
     const delayMs = Math.max(0, resolvedOptions.retry?.delayMs ?? 0);
+    // Log the first failure, then only the outcome: a reloading leader would otherwise log every attempt.
     for (let attempt = 1;; attempt += 1) {
         try {
-            return await sendTelegramBusLocalEnvelopeOnce(resolvedOptions);
+            const response = await sendTelegramBusLocalEnvelopeOnce(resolvedOptions);
+            if (attempt > 1)
+                resolvedOptions.recordTransportEvent?.("client-recovered", {
+                    ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+                    ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
+                    attempt,
+                    attempts,
+                });
+            return response;
         }
         catch (error) {
             const info = classifyTelegramBusTransportError(error);
-            resolvedOptions.recordTransportEvent?.("client-failed", {
-                ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
-                ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
-                attempt,
-                attempts,
-                ...info,
-            });
-            if (error instanceof TelegramBusLocalAuthorityError ||
+            const final = error instanceof TelegramBusLocalAuthorityError ||
                 attempt >= attempts ||
-                !isRetryableTelegramBusTransportError(error)) {
+                !isRetryableTelegramBusTransportError(error);
+            if (attempt === 1 || final)
+                resolvedOptions.recordTransportEvent?.("client-failed", {
+                    ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+                    ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
+                    attempt,
+                    attempts,
+                    ...info,
+                });
+            if (final)
                 throw error;
-            }
-            resolvedOptions.recordTransportEvent?.("client-retry", {
-                ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
-                ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
-                attempt,
-                attempts,
-                delayMs,
-                ...info,
-            });
+            if (attempt === 1)
+                resolvedOptions.recordTransportEvent?.("client-retry", {
+                    ...getTelegramBusEndpointDiagnostics(resolvedOptions.socketPath),
+                    ...getTelegramBusEnvelopeDiagnostics(resolvedOptions.envelope),
+                    attempt,
+                    attempts,
+                    delayMs,
+                    ...info,
+                });
             await delayTelegramBusTransportRetry(delayMs);
         }
     }

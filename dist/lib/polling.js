@@ -471,6 +471,7 @@ export function createTelegramThreadCapabilityOrchestration(deps) {
         isTopicModeUnavailableError: deps.isTopicModeUnavailableError,
         updateStatus: deps.updateStatus,
         recordEvent: deps.recordEvent,
+        failureLog: deps.failureLog,
     };
     return {
         monitor: createTelegramThreadCapabilityMonitor(capabilityDeps),
@@ -813,8 +814,37 @@ export function createTelegramThreadCapabilityMonitor(deps) {
     let generation = 0;
     let transitionPromise;
     let consecutiveDisabledProbes = 0;
+    // An absent leader endpoint repeats one identical probe failure every interval; the port collapses the run.
+    // Running it through one guard keeps a faulty diagnostics port from breaking probes or the interval callback.
+    const capabilityFailureLog = {
+        record(error, details) {
+            try {
+                deps.failureLog.record(error, details);
+            }
+            catch {
+                // Monitor diagnostics cannot create an uncaught interval exception.
+            }
+        },
+        settled() {
+            try {
+                deps.failureLog.settled();
+            }
+            catch {
+                // Monitor diagnostics cannot fail a completed probe.
+            }
+        },
+        reset() {
+            try {
+                deps.failureLog.reset();
+            }
+            catch {
+                // Monitor diagnostics cannot fail a monitor stop.
+            }
+        },
+    };
     const stop = () => {
         generation += 1;
+        capabilityFailureLog.reset();
         if (interval)
             clearInterval(interval);
         interval = undefined;
@@ -832,6 +862,7 @@ export function createTelegramThreadCapabilityMonitor(deps) {
             .then(async (threadModeEnabled) => {
             if (!isCurrent())
                 return;
+            capabilityFailureLog.settled();
             if (threadModeEnabled === undefined) {
                 if (deps.topicTargetStore.getBotState().threadMode !== "enabled" &&
                     !deps.getPollingStartedWithTelegramBus() &&
@@ -879,12 +910,7 @@ export function createTelegramThreadCapabilityMonitor(deps) {
             .catch((error) => {
             if (!isCurrent())
                 return;
-            try {
-                deps.recordEvent("bus", error, { phase: "capability-monitor" });
-            }
-            catch {
-                // Monitor diagnostics cannot create an unhandled interval rejection.
-            }
+            capabilityFailureLog.record(error);
         })
             .finally(() => {
             if (transitionPromise === tracked)
@@ -911,12 +937,7 @@ export function createTelegramThreadCapabilityMonitor(deps) {
                     catch {
                         /* Timer shutdown must not escape the callback. */
                     }
-                    try {
-                        deps.recordEvent("bus", error, { phase: "capability-monitor" });
-                    }
-                    catch {
-                        // Monitor diagnostics cannot create an uncaught interval exception.
-                    }
+                    capabilityFailureLog.record(error);
                 }
             }, intervalMs);
             interval.unref?.();

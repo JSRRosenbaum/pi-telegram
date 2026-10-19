@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+## 0.57.2: Connect Latency and Session Identity
+
+- `Connect latency`: A new Thread no longer waits about 20 seconds when all 26 letter slots are occupied. Slot rotation read the complete journal namespace and every shared journal once per binding inside one synchronous pass, freezing the leader's event loop and staling healthy follower heartbeats. One occupancy snapshot now reads that binding-independent evidence once, and every fresh snapshot still re-reads it so post-fence checks see newly arrived work.
+- `Session identity`: Follower promotion, Thread-name authority and in-flight registration now compare the session instead of the exact context object. A follower connected manually with `/telegram-connect` becomes leader when the old leader stops answering, instead of rescheduling promotion forever while registration retried a dead socket. Pi's fresh per-event context objects no longer change behavior; a follower with no live session still waits.
+- `Bus retries`: A leader reload no longer logs a line for every follower bus attempt, and an absent leader no longer repeats identical heartbeat, capability-probe or typing-presence failures every interval or tick. Each request records its first failure, one `client-recovered` event when a later attempt succeeds, and its final failure; a repeated failure records once per run plus a recovery record with the suppressed count. Detection and recovery observation are unchanged.
+- `Restore probe`: The follower restore probe now treats Telegram's `message thread not found` as its own expected answer instead of an API error. It still marks the target stale, re-creates the Thread and records one `topic-lifecycle` event with the old and new thread ids. Unexpected API failures keep their diagnostics.
+- `Graceful shutdown`: Graceful cleanup in a private chat now deletes the Thread directly instead of first calling `closeForumTopic`, which Telegram rejects outside forums. Rebind protection still runs immediately before deletion, so a Thread re-bound during cleanup remains protected; forum cleanups still close before deleting.
+- `Status diagnostics`: The connection status prints the state and log paths of the agent directory actually in use, so a second profile started with `PI_CODING_AGENT_DIR` no longer points at the default profile's files. Stored paths resolve through symlinked home directories before they are abbreviated. Fixes #349.
+- `Slow-call diagnostics`: Follower API calls slower than 1.5 seconds record one diagnostic with the method, the elapsed time and the split between waiting for registration and transport. A late reply can now be attributed to recovery waiting or to delivery instead of staying unexplained. This is observation only.
+- `Delivery coverage`: Automated checks now assert that commentary is delivered while its tool call is still running and that a final answer is delivered before automatic compaction completes, for every activity mode with draft previews on and off. Both paths already behaved this way; the coverage prevents regressions.
+
+
 ## 0.57.1: Guest Media and Routing Cleanup
 
 - `Guest attachments`: Queued photos, documents and MP3 audio now replace the acknowledged Guest Mode placeholder instead of being silently skipped. Upload failures and confirmed edit rejections report errors; uncertain edits are not replayed or overwritten. OGG/Opus attachments are rejected before queueing on this path, and voice markup explains the limitation. Live-client media acceptance remains a deferred follow-up. Fixes #346.

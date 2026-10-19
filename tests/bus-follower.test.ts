@@ -178,6 +178,7 @@ import { createTelegramWorkspaceOperationRuntime } from "../lib/workspace-retire
 
 import { createTelegramUpdateWorkerRuntime, createTelegramUpdateAdmissionLifecycleRuntime } from "../lib/updates.ts";
 import { createTelegramUpdateJournalBindingKey } from "../lib/journal.ts";
+import { createTelegramFailureRunLog } from "../lib/logging.ts";
 
 for (const mode of ["direct", "retained-generic", "receiver-disabled", "receiver-enabled", "receiver-missing-cap", "apply-generic", "release-generic"] as const) {
   test(`Selected status recipient cannot borrow generic save without native consumption (${mode})`, async () => {
@@ -2400,6 +2401,66 @@ test("Bus follower scheduled recovery transfers across session context replaceme
   assert.equal(promotedContext, "new-ctx");
 });
 
+test("Bus follower promotes a manually connected follower through the live session context without a retry", async () => {
+  // Pi creates a fresh context per command and event: /telegram-connect registers with a command context that is
+  // never the stored session object. Heartbeat failures outpace the retry grace, so retries must not be required.
+  const scheduled: Array<() => void> = [];
+  const promotedContexts: unknown[] = [];
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 }, { slot: "D", threadName: "Delta" });
+  const commandCtx = { cwd: "/repo", source: "command" };
+  const sessionCtx = { cwd: "/repo", source: "session_start" };
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({ registerWithLeader: async () => false, setContext: () => undefined, stop: () => undefined }),
+    getLeaderState: () => ({ kind: "inactive" }),
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async (ctx) => {
+      promotedContexts.push(ctx);
+      return true;
+    },
+    sleep: async () => undefined,
+    scheduleRetry: (retry) => {
+      scheduled.push(retry);
+    },
+    getActiveContext: () => sessionCtx,
+    promotionGraceMs: 0,
+    recordRuntimeEvent: () => undefined,
+  });
+  await handler(new Error("connect ENOENT"), commandCtx);
+  assert.deepEqual(promotedContexts, [sessionCtx]);
+  assert.equal(scheduled.length, 0, "promotion must not depend on a retry that heartbeat failures keep re-arming");
+});
+
+test("Bus follower heartbeat recovery waits for a session context before promotion", async () => {
+  const scheduled: Array<() => void> = [];
+  let promotions = 0;
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 });
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({ registerWithLeader: async () => false, setContext: () => undefined, stop: () => undefined }),
+    getLeaderState: () => ({ kind: "inactive" }),
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async () => {
+      promotions += 1;
+      return true;
+    },
+    sleep: async () => undefined,
+    scheduleRetry: (retry) => {
+      scheduled.push(retry);
+    },
+    getActiveContext: (): string | undefined => undefined,
+    promotionGraceMs: 0,
+    recordRuntimeEvent: () => undefined,
+  });
+  await handler(new Error("connect ENOENT"), "ctx");
+  assert.equal(promotions, 0);
+  assert.equal(scheduled.length, 1);
+});
+
 test("Bus follower heartbeat recovery swallows stale-context status updates", async () => {
   const events: unknown[] = [];
   let leaderStateCalls = 0;
@@ -2544,6 +2605,13 @@ test("Follower assembly keeps same-session refresh stable and requires registrat
   const assembly = createTelegramBusFollowerRuntimeAssembly<{
     cwd: string;
   }>({
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "follower-heartbeat",
+      outcomePhase: "follower-heartbeat-recovered",
+      label: "follower heartbeat",
+      record: () => {},
+    }),
     instanceId: "inst-a",
     registrationState,
     recordRuntimeEvent: () => undefined,
@@ -2661,6 +2729,13 @@ test("Follower readiness captures session identity across preparation and reused
     }),
   });
   const assembly = createTelegramBusFollowerRuntimeAssembly({ instanceId: "session-ready", registrationState: state,
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "follower-heartbeat",
+      outcomePhase: "follower-heartbeat-recovered",
+      label: "follower heartbeat",
+      record: () => {},
+    }),
     recordRuntimeEvent: () => {},
     receiver: { socketPath: followerSocketPath, getContext: () => ctx,
       getRecipientBindingKey: () => "manual:session-ready",
@@ -3305,6 +3380,108 @@ test("Bus follower registration runtime waits for slow target provisioning", asy
   }
 });
 
+test("Bus follower registration survives a fresh same-session context object", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-context-"));
+  const socketPath = join(dir, "bus.sock");
+  const registry = createTelegramBusFollowerRegistry();
+  let releaseProvision: (() => void) | undefined;
+  const provisioning = new Promise<void>((resolve) => {
+    releaseProvision = resolve;
+  });
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: registry,
+      async provisionFollowerTarget() {
+        await provisioning;
+        return { chatId: -1007, threadId: 42, slot: "A" };
+      },
+    }),
+  });
+  const sessionCtx = { cwd: "/repo" };
+  const state = createTelegramBusFollowerRegistrationState();
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "inst-a",
+    createRequestId: () => "inst-a:context:1",
+    getNowMs: () => 1000,
+    registrationState: state,
+    getSessionId: () => "session-a",
+    getSessionGeneration: () => 7,
+    registrationTimeoutMs: 250,
+  });
+  try {
+    await server.start();
+    const registration = follower.registerWithLeader(sessionCtx, {
+      busSocketPath: socketPath,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    // Pi hands every event a fresh context object for the same session.
+    follower.setContext({ ...sessionCtx });
+    releaseProvision?.();
+    assert.equal(
+      await registration,
+      true,
+      "A fresh event context of the same session must not cancel an in-flight registration",
+    );
+    assert.equal(state.isRegistered(), true);
+    assert.deepEqual(state.getTarget(), { chatId: -1007, threadId: 42 });
+  } finally {
+    follower.stop();
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower registration abandons an attempt when its session is replaced", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-session-replaced-"));
+  const socketPath = join(dir, "bus.sock");
+  const registry = createTelegramBusFollowerRegistry();
+  let releaseProvision: (() => void) | undefined;
+  const provisioning = new Promise<void>((resolve) => {
+    releaseProvision = resolve;
+  });
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: registry,
+      async provisionFollowerTarget() {
+        await provisioning;
+        return { chatId: -1007, threadId: 42, slot: "A" };
+      },
+    }),
+  });
+  const sessionCtx = { cwd: "/repo" };
+  let sessionId = "session-a";
+  const state = createTelegramBusFollowerRegistrationState();
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "inst-a",
+    createRequestId: () => "inst-a:replaced:1",
+    getNowMs: () => 1000,
+    registrationState: state,
+    getSessionId: () => sessionId,
+    getSessionGeneration: () => 7,
+    registrationTimeoutMs: 250,
+  });
+  try {
+    await server.start();
+    const registration = follower.registerWithLeader(sessionCtx, {
+      busSocketPath: socketPath,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    sessionId = "session-b";
+    follower.setContext({ cwd: "/repo" });
+    releaseProvision?.();
+    assert.equal(await registration, false);
+    assert.equal(state.isRegistered(), false);
+    // The leader may already hold the completed registration; this process must not adopt it as its binding.
+    assert.equal(state.getTarget(), undefined);
+  } finally {
+    follower.stop();
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus follower registration runtime registers and explicitly disconnects", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-"));
   const socketPath = join(dir, "bus.sock");
@@ -3586,6 +3763,126 @@ test("Bus follower heartbeat tolerates one delayed leader acknowledgement withou
     await waitForCondition(() => heartbeatCalls >= 3, 2_500);
     assert.deepEqual(failures, []);
     assert.equal(state.isRegistered(), true);
+  } finally {
+    follower.stop();
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower heartbeat collapses one sustained failure run into a failure record and an outcome record", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-heartbeat-run-"));
+  const socketPath = join(dir, "bus.sock");
+  const events: Array<{ phase?: string; failureSignature?: string; failedAttempts?: number; failedForMs?: number }> = [];
+  const failures: unknown[] = [];
+  let requests = 0;
+  const startServer = () =>
+    createTelegramBusLocalServer({
+      socketPath,
+      handleEnvelope: (envelope) => ({ kind: "bus.ack", requestId: envelope.requestId, ok: true }),
+    });
+  const server = startServer();
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    // The logging domain owns the collapsing policy; this test supplies it explicitly.
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "follower-heartbeat",
+      outcomePhase: "follower-heartbeat-recovered",
+      label: "follower heartbeat",
+      record: (_category, _errorOrMessage, details) => events.push(details ?? {}),
+      getNowMs: () => nowMs,
+    }),
+    instanceId: "inst-a",
+    createRequestId: () => `inst-a:${++requests}`,
+    getNowMs: () => nowMs,
+    registrationState: createTelegramBusFollowerRegistrationState(),
+    heartbeatMs: 5,
+    timeoutMs: 50,
+    recordRuntimeEvent: (_category, _error, details) => events.push(details ?? {}),
+    onHeartbeatFailure(error) {
+      failures.push(error);
+    },
+  });
+  let nowMs = 1000;
+  try {
+    await server.start();
+    await follower.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath });
+    await server.stop();
+    // A sustained outage repeats one identical failure every interval.
+    await waitForCondition(() => failures.length >= 3, 300);
+    const failureEvents = () => events.filter((event) => event.phase === "follower-heartbeat");
+    assert.equal(failureEvents().length, 1, "a repeated identical failure is logged once");
+    assert.equal(failureEvents()[0]?.failureSignature, "ENOENT");
+    nowMs += 5000;
+    const replacement = startServer();
+    await replacement.start();
+    await waitForCondition(() => events.some((event) => event.phase === "follower-heartbeat-recovered"), 300);
+    // Recovery notification stays per-failure: only diagnostics are deduplicated.
+    assert.ok(failures.length >= 3, "liveness recovery keeps observing every failed heartbeat");
+    assert.equal(failureEvents().length, 1);
+    const recovered = events.find((event) => event.phase === "follower-heartbeat-recovered");
+    assert.equal(recovered?.failureSignature, "ENOENT");
+    assert.ok((recovered?.failedAttempts ?? 0) >= 3);
+    assert.equal(recovered?.failedForMs, 5000 + 0);
+    await replacement.stop();
+  } finally {
+    follower.stop();
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower heartbeat logs a new failure record when the failure kind changes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-heartbeat-change-"));
+  const socketPath = join(dir, "bus.sock");
+  const events: Array<{ phase?: string; failureSignature?: string; previousFailureSignature?: string }> = [];
+  let requests = 0;
+  let rejecting = false;
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) =>
+      rejecting
+        ? { kind: "bus.ack", requestId: envelope.requestId, ok: false, message: "Telegram bus follower heartbeat was rejected." }
+        : { kind: "bus.ack", requestId: envelope.requestId, ok: true },
+  });
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    // The logging domain owns the collapsing policy; this test supplies it explicitly.
+    failureLog: createTelegramFailureRunLog({
+      category: "bus",
+      failurePhase: "follower-heartbeat",
+      outcomePhase: "follower-heartbeat-recovered",
+      label: "follower heartbeat",
+      record: (_category, _errorOrMessage, details) => events.push(details ?? {}),
+    }),
+    instanceId: "inst-a",
+    createRequestId: () => `inst-a:${++requests}`,
+    registrationState: createTelegramBusFollowerRegistrationState(),
+    heartbeatMs: 5,
+    timeoutMs: 50,
+    recordRuntimeEvent: (_category, _error, details) => events.push(details ?? {}),
+    onHeartbeatFailure() {},
+  });
+  try {
+    await server.start();
+    await follower.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath });
+    rejecting = true;
+    await waitForCondition(() => events.some((event) => event.phase === "follower-heartbeat"), 300);
+    await server.stop();
+    await waitForCondition(() => events.some((event) => event.failureSignature === "ENOENT"), 300);
+    const failureEvents = events.filter((event) => event.phase === "follower-heartbeat");
+    const signatures = failureEvents.map((event) => event.failureSignature);
+    assert.equal(signatures[0], "Telegram bus follower heartbeat was rejected.");
+    // A stopped listener can reset one in-flight heartbeat before the steady connection error, and each
+    // distinct failure kind earns its own record while repeats of the same kind stay suppressed.
+    const connectionError = failureEvents.find((event) => event.failureSignature === "ENOENT");
+    assert.ok(connectionError, `expected a connection failure among ${JSON.stringify(signatures)}`);
+    assert.ok(connectionError.previousFailureSignature, "a changed failure kind reports the run it superseded");
+    assert.notEqual(connectionError.previousFailureSignature, "ENOENT");
+    assert.equal(signatures.filter((signature) => signature === "ENOENT").length, 1);
+    assert.ok(
+      signatures.every((signature, index) => index === 0 || signature !== signatures[index - 1]),
+      "the same failure kind is never logged twice in a row",
+    );
   } finally {
     follower.stop();
     await server.stop();
@@ -4121,13 +4418,16 @@ test("Bus follower API calls wait for heartbeat recovery before transport", asyn
       };
     },
   });
+  let nowMs = 7001;
+  const slowEvents: unknown[] = [];
   const callApi = createTelegramBusFollowerApiCaller({
     socketPath,
     instanceId: "inst-a",
     createRequestId: () => "inst-a:recovery:1",
     getRegistrationGeneration: registrationState.getGeneration,
     waitForRegistrationGeneration: registrationState.waitForGeneration,
-    getNowMs: () => 7001,
+    getNowMs: () => nowMs,
+    recordRuntimeEvent: (_category, _message, details) => slowEvents.push(details),
   });
   try {
     await server.start();
@@ -4135,6 +4435,7 @@ test("Bus follower API calls wait for heartbeat recovery before transport", asyn
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(received, []);
 
+    nowMs += 4000;
     registrationState.setRegistered(
       true,
       { chatId: 1, threadId: 2 },
@@ -4148,6 +4449,9 @@ test("Bus follower API calls wait for heartbeat recovery before transport", asyn
         .registrationGeneration,
       "generation-restored",
     );
+    // A send held behind recovery is attributed to registration wait, not transport.
+    assert.deepEqual(slowEvents, [{ phase: "follower-api-slow", method: "sendRichMessage", elapsedMs: 4000,
+      registrationWaitMs: 4000, transportMs: 0, outcome: "ok" }]);
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -5107,6 +5411,13 @@ for (const boundary of ["ready", "busy", "before-ready", "local-disabled", "wron
       let sequence = 0;
       const errors: string[] = [];
       const assembly = createTelegramBusFollowerRuntimeAssembly({ instanceId: "old", registrationState: registration,
+        failureLog: createTelegramFailureRunLog({
+          category: "bus",
+          failurePhase: "follower-heartbeat",
+          outcomePhase: "follower-heartbeat-recovered",
+          label: "follower heartbeat",
+          record: () => {},
+        }),
         recordRuntimeEvent(_category, error) { errors.push(String(error)); }, receiver: { socketPath, getContext: () => receiverContext, getAuthSecret: () => authenticatedSecret,
           getRecipientBindingKey: () => "manual:old", getLiveRebindJournalBindingKey: () => journalCurrent ? admission.getJournalBindingKey() : undefined,
           getSessionId: (): string | undefined => assembly.getReadySessionId(), getLeaderProtocol: registration.getLeaderProtocol, getLocalProtocol: () => localProtocol,

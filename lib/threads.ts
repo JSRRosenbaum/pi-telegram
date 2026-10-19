@@ -252,6 +252,13 @@ export interface TelegramWorkspaceExternalProtectionEvidence {
   deliveryAuthority: TelegramWorkspaceProtectionState;
 }
 
+/** Per-binding probe; `withSnapshot` lets one occupancy capture share binding-independent evidence reads. */
+export type TelegramWorkspaceExternalProtectionCapture = ((
+  binding: TelegramWorkspaceThreadBinding,
+) => TelegramWorkspaceExternalProtectionEvidence) & {
+  withSnapshot?: <T>(capture: () => T) => T;
+};
+
 export interface TelegramWorkspaceSlotOccupancySnapshot {
   bindings: TelegramWorkspaceSlotOccupancy[];
   reservedSlots: string[];
@@ -876,9 +883,7 @@ export interface TelegramTopicTargetStore {
   ) => Promise<boolean>;
   /** Caller must separately prove no external live owner, accepted work, or delivery authority. */
   captureWorkspaceSlotOccupancy: (
-    getExternalProtection: (
-      binding: TelegramWorkspaceThreadBinding,
-    ) => TelegramWorkspaceExternalProtectionEvidence,
+    getExternalProtection: TelegramWorkspaceExternalProtectionCapture,
     options?: { expectedRetirement?: TelegramWorkspaceRetirementIntent },
   ) => TelegramWorkspaceSlotOccupancySnapshot;
   hasWorkspaceBinding: (cwd: string, sessionId?: string) => boolean;
@@ -7359,7 +7364,9 @@ export function createTelegramTopicTargetStore(
     },
     captureWorkspaceSlotOccupancy(getExternalProtection, options) {
       const nowMs = getNowMs();
-      const bindings = Array.from(workspaceBindings.values()).map((binding) => {
+      const inSnapshot =
+        getExternalProtection.withSnapshot ?? ((capture) => capture());
+      const bindings = inSnapshot(() => Array.from(workspaceBindings.values()).map((binding) => {
         const slot = binding.slot?.toLowerCase() ?? "";
         const locallyProtected = isWorkspaceBindingLocallyProtected(
           binding,
@@ -7398,7 +7405,7 @@ export function createTelegramTopicTargetStore(
             : {}),
           protection,
         };
-      });
+      }));
       const localReservedSlots = [
         ...Array.from(workspaceClaims.values()).map(
           (claim) => claim.identity.slot,
