@@ -17,6 +17,7 @@ import {
   TELEGRAM_ATTACH_PROMPT_SNIPPET,
   TELEGRAM_CONNECTED_CONTEXT_MESSAGE,
   TELEGRAM_DISCONNECTED_CONTEXT_MESSAGE,
+  TELEGRAM_MESSAGE_PROMPT_GUIDELINES,
   TELEGRAM_MESSAGE_PROMPT_SNIPPET,
 } from "../lib/prompts.ts";
 
@@ -376,6 +377,109 @@ test("Prompt helpers return no override when the computed prompt equals the inco
         "base\ntelegram turn contract\n- The current user message came from Telegram.",
     },
   );
+});
+
+function createSectionsEvent(
+  prompt: string,
+  options: Record<string, unknown> = {},
+  extra: Record<string, unknown> = {},
+): BeforeAgentStartHookEvent {
+  return {
+    type: "before_agent_start",
+    prompt,
+    systemPrompt: "rendered base",
+    systemPromptOptions: {
+      cwd: ".", selectedTools: [], toolSnippets: {}, toolGuidelines: {}, promptGuidelines: [],
+      appendSystemPrompt: "", sections: {}, contextFiles: [], skills: [], ...options,
+    },
+    ...extra,
+  } as unknown as BeforeAgentStartHookEvent;
+}
+
+function getSections(event: BeforeAgentStartHookEvent): Record<string, string> {
+  return (event as unknown as { systemPromptOptions: { sections: Record<string, string> } })
+    .systemPromptOptions.sections;
+}
+
+test("Prompt sections carry the connected bridge guidance without forcing a system prompt", async () => {
+  const hook = createTelegramProactiveBeforeAgentStartHook({ isAvailable: () => true });
+  const localEvent = createSectionsEvent("local prompt", { sections: { other: "keep" } });
+  assert.equal(await hook(localEvent, "ctx"), undefined);
+  assert.deepEqual(Object.keys(getSections(localEvent)), ["other", "telegram"]);
+  assert.equal(getSections(localEvent).other, "keep");
+  const localSection = getSections(localEvent).telegram;
+  assert.equal(localSection.startsWith(TELEGRAM_CONNECTED_CONTEXT_MESSAGE), true);
+  assert.equal(localSection.includes("Telegram turn note"), false);
+  assert.equal(localSection, localSection.trim());
+
+  const telegramEvent = createSectionsEvent("  [telegram] hello");
+  assert.equal(await hook(telegramEvent, "ctx"), undefined);
+  assert.equal(
+    getSections(telegramEvent).telegram,
+    `${localSection}\n\nTelegram turn note: Follow the applicable bundled Telegram Skills in routing order; load only missing instructions.\n- The current user message came from Telegram.`,
+  );
+
+  const customEvent = createSectionsEvent("[telegram] stale", {}, { messageType: "custom" });
+  assert.equal(await hook(customEvent, "ctx"), undefined);
+  assert.equal(getSections(customEvent).telegram, localSection);
+
+  // The section text equals what the forced-prompt path appends today.
+  const forced = createTelegramBeforeAgentStartHook()(createBeforeAgentStartEvent("[telegram] hello", ""));
+  assert.equal(forced.systemPrompt, `\n\n${getSections(telegramEvent).telegram}`);
+});
+
+test("Prompt sections drop stale Telegram guidance when the bridge is unavailable", async () => {
+  const reconciled: string[] = [];
+  const hook = createTelegramProactiveBeforeAgentStartHook({
+    reconcileAvailability: () => { reconciled.push("reconcile"); },
+    isAvailable: () => false,
+  });
+  const event = createSectionsEvent("[telegram] hello", {
+    sections: { telegram: "stale", other: "keep" },
+    toolSnippets: {
+      telegram_attach: TELEGRAM_ATTACH_PROMPT_SNIPPET,
+      telegram_message: TELEGRAM_MESSAGE_PROMPT_SNIPPET,
+      read: "Read files",
+    },
+    toolGuidelines: {
+      telegram_attach: [...TELEGRAM_ATTACH_PROMPT_GUIDELINES],
+      telegram_message: [...TELEGRAM_MESSAGE_PROMPT_GUIDELINES],
+      read: ["Read carefully"],
+    },
+  });
+  assert.equal(await hook(event, "ctx"), undefined);
+  const options = (event as unknown as {
+    systemPromptOptions: { sections: object; toolSnippets: object; toolGuidelines: object };
+  }).systemPromptOptions;
+  assert.deepEqual(options.sections, { other: "keep" });
+  assert.deepEqual(options.toolSnippets, { read: "Read files" });
+  assert.deepEqual(options.toolGuidelines, { read: ["Read carefully"] });
+  assert.deepEqual(reconciled, ["reconcile"]);
+
+  // Pi hands over normalized options, but tolerate partial ones too.
+  const partial = { prompt: "x", systemPrompt: "base", systemPromptOptions: { sections: { telegram: "stale" } } } as unknown as BeforeAgentStartHookEvent;
+  assert.equal(await hook(partial, "ctx"), undefined);
+  assert.deepEqual(getSections(partial), {});
+});
+
+test("Prompt hooks keep the forced-prompt path when Pi exposes no sections or a custom base hook is supplied", async () => {
+  const stale = `base\n- telegram_attach: ${TELEGRAM_ATTACH_PROMPT_SNIPPET}`;
+  for (const systemPromptOptions of [undefined, null, {}, { sections: null }, { sections: "x" }]) {
+    const event = { prompt: "[telegram] hi", systemPrompt: stale, systemPromptOptions } as unknown as BeforeAgentStartHookEvent;
+    const unavailable = createTelegramProactiveBeforeAgentStartHook({ isAvailable: () => false });
+    assert.deepEqual(await unavailable(event, "ctx"), { systemPrompt: "base" });
+    const available = createTelegramProactiveBeforeAgentStartHook({ isAvailable: () => true });
+    const result = await available({ ...event, systemPrompt: "base" } as BeforeAgentStartHookEvent, "ctx");
+    assert.equal(typeof result?.systemPrompt, "string");
+    assert.equal((result?.systemPrompt as string).includes(TELEGRAM_CONNECTED_CONTEXT_MESSAGE), true);
+  }
+  const customBase = createTelegramProactiveBeforeAgentStartHook({
+    baseHook: createTelegramBeforeAgentStartHook({ localSystemPromptSuffix: "local", telegramTurnSystemPromptSuffix: "turn" }),
+    isAvailable: () => true,
+  });
+  const event = createSectionsEvent("local prompt");
+  assert.deepEqual(await customBase(event, "ctx"), { systemPrompt: "rendered baselocal" });
+  assert.deepEqual(getSections(event), {});
 });
 
 test("Model-context availability binding safely delegates after late composition", () => {

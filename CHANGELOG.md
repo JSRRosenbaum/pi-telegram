@@ -5,6 +5,7 @@
 ## Unreleased
 
 - `Prompt cache`: Runs where Telegram has nothing to add or strip no longer return a `systemPrompt` from `before_agent_start`, so Pi keeps its own prompt and Anthropic prompt-cache prefixes survive. Returning any prompt made Pi fold all system messages into one head, causing cache misses and dropped thinking blocks. Telegram turns still append their suffix, and an unavailable bridge still strips Telegram tool metadata when present. Refs #353.
+- `Prompt sections`: When Pi exposes `systemPromptOptions.sections`, a connected bridge now sets a `telegram` section (local guidance plus the Telegram-turn note on Telegram turns) and an unavailable bridge deletes it and its tool snippets/guidelines, returning no `systemPrompt`. Pi sends changes as a transcript delta instead of a forced prompt, so connected sessions keep cache prefixes and thinking blocks. Pi without sections keeps the forced-prompt path. Refs #353.
 
 ## 0.57.3: Session Thread Continuity
 
