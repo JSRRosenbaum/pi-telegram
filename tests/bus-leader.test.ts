@@ -672,7 +672,7 @@ test("Follower recovery shortcuts preserve pending evidence under exact cleanup 
 });
 
 for (const state of ["dead", "alive", "unknown", "registered", "other-session", "ambiguous", "unknown-runtime", "missing-liveness", "missing-registry"] as const) {
-  test(`Cold restore-only follower reclaims its exact retained Thread only after predecessor death (${state})`, async () => {
+  test(`Cold restore-only follower reclaims the retained Thread after predecessor death (${state})`, async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-telegram-cold-follower-"));
     const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
     await store.load();
@@ -700,19 +700,54 @@ for (const state of ["dead", "alive", "unknown", "registered", "other-session", 
     try {
       const result = await provision({ instanceId: "successor", profileKey: "manual:successor", cwd: "/repo", sessionId: state === "other-session" ? "foreign" : "session",
         connectedAtMs: 1000 }, { existingWorkspaceBindingOnly: true });
-      if (state !== "dead") {
+      if (state !== "dead" && state !== "other-session") {
         assert.equal(result, undefined); assert.deepEqual(calls, []); assert.equal(readFileSync(join(dir, "state.json"), "utf8"), before);
       } else {
         assert.deepEqual(result, { ...target, slot: "S", threadName: "Signal" });
         assert.deepEqual(calls.map(call => call.method), ["sendMessage"]);
         assert.match(String(calls[0]!.body.text), /Instance <i>Home<\/i> connected/);
-        assert.deepEqual(store.getWorkspaceBindingByTarget(target, "session")?.journalBindingKeys, ["retained-journal"]);
-        assert.equal(store.getWorkspaceBindingByTarget(target, "session")?.instanceSlot, "b");
+        // A folder whose previous session is gone hands its Thread to the successor instead of leaving an orphan.
+        const successorSession = state === "other-session" ? "foreign" : "session";
+        assert.deepEqual(store.getWorkspaceBindingByTarget(target, successorSession)?.journalBindingKeys, ["retained-journal"]);
+        assert.equal(store.getWorkspaceBindingByTarget(target, successorSession)?.instanceSlot, "b");
         assert.equal(store.listWorkspaceBindings().length, 1);
+        if (state === "other-session") assert.equal(store.getWorkspaceBindingByTarget(target, "session"), undefined);
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+test("A new session in a folder with no live predecessor adopts the retained Thread", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-session-adoption-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+  await store.load();
+  const identity = createTelegramWorkspaceBindingIdentity("/repo", 1, "session")!;
+  const target = { chatId: 7, threadId: 42 };
+  store.upsertWorkspaceBinding({ ...identity, target, slot: "S", threadName: "Signal", displayTitle: "Home", updatedAtMs: 1 });
+  store.upsert({ profileKey: "manual:stable", owner: { kind: "manual-follower", instanceId: "stable" }, instanceId: "424242:1000",
+    target, slot: "S", threadName: "Signal", status: "active", createdAtMs: 1, updatedAtMs: 1 });
+  await store.persist();
+  const sourceSlot = store.getWorkspaceBindingByTarget(target, "session")?.instanceSlot;
+  assert.equal(sourceSlot, "b");
+  let alive = true;
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  const provision = createTelegramBusFollowerTargetProvisioner({ topicTargetStore: store, getAllowedUserId: () => 7,
+    getLiveFollowers: () => [],
+    isFollowerProcessAlive: () => alive,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) { calls.push({ method, body }); return { message_thread_id: 43 } as TResponse; },
+    getSyncState: () => ({}), setSyncState() {}, recordRuntimeEvent() {}, getNowMs: () => 1000 });
+  try {
+    // A live predecessor keeps its Thread; the registering session gets its own target.
+    const live = await provision({ instanceId: "live-successor", profileKey: "manual:live", cwd: "/repo", sessionId: "next", connectedAtMs: 1000 });
+    assert.notEqual(live?.threadId, 42);
+    assert.equal(store.getWorkspaceBindingByTarget(target, "session")?.sessionId, "session");
+    alive = false;
+    const result = await provision({ instanceId: "successor", profileKey: "manual:successor", cwd: "/repo", sessionId: "later", connectedAtMs: 1001 });
+    assert.deepEqual(result, { ...target, slot: "S", threadName: "Signal" });
+    assert.equal(store.getWorkspaceBindingByTarget(target, "later")?.sessionId, "later");
+    assert.equal(store.getWorkspaceBindingByTarget(target, "session"), undefined);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("Bus leader restore-only provisioning does not allocate a missing Workspace", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-restore-only-"));

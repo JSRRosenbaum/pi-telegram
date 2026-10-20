@@ -914,6 +914,16 @@ export interface TelegramTopicTargetStore {
       onCapacityUnavailable?: () => void;
     },
   ) => TelegramWorkspaceBindingIdentity | undefined;
+  /**
+   * Re-keys one retained Thread binding from a retired session to its successor at the same slot and target,
+   * so the tab keeps a single owner. Fails without mutation when the source binding or slot identity is absent.
+   */
+  adoptWorkspaceThreadBindingForSession: (
+    cwd: string,
+    sourceSessionId: string,
+    sessionId: string,
+    target: TelegramTarget,
+  ) => boolean;
   releaseWorkspaceClaim: (instanceId: string) => boolean;
   upsertWorkspaceBinding: (
     binding: TelegramWorkspaceThreadBinding,
@@ -4971,6 +4981,50 @@ export function createTelegramTopicTargetStore(
     };
   };
 
+  /**
+   * Re-keys one retained Thread binding from a retired session to its successor at the same slot and target,
+   * so the tab keeps a single owner. Fails without mutation when the source binding or slot identity is absent.
+   */
+  const rekeyWorkspaceBindingForSession = (
+    cwd: string,
+    sourceSessionId: string,
+    sessionId: string,
+    target: TelegramTarget,
+  ): boolean => {
+    const sourceEntry = Array.from(workspaceBindings.entries()).find(
+      ([, binding]) =>
+        binding.cwd === cwd &&
+        binding.sessionId === sourceSessionId &&
+        targetMatches(binding.target, target),
+    );
+    if (!sourceEntry) return false;
+    const [sourceKey, sourceBinding] = sourceEntry;
+    const replacementIdentity = Array.from({
+      length: TELEGRAM_WORKSPACE_SLOTS.length,
+    })
+      .map((_, ordinal) =>
+        createTelegramWorkspaceBindingIdentityWithKey(
+          sourceBinding.cwd,
+          sourceBinding.workspaceKey,
+          ordinal,
+          sessionId,
+        ),
+      )
+      .find((identity) => identity?.instanceSlot === sourceBinding.instanceSlot);
+    if (
+      !replacementIdentity ||
+      replacementIdentity.instanceSlot !== sourceBinding.instanceSlot
+    )
+      return false;
+    workspaceBindings.delete(sourceKey);
+    workspaceBindings.set(getWorkspaceBindingMapKey(replacementIdentity), {
+      ...sourceBinding,
+      ...replacementIdentity,
+      updatedAtMs: getNowMs(),
+    });
+    markDirty();
+    return true;
+  };
   return {
     async load() {
       if (workspaceIO && dirty && !loadedScopeMatches(getPath()))
@@ -7505,6 +7559,31 @@ export function createTelegramTopicTargetStore(
       const binding = workspaceBindings.get(mapKey);
       return binding ? cloneWorkspaceBinding(binding) : undefined;
     },
+    adoptWorkspaceThreadBindingForSession(
+      cwd,
+      sourceSessionId,
+      sessionId,
+      target,
+    ) {
+      if (workspaceRetirementCommitInFlight) return false;
+      const normalizedCwd = normalizeTelegramWorkspacePath(cwd);
+      const normalizedSource = normalizeTelegramSessionId(sourceSessionId);
+      const normalizedSession = normalizeTelegramSessionId(sessionId);
+      if (
+        !normalizedCwd ||
+        !normalizedSource ||
+        !normalizedSession ||
+        normalizedSource === normalizedSession ||
+        hasWorkspaceRetirementConflict({ cwd: normalizedCwd })
+      )
+        return false;
+      return rekeyWorkspaceBindingForSession(
+        normalizedCwd,
+        normalizedSource,
+        normalizedSession,
+        target,
+      );
+    },
     claimWorkspaceIdentity(cwd, instanceId, previousInstanceId, options) {
       if (workspaceRetirementCommitInFlight) return undefined;
       const normalizedCwd = normalizeTelegramWorkspacePath(cwd);
@@ -7539,41 +7618,18 @@ export function createTelegramTopicTargetStore(
             targetMatches(binding.target, replacement.target),
         );
         if (sourceEntry) {
-          const [sourceKey, sourceBinding] = sourceEntry;
-          const replacementIdentity = Array.from({
-            length: TELEGRAM_WORKSPACE_SLOTS.length,
-          })
-            .map((_, ordinal) =>
-              createTelegramWorkspaceBindingIdentityWithKey(
-                sourceBinding.cwd,
-                sourceBinding.workspaceKey,
-                ordinal,
-                normalizedSessionId,
-              ),
-            )
-            .find(
-              (identity) =>
-                identity?.instanceSlot === sourceBinding.instanceSlot,
-            );
+          const existingTargetRecord = Array.from(records.values()).find(
+            (record) => targetMatches(record.target, replacement.target),
+          );
           if (
-            replacementIdentity &&
-            replacementIdentity.instanceSlot === sourceBinding.instanceSlot
-          ) {
-            const existingTargetRecord = Array.from(records.values()).find(
-              (record) => targetMatches(record.target, replacement.target),
-            );
+            rekeyWorkspaceBindingForSession(
+              normalizedCwd,
+              replacement.sourceSessionId,
+              normalizedSessionId,
+              replacement.target,
+            )
+          )
             replacementPreviousInstanceId = existingTargetRecord?.instanceId;
-            workspaceBindings.delete(sourceKey);
-            workspaceBindings.set(
-              getWorkspaceBindingMapKey(replacementIdentity),
-              {
-                ...sourceBinding,
-                ...replacementIdentity,
-                updatedAtMs: getNowMs(),
-              },
-            );
-            markDirty();
-          }
         }
       }
       const effectivePreviousInstanceId =
