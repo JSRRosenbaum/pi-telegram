@@ -8008,7 +8008,7 @@ test("Extension runtime ignores the retired proactive opt-out while Telegram is 
         { prompt: "local after disconnect", systemPrompt: "base" },
         ctx,
       ),
-      { systemPrompt: "base" },
+      undefined,
     );
     await handlers.get("session_shutdown")?.({}, ctx);
   } finally {

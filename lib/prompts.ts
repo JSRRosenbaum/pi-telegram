@@ -168,6 +168,21 @@ type TelegramBeforeAgentStartHook = (
   event: TelegramBeforeAgentStartEvent,
 ) => TelegramBeforeAgentStartResult;
 
+// Returning any systemPrompt makes Pi replace its prompt, which defeats prompt
+// caching; return an override only when the computed prompt actually differs.
+function overrideSystemPromptIfChanged(
+  incoming: TelegramSystemPrompt | null | undefined,
+  computed: TelegramSystemPrompt,
+): TelegramBeforeAgentStartResult | undefined {
+  const base = incoming ?? "";
+  const unchanged =
+    Array.isArray(base) && Array.isArray(computed)
+      ? base.length === computed.length &&
+        base.every((block, index) => block === computed[index])
+      : base === computed;
+  return unchanged ? undefined : { systemPrompt: computed };
+}
+
 export function buildTelegramBridgeSystemPrompt(options: {
   prompt?: string;
   systemPrompt?: TelegramSystemPrompt | null;
@@ -241,17 +256,19 @@ export function createTelegramProactiveBeforeAgentStartHook<TContext>(
 ): (
   event: TelegramBeforeAgentStartEvent,
   ctx: TContext,
-) => Promise<TelegramBeforeAgentStartResult> {
+) => Promise<TelegramBeforeAgentStartResult | undefined> {
   const baseHook = deps.baseHook ?? createTelegramBeforeAgentStartHook();
   return async (event, ctx) => {
     deps.reconcileAvailability?.();
     if (!deps.isAvailable(ctx)) {
-      return {
-        systemPrompt: stripTelegramToolMetadataFromSystemPrompt(
-          event.systemPrompt,
-        ),
-      };
+      return overrideSystemPromptIfChanged(
+        event.systemPrompt,
+        stripTelegramToolMetadataFromSystemPrompt(event.systemPrompt),
+      );
     }
-    return baseHook(event);
+    return overrideSystemPromptIfChanged(
+      event.systemPrompt,
+      baseHook(event).systemPrompt,
+    );
   };
 }

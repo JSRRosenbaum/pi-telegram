@@ -55,5 +55,5 @@ export interface TelegramProactivePromptHookDeps<TContext> {
     reconcileAvailability?: () => void;
     isAvailable: (ctx: TContext) => boolean;
 }
-export declare function createTelegramProactiveBeforeAgentStartHook<TContext>(deps: TelegramProactivePromptHookDeps<TContext>): (event: TelegramBeforeAgentStartEvent, ctx: TContext) => Promise<TelegramBeforeAgentStartResult>;
+export declare function createTelegramProactiveBeforeAgentStartHook<TContext>(deps: TelegramProactivePromptHookDeps<TContext>): (event: TelegramBeforeAgentStartEvent, ctx: TContext) => Promise<TelegramBeforeAgentStartResult | undefined>;
 export {};
