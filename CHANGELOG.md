@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.57.3: Session Thread Continuity
+
+- `Session handoff`: A session replaced inside one Pi process now reuses its preserved Thread on every registration path, not only connect recovery. The successor re-keys onto the same tab and slot with the new session id, so `/new` no longer provisions a second tab and leaves the previous one without an owner.
+- `Successor adoption`: A new session registering in a folder whose previous session is provably gone adopts that binding's exact target and slot, and the retained binding is re-keyed to the successor instead of leaving an orphan active row. A live predecessor, an ambiguous candidate set, an unknown runtime or a missing liveness probe keeps ordinary provisioning.
+
 ## 0.57.2: Connect Latency and Session Identity
 
 - `Connect latency`: A new Thread no longer waits about 20 seconds when all 26 letter slots are occupied. Slot rotation read the complete journal namespace and every shared journal once per binding inside one synchronous pass, freezing the leader's event loop and staling healthy follower heartbeats. One occupancy snapshot now reads that binding-independent evidence once, and every fresh snapshot still re-reads it so post-fence checks see newly arrived work.

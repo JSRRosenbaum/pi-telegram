@@ -4682,6 +4682,64 @@ test("Bus follower initial registration consumes a pending session handoff after
   }
 });
 
+test("Bus follower restore after session replacement reuses the preserved Thread", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-follower-handoff-restore-"));
+  const socketPath = join(dir, "bus.sock");
+  const registrations: Array<{
+    target: unknown;
+    previousInstanceId: string | undefined;
+  }> = [];
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: createTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: createTelegramBusFollowerRegistry(),
+      provisionFollowerTarget(registration) {
+        registrations.push({
+          target: registration.target,
+          previousInstanceId: registration.previousInstanceId,
+        });
+        return { chatId: 1, threadId: 2, slot: "B", threadName: "Beryl" };
+      },
+    }),
+  });
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "new-inst",
+    createRequestId: () => "new-inst:restore:1",
+    registrationState: createTelegramBusFollowerRegistrationState(),
+  });
+  setTelegramFollowerSessionHandoff({
+    pid: process.pid,
+    instanceId: "old-inst",
+    createdAtMs: Date.now(),
+    target: { chatId: 1, threadId: 2 },
+    slot: "B",
+    threadName: "Beryl",
+  });
+  try {
+    await server.start();
+    // A replaced session registers through the ordinary restore path, not only through connect recovery.
+    assert.equal(
+      await follower.registerWithLeader(
+        { cwd: "/repo" },
+        { busSocketPath: socketPath },
+        { restoreWorkspace: true },
+      ),
+      true,
+    );
+    assert.deepEqual(registrations, [
+      {
+        target: { chatId: 1, threadId: 2 },
+        previousInstanceId: "old-inst",
+      },
+    ]);
+  } finally {
+    follower.stop();
+    setTelegramFollowerSessionHandoff(undefined);
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Bus follower session replacement preserves a same-process handoff", async () => {
   const registrationState = createTelegramBusFollowerRegistrationState();
   registrationState.setRegistered(

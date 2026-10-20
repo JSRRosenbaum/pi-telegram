@@ -1583,6 +1583,80 @@ export function createTelegramBusFollowerTargetProvisioner(
         });
       if (candidates.length === 1) restoredPredecessor = candidates[0];
     }
+    // A new session in a folder whose previous session is gone takes over that Thread: the tab keeps a single
+    // owner and the retired binding is re-keyed instead of being left behind as an orphan.
+    if (
+      !restoredPredecessor &&
+      registration.cwd &&
+      registration.sessionId &&
+      !registration.previousInstanceId &&
+      deps.getLiveFollowers &&
+      deps.isFollowerProcessAlive
+    ) {
+      const identity = Threads.createTelegramWorkspaceBindingIdentity(
+        registration.cwd,
+        0,
+        registration.sessionId,
+      );
+      const liveFollowers = deps.getLiveFollowers();
+      const candidates = deps.topicTargetStore
+        .listWorkspaceBindings()
+        .filter(
+          (binding) =>
+            !!(
+              identity &&
+              binding.cwd === identity.cwd &&
+              binding.sessionId !== identity.sessionId
+            ),
+        )
+        .flatMap((binding) => {
+          const matches = deps.topicTargetStore
+            .list()
+            .filter(
+              (record) =>
+                record.status === "active" &&
+                record.owner?.kind === "manual-follower" &&
+                record.target.chatId === binding.target.chatId &&
+                record.target.threadId === binding.target.threadId,
+            );
+          return matches.length === 1
+            ? [{ binding, record: matches[0]! }]
+            : [];
+        })
+        .filter(({ record }) => {
+          if (
+            liveFollowers.some(
+              (peer) =>
+                peer.instanceId === record.instanceId ||
+                (peer.target?.chatId === record.target.chatId &&
+                  peer.target.threadId === record.target.threadId),
+            )
+          )
+            return false;
+          const match = /^([1-9][0-9]*):[0-9]+$/.exec(record.instanceId ?? ""),
+            pid = match ? Number(match[1]) : undefined;
+          if (pid === undefined || !Number.isSafeInteger(pid)) return false;
+          try {
+            return deps.isFollowerProcessAlive!(pid) === false;
+          } catch {
+            return false;
+          }
+        });
+      // Ambiguity keeps ordinary provisioning: never guess which retained tab a new session inherits.
+      if (candidates.length === 1 && identity?.sessionId) {
+        const candidate = candidates[0]!;
+        if (
+          candidate.binding.sessionId &&
+          deps.topicTargetStore.adoptWorkspaceThreadBindingForSession(
+            candidate.binding.cwd,
+            candidate.binding.sessionId,
+            identity.sessionId,
+            candidate.binding.target,
+          )
+        )
+          restoredPredecessor = candidate.record;
+      }
+    }
     let capacityUnavailable = false;
     const workspaceIdentity = registration.cwd
       ? deps.topicTargetStore.claimWorkspaceIdentity(

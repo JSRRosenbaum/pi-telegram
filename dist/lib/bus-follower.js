@@ -1851,9 +1851,9 @@ export function createTelegramBusFollowerRegistrationRuntime(deps) {
                 deps.setActiveAuthSecret?.(undefined);
                 await deps.stopReceiving?.();
             };
-            const pendingHandoff = options && !options.recoverConnection
-                ? undefined
-                : getTelegramFollowerSessionHandoff();
+            // A fresh handoff belongs to this same process, so a replaced session reuses its Thread: the tab keeps
+            // one identity and only its owner rotates. Explicit options still override the preserved target.
+            const pendingHandoff = getTelegramFollowerSessionHandoff();
             const pendingHandoffOptions = isTelegramFollowerSessionHandoffFresh(pendingHandoff)
                 ? {
                     target: pendingHandoff.target,

@@ -569,6 +569,11 @@ export interface TelegramTopicTargetStore {
         sessionHandoff?: boolean;
         onCapacityUnavailable?: () => void;
     }) => TelegramWorkspaceBindingIdentity | undefined;
+    /**
+     * Re-keys one retained Thread binding from a retired session to its successor at the same slot and target,
+     * so the tab keeps a single owner. Fails without mutation when the source binding or slot identity is absent.
+     */
+    adoptWorkspaceThreadBindingForSession: (cwd: string, sourceSessionId: string, sessionId: string, target: TelegramTarget) => boolean;
     releaseWorkspaceClaim: (instanceId: string) => boolean;
     upsertWorkspaceBinding: (binding: TelegramWorkspaceThreadBinding, claimInstanceId?: string) => TelegramWorkspaceThreadBinding | undefined;
     upsert: (record: TelegramTopicTargetRecord) => TelegramTopicTargetRecord;
