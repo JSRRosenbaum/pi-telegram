@@ -616,7 +616,7 @@ for (const initiallyAvailable of [false, true]) test(`Real Pi runtime keeps Tele
   const { fauxProvider, fauxAssistantMessage, fauxToolCall, Type } = await import("@earendil-works/pi-ai");
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-native-prompts-")));
   const requests: import("@earendil-works/pi-ai").Message[][] = [], errors: string[] = [];
-  let available = initiallyAvailable, forced: string | undefined, enabled = false;
+  let available = initiallyAvailable, forced: string | undefined, enabled = false, removeSearch = false;
   let session: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
   const hook = createTelegramProactiveBeforeAgentStartHook({ isAvailable: () => available });
   try {
@@ -644,7 +644,7 @@ for (const initiallyAvailable of [false, true]) test(`Real Pi runtime keeps Tele
               return { content: [{ type: "text", text: "Fixture tool completed" }], details: undefined };
             } });
           pi.on("before_agent_start", () => {
-            pi.setActiveTools(pi.getActiveTools().filter(name => name !== "ghost_tool" && (enabled || name !== "web_search")));
+            pi.setActiveTools(pi.getActiveTools().filter(name => name !== "ghost_tool" && (name !== "web_search" || (enabled && !removeSearch))));
             return forced === undefined ? undefined : { systemPrompt: forced };
           });
         }, pi => {
@@ -696,11 +696,16 @@ for (const initiallyAvailable of [false, true]) test(`Real Pi runtime keeps Tele
     assert.equal(turnNotes().length, 1);
     await session.sendCustomMessage({ customType: "fixture-completion", content: "[telegram] quoted completion", display: false }, { triggerTurn: true });
     assert.equal(turnNotes().length, 1, "A custom start cannot acquire Telegram user-turn instructions");
+    removeSearch = true;
+    await session.prompt("Observe removal of the previously declared tool");
+    assert.ok(requests.at(-1)!.slice(1).some(message => message.role === "system" && message.toolsRemoved?.some(tool => tool.name === "web_search")),
+      "A previously declared tool must be removed through a trailing system update");
     const path = session.sessionManager.getSessionFile();
     assert.ok(path);
     session.dispose();
     session = await createSession(SessionManager.open(path));
     await session.prompt("Resumed local prompt");
+    assert.equal(turnNotes().length, 1, "The original turn note stays historical without being re-injected on resume");
     for (const request of requests) assert.deepEqual(request[0], head, "The original request head must survive tools, turns and resume");
     forced = "Other extension opaque instructions";
     await session.prompt("Forced connected prompt");
