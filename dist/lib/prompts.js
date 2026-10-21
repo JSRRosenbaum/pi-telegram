@@ -1,7 +1,7 @@
 /**
  * Telegram prompt injection helpers
  * Zones: pi agent prompts, telegram guidance
- * Owns Telegram-specific system prompt suffixes injected into pi agent turns
+ * Owns stable Telegram guidance, turn-scoped context, and compatibility fallback hooks
  */
 import { TELEGRAM_PREFIX } from "./turns.js";
 export const TELEGRAM_CONNECTED_CONTEXT_MESSAGE = "Telegram session connected. Use Telegram features for Telegram-originated turns or explicit Telegram requests; connectivity alone is not user intent.";
@@ -162,21 +162,15 @@ function stripTelegramToolMetadataFromSystemPrompt(systemPrompt) {
         : stripTelegramToolMetadataFromString(systemPrompt);
 }
 const TELEGRAM_TOOL_NAMES = ["telegram_attach", "telegram_message"];
-// Pi exposes structured prompt sections on the event. Editing them instead of
-// returning a forced systemPrompt lets Pi send changes as a transcript delta,
-// keeping the cached prefix and signed thinking blocks intact. Returns false
-// when Pi gives no sections so the caller can fall back to a forced prompt.
+// Sections cannot modify an opaque prompt owned by an earlier handler.
+// Preserve append/strip compatibility there instead of silently losing guidance.
 function applyTelegramPromptSections(event, available) {
     const options = event.systemPromptOptions;
     const sections = options?.sections;
-    if (typeof sections !== "object" || sections === null)
+    if (typeof sections !== "object" || sections === null || options?.forceSystemPrompt !== undefined)
         return false;
     if (available) {
-        sections.telegram = (LOCAL_SYSTEM_PROMPT_SUFFIX +
-            buildTelegramTurnSuffix({
-                prompt: event.messageType === "custom" ? undefined : event.prompt,
-                telegramTurnSystemPromptSuffix: TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX,
-            })).trim();
+        sections.telegram = LOCAL_SYSTEM_PROMPT_SUFFIX.trim();
         return true;
     }
     delete sections.telegram;
@@ -194,9 +188,12 @@ export function createTelegramProactiveBeforeAgentStartHook(deps) {
         deps.reconcileAvailability?.();
         const available = deps.isAvailable(ctx);
         // A caller-supplied baseHook owns its own prompt text, so it stays on the forced-prompt path.
-        if (!deps.baseHook &&
-            applyTelegramPromptSections(event, available)) {
-            return undefined;
+        if (!deps.baseHook && applyTelegramPromptSections(event, available)) {
+            const turnSuffix = available ? buildTelegramTurnSuffix({
+                prompt: event.messageType === "custom" ? undefined : event.prompt,
+                telegramTurnSystemPromptSuffix: TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX,
+            }).trim() : "";
+            return turnSuffix ? { message: { customType: "telegram-turn", content: turnSuffix, display: false } } : undefined;
         }
         if (!available) {
             return overrideSystemPromptIfChanged(event.systemPrompt, stripTelegramToolMetadataFromSystemPrompt(event.systemPrompt));
