@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Prompt cache`: Runs where Telegram has nothing to add or strip no longer return a `systemPrompt` from `before_agent_start`, so Pi keeps its own prompt and Anthropic prompt-cache prefixes survive. Returning any prompt made Pi fold all system messages into one head, causing cache misses and dropped thinking blocks. Telegram turns still append their suffix, and an unavailable bridge still strips Telegram tool metadata when present. Refs #353.
+
 ## 0.57.3: Session Thread Continuity
 
 - `Session handoff`: A session replaced inside one Pi process now reuses its preserved Thread on every registration path, not only connect recovery. The successor re-keys onto the same tab and slot with the new session id, so `/new` no longer provisions a second tab and leaves the previous one without an owner.

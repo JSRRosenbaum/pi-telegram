@@ -17,6 +17,7 @@ import {
   TELEGRAM_ATTACH_PROMPT_SNIPPET,
   TELEGRAM_CONNECTED_CONTEXT_MESSAGE,
   TELEGRAM_DISCONNECTED_CONTEXT_MESSAGE,
+  TELEGRAM_MESSAGE_PROMPT_SNIPPET,
 } from "../lib/prompts.ts";
 
 type BeforeAgentStartHookEvent = Parameters<
@@ -41,9 +42,10 @@ test("Prompt hooks normalize missing and null system prompts without losing Tele
       const proactive = createTelegramProactiveBeforeAgentStartHook({
         baseHook: hook, isAvailable: () => available,
       });
-      assert.deepEqual(await proactive(event, undefined), {
-        systemPrompt: available ? hook(event).systemPrompt : "",
-      });
+      assert.deepEqual(
+        await proactive(event, undefined),
+        available ? { systemPrompt: hook(event).systemPrompt } : undefined,
+      );
     }
   }
   assert.deepEqual(buildTelegramBridgeSystemPrompt({
@@ -72,9 +74,12 @@ test("Custom-message starts keep bridge guidance without claiming Telegram user 
         });
         const result = await hook(event, undefined);
         const base = systemPrompt ?? "";
-        assert.deepEqual(result, {
-          systemPrompt: available ? (Array.isArray(base) ? [...base, "local"] : base + "local") : base,
-        });
+        assert.deepEqual(
+          result,
+          available
+            ? { systemPrompt: Array.isArray(base) ? [...base, "local"] : base + "local" }
+            : undefined,
+        );
         assert.equal(reconciled, 1);
       }
     }
@@ -319,6 +324,58 @@ test("Prompt helpers strip unavailable Telegram tools from each ordered block", 
   assert.deepEqual(result, {
     systemPrompt: ["base\ntail", "project context"],
   });
+});
+
+test("Prompt helpers return no override when unavailable transport has nothing to strip", async () => {
+  const hook = createTelegramProactiveBeforeAgentStartHook({
+    isAvailable: () => false,
+  });
+  for (const systemPrompt of ["base", ["base", "project context"]]) {
+    const result = await hook(
+      createBeforeAgentStartEvent("local prompt", systemPrompt),
+      "ctx",
+    );
+    assert.equal(result, undefined);
+  }
+  for (const systemPrompt of [undefined, null]) {
+    const event = { prompt: "local prompt", systemPrompt } as BeforeAgentStartHookEvent;
+    assert.equal(await hook(event, "ctx"), undefined);
+  }
+});
+
+test("Prompt helpers still force a stripped prompt when unavailable transport has Telegram tool metadata", async () => {
+  const hook = createTelegramProactiveBeforeAgentStartHook({
+    isAvailable: () => false,
+  });
+  const result = await hook(
+    createBeforeAgentStartEvent(
+      "local prompt",
+      `base\n- telegram_message: ${TELEGRAM_MESSAGE_PROMPT_SNIPPET}`,
+    ),
+    "ctx",
+  );
+  assert.deepEqual(result, { systemPrompt: "base" });
+});
+
+test("Prompt helpers return no override when the computed prompt equals the incoming prompt", async () => {
+  const hook = createTelegramProactiveBeforeAgentStartHook({
+    baseHook: createTelegramBeforeAgentStartHook({
+      localSystemPromptSuffix: "",
+      telegramTurnSystemPromptSuffix: "\ntelegram turn contract",
+    }),
+    isAvailable: () => true,
+  });
+  assert.equal(
+    await hook(createBeforeAgentStartEvent("local prompt", "base"), "ctx"),
+    undefined,
+  );
+  assert.deepEqual(
+    await hook(createBeforeAgentStartEvent("[telegram] hello", "base"), "ctx"),
+    {
+      systemPrompt:
+        "base\ntelegram turn contract\n- The current user message came from Telegram.",
+    },
+  );
 });
 
 test("Model-context availability binding safely delegates after late composition", () => {
