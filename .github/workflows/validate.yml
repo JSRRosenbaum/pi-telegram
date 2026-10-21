@@ -17,7 +17,8 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
+          # Hosted arm64 capacity can leave macos-latest jobs unacquired.
+          - macos-26-intel
           - windows-latest
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
