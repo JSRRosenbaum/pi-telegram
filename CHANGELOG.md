@@ -4,7 +4,8 @@
 
 ## Unreleased
 
-- `Prompt cache`: Runs where Telegram has nothing to add or strip no longer return a `systemPrompt` from `before_agent_start`, so Pi keeps its own prompt and Anthropic prompt-cache prefixes survive. Returning any prompt made Pi fold all system messages into one head, causing cache misses and dropped thinking blocks. Telegram turns still append their suffix, and an unavailable bridge still strips Telegram tool metadata when present. Refs #353.
+- `Prompt composition`: Telegram guidance uses Pi's native sections instead of replacing the system prompt, preserving the transcript head across tool changes, connection changes and resume. Telegram-turn notes are hidden turn-scoped messages, so local/Telegram switches do not toggle system sections. This removes the bridge's forced-prefix cache/thinking regression. Fixes #353.
+- `Prompt compatibility`: Unchanged fallback prompts produce no override. Hosts without sections, explicit custom hooks and an earlier extension-owned forced prompt retain equality-guarded append/strip behavior without losing foreign instructions. Another extension's forced prompt remains outside the cache-stability guarantee.
 
 ## 0.57.3: Session Thread Continuity
 

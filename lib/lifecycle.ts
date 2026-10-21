@@ -14,6 +14,7 @@ import type {
   AgentStartEvent,
   AssistantMessageEvent,
   BeforeAgentStartEvent,
+  BeforeAgentStartEventResult,
   ExtensionAPI,
   ExtensionContext,
   InputEvent,
@@ -61,6 +62,7 @@ type TelegramBeforeAgentStartEvent = Omit<
 
 export interface TelegramBeforeAgentStartResult {
   systemPrompt?: string | string[];
+  message?: BeforeAgentStartEventResult["message"];
 }
 
 type TelegramBeforeAgentStartReturn =

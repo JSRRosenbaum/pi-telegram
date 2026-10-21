@@ -1073,6 +1073,7 @@ test("Message activity hooks preserve typing after transient preview errors", as
 test("Lifecycle helpers register pi hooks and delegate to handlers", async () => {
   const harness = createLifecycleApiHarness();
   const events: string[] = [];
+  const turnMessage = { customType: "telegram-turn", content: "Fixture turn instructions", display: false };
   let active = true;
   registerTelegramLifecycleHooks(harness.api, {
     isSessionActive: () => active,
@@ -1097,7 +1098,7 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     },
     onBeforeAgentStart: (event) => {
       events.push("before-agent-start");
-      return { systemPrompt: event.systemPrompt };
+      return "prompt" in event && event.prompt === "[telegram] fixture" ? { message: turnMessage } : { systemPrompt: event.systemPrompt };
     },
     onModelSelect: () => {
       events.push("model-select");
@@ -1236,4 +1237,8 @@ test("Lifecycle helpers register pi hooks and delegate to handlers", async () =>
     "ui-prompt-end",
     "agent-end",
   ]);
+  const messageOnlyResult = await getRequiredLifecycleHandler(harness.handlers, "before_agent_start")(
+    { prompt: "[telegram] fixture", systemPrompt: "base" }, ctx,
+  );
+  assert.deepEqual(messageOnlyResult, { message: turnMessage });
 });
