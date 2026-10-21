@@ -4,8 +4,11 @@
 
 ## Unreleased
 
-- `Prompt composition`: Telegram guidance uses Pi's native sections instead of replacing the system prompt, preserving the transcript head across tool changes, connection changes and resume. Telegram-turn notes are hidden turn-scoped messages, so local/Telegram switches do not toggle system sections. This removes the bridge's forced-prefix cache/thinking regression. Fixes #353.
-- `Prompt compatibility`: Unchanged fallback prompts produce no override. Hosts without sections, explicit custom hooks and an earlier extension-owned forced prompt retain equality-guarded append/strip behavior without losing foreign instructions. Another extension's forced prompt remains outside the cache-stability guarantee.
+## 0.57.4: Prompt Cache Stability
+
+- `Prompt composition`: Telegram guidance uses native Pi sections instead of forcing the request head, preserving its prefix across tool/context updates, connection changes and resume. Stable connection guidance is separate from hidden Telegram-turn messages; local/custom starts do not add new turn notes, while earlier notes remain in their original history. Refs #353.
+- `Prompt compatibility`: An unchanged fallback produces no override. Hosts without structured sections, explicit custom hooks and an earlier extension-owned opaque prompt retain equality-guarded append/strip behavior for strings or ordered blocks without losing foreign instructions. Another extension's forced prompt remains outside the cache-stability guarantee.
+- `CI`: macOS validation uses the supported macOS 26 Intel image to avoid hosted ARM runner-capacity failures. Full checks remain enabled on macOS, Linux and Windows, with unchanged test deadlines and assertions.
 
 ## 0.57.3: Session Thread Continuity
 
