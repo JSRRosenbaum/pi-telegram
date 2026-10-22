@@ -8,7 +8,7 @@
 
 - `Prompt composition`: Telegram guidance uses native Pi sections instead of forcing the request head, preserving its prefix across tool/context updates, connection changes and resume. Stable connection guidance is separate from hidden Telegram-turn messages; local/custom starts do not add new turn notes, while earlier notes remain in their original history. Refs #353.
 - `Prompt compatibility`: An unchanged fallback produces no override. Hosts without structured sections, explicit custom hooks and an earlier extension-owned opaque prompt retain equality-guarded append/strip behavior for strings or ordered blocks without losing foreign instructions. Another extension's forced prompt remains outside the cache-stability guarantee.
-- `CI`: macOS validation uses the supported macOS 26 Intel image to avoid hosted ARM runner-capacity failures. Full checks remain enabled on macOS, Linux and Windows, with unchanged test deadlines and assertions.
+- `CI`: macOS validation uses the supported macOS 26 Intel image to avoid hosted ARM runner-capacity failures, and runs its test files two at a time so wall-clock latency tests stop failing under contention. Full checks remain enabled on macOS, Linux and Windows, with unchanged test deadlines and assertions.
 
 ## 0.57.3: Session Thread Continuity
 

@@ -52,7 +52,12 @@ jobs:
           tests/command-templates.test.ts tests/outbound-voice.test.ts
           tests/bus-follower.test.ts tests/bus-leader.test.ts
       - name: Run tests
+        if: matrix.os != 'macos-26-intel'
         run: npm test
+      # Wall-clock latency tests share a small Intel runner; fewer parallel test files keep every assertion and deadline unchanged.
+      - name: Run tests with reduced concurrency
+        if: matrix.os == 'macos-26-intel'
+        run: npm run test:low-concurrency
       - name: Check package contents
         run: npm run pack:check
       - name: Audit dependencies
