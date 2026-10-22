@@ -1906,7 +1906,7 @@ export function createTelegramWorkspaceSlotRotation(
     return requests.runExclusive(async () => {
       if (!isCurrent())
         throw new Error("Telegram Workspace allocation lost leader authority.");
-      const rotate = async () => {
+      const rotate = async (options?: { reuseWhenProtected?: boolean }) => {
         const result = await input.runExclusive(async () => {
           if (!isCurrent())
             throw new Error(
@@ -1959,6 +1959,41 @@ export function createTelegramWorkspaceSlotRotation(
             },
           });
         });
+        if (
+          options?.reuseWhenProtected &&
+          result.kind === "blocked" &&
+          result.stage === "preparation" &&
+          result.reason === "protected-capacity"
+        ) {
+          // Every letter is protected, so deleting a Thread is off the table: reassign the
+          // least recently used letter as metadata and keep its Thread, journals and work.
+          const reused = await input.runExclusive(async () => {
+            if (!isCurrent())
+              throw new Error(
+                "Telegram Workspace slot reuse lost leader authority.",
+              );
+            await input.store.load();
+            if (!isCurrent())
+              throw new Error(
+                "Telegram Workspace slot reuse lost leader authority.",
+              );
+            return input.store.reuseLeastRecentlyUsedWorkspaceSlot(isCurrent);
+          });
+          if (!isCurrent())
+            throw new Error("Telegram Workspace rotation lost leader authority.");
+          if (reused) {
+            if (reused.kind === "reused") {
+              try {
+                input.recordEvent("Telegram Workspace slot reused.", {
+                  slot: reused.slot,
+                });
+              } catch {
+                /* Diagnostics cannot turn a published reassignment into another attempt. */
+              }
+            }
+            return { kind: "reused" as const };
+          }
+        }
         if (
           result.kind !== "retired" &&
           result.kind !== "not-needed" &&
@@ -2104,7 +2139,7 @@ export function createTelegramWorkspaceSlotRotation(
             }
           }
         }
-        await rotate();
+        await rotate({ reuseWhenProtected: true });
         return operation();
       }
     });

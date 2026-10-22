@@ -556,6 +556,19 @@ export interface TelegramTopicTargetStore {
     captureWorkspaceSlotOccupancy: (getExternalProtection: TelegramWorkspaceExternalProtectionCapture, options?: {
         expectedRetirement?: TelegramWorkspaceRetirementIntent;
     }) => TelegramWorkspaceSlotOccupancySnapshot;
+    /**
+     * Fallback for a full A-Z pool: strips the display letter from the least recently used
+     * binding (and its current Thread record) and persists, so a fresh allocation can take it.
+     * Metadata only: the Thread, journals and accepted work stay untouched, and a binding or
+     * letter held by a claim, reservation, provision, cleanup or retirement is never chosen.
+     */
+    reuseLeastRecentlyUsedWorkspaceSlot: (isCurrent: () => boolean) => Promise<{
+        kind: "free";
+    } | {
+        kind: "reused";
+        bindingKey: string;
+        slot: string;
+    } | undefined>;
     hasWorkspaceBinding: (cwd: string, sessionId?: string) => boolean;
     setWorkspaceDisplayTitle: (expected: TelegramWorkspaceThreadBinding, title: string) => boolean;
     markWorkspaceBindingInactiveByTarget: (target: TelegramTarget, inactiveSinceMs?: number) => boolean;
