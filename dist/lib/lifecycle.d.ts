@@ -5,7 +5,7 @@
  * Transport authority, durable bindings, and queue custody remain with their owners.
  */
 import * as BusFollower from "./bus-follower.ts";
-import type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, ExtensionAPI, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionCompactFailedEvent, SessionShutdownEvent, SessionStartEvent, ToolExecutionEndEvent, ToolExecutionStartEvent, ToolExecutionUpdateEvent, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent } from "./pi.ts";
+import type { AgentEndEvent, AgentSettledEvent, AgentStartEvent, AssistantMessageEvent, BeforeAgentStartEvent, BeforeAgentStartEventResult, ExtensionAPI, ExtensionContext, InputEvent, MessageEndEvent, SessionBeforeCompactEvent, SessionCompactEvent, SessionCompactFailedEvent, SessionShutdownEvent, SessionStartEvent, ToolExecutionEndEvent, ToolExecutionStartEvent, ToolExecutionUpdateEvent, TurnEndEvent, TurnEndEventResult, UIPromptEndEvent, UIPromptStartEvent } from "./pi.ts";
 import * as Machine from "./machine.ts";
 import * as Queue from "./queue.ts";
 export declare function createAgentStartDedupHook(inner: (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>, resetReplyDedup: () => void, schedulePublication?: (task: () => Promise<void>) => void): (event: AgentStartEvent, ctx: ExtensionContext) => Promise<void>;
@@ -14,6 +14,7 @@ type TelegramBeforeAgentStartEvent = Omit<BeforeAgentStartEvent, "systemPrompt">
 };
 export interface TelegramBeforeAgentStartResult {
     systemPrompt?: string | string[];
+    message?: BeforeAgentStartEventResult["message"];
 }
 type TelegramBeforeAgentStartReturn = Promise<TelegramBeforeAgentStartResult | undefined> | TelegramBeforeAgentStartResult | undefined;
 type TelegramLifecycleModel = ExtensionContext["model"];

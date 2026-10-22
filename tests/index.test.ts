@@ -62,13 +62,6 @@ function createIndexExtensionContext(): ExtensionContext {
   return {} as ExtensionContext;
 }
 
-function assertSystemPromptResult(
-  value: unknown,
-): asserts value is { systemPrompt: string } {
-  assert.ok(typeof value === "object" && value !== null);
-  assert.equal(typeof Reflect.get(value, "systemPrompt"), "string");
-}
-
 test("Extension entrypoint exposes only the default composition root", () => {
   assert.deepEqual(Object.keys(telegramEntrypoint), ["default"]);
 });
@@ -142,8 +135,6 @@ test("Extension before-agent-start hook skips Telegram guidance when unconfigure
     { systemPrompt: basePrompt, prompt: "hello" },
     createIndexExtensionContext(),
   );
-  assertSystemPromptResult(telegramResult);
-  assertSystemPromptResult(localResult);
-  assert.equal(telegramResult.systemPrompt, basePrompt);
-  assert.equal(localResult.systemPrompt, basePrompt);
+  assert.equal(telegramResult, undefined);
+  assert.equal(localResult, undefined);
 });

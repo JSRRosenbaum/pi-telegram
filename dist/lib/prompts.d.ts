@@ -1,9 +1,9 @@
 /**
  * Telegram prompt injection helpers
  * Zones: pi agent prompts, telegram guidance
- * Owns Telegram-specific system prompt suffixes injected into pi agent turns
+ * Owns stable Telegram guidance, turn-scoped context, and compatibility fallback hooks
  */
-import type { BeforeAgentStartEvent } from "./pi.ts";
+import type { BeforeAgentStartEvent, BeforeAgentStartEventResult } from "./pi.ts";
 export declare const TELEGRAM_CONNECTED_CONTEXT_MESSAGE = "Telegram session connected. Use Telegram features for Telegram-originated turns or explicit Telegram requests; connectivity alone is not user intent.";
 export declare const TELEGRAM_DISCONNECTED_CONTEXT_MESSAGE = "Telegram session disconnected. Do not use Telegram delivery, actions, or Telegram-specific reply features unless the user reconnects it.";
 export declare const TELEGRAM_ATTACH_PROMPT_SNIPPET = "Queue files for the active Telegram reply; outside Telegram turns, send files directly to Telegram.";
@@ -37,6 +37,9 @@ type TelegramBeforeAgentStartEvent = Omit<BeforeAgentStartEvent, "systemPrompt" 
 type TelegramBeforeAgentStartResult = {
     systemPrompt: TelegramSystemPrompt;
 };
+type TelegramProactiveBeforeAgentStartResult = Omit<BeforeAgentStartEventResult, "systemPrompt"> & {
+    systemPrompt?: TelegramSystemPrompt;
+};
 type TelegramBeforeAgentStartHook = (event: TelegramBeforeAgentStartEvent) => TelegramBeforeAgentStartResult;
 export declare function buildTelegramBridgeSystemPrompt(options: {
     prompt?: string;
@@ -55,5 +58,5 @@ export interface TelegramProactivePromptHookDeps<TContext> {
     reconcileAvailability?: () => void;
     isAvailable: (ctx: TContext) => boolean;
 }
-export declare function createTelegramProactiveBeforeAgentStartHook<TContext>(deps: TelegramProactivePromptHookDeps<TContext>): (event: TelegramBeforeAgentStartEvent, ctx: TContext) => Promise<TelegramBeforeAgentStartResult>;
+export declare function createTelegramProactiveBeforeAgentStartHook<TContext>(deps: TelegramProactivePromptHookDeps<TContext>): (event: TelegramBeforeAgentStartEvent, ctx: TContext) => Promise<TelegramProactiveBeforeAgentStartResult | undefined>;
 export {};
