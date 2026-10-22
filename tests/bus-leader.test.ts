@@ -5227,19 +5227,25 @@ test("Workspace rotation integrates leader and follower allocation without bypas
           assert.equal(reuse?.kind === "bus.ack" && reuse.ok, true);
           assert.deepEqual(effects, []);
           const responses = await Promise.all([register("first"), register("second")]);
-          if (scenario === "followers" || scenario === "already-absent") {
+          if (scenario === "followers" || scenario === "already-absent" || scenario === "protected") {
             assert.ok(responses.every((response) => response?.kind === "bus.ack" && response.ok));
-            assert.deepEqual(effects, ["delete:101", "create", "delete:100", "create"]);
+            // Fully protected capacity deletes nothing: the oldest letters are reassigned as metadata.
+            assert.deepEqual(effects, scenario === "protected" ? ["create", "create"] : ["delete:101", "create", "delete:100", "create"]);
             assert.equal(store.getWorkspaceBinding("/fresh/first", "a", "fresh-session")?.slot, "B");
             assert.equal(store.getWorkspaceBinding("/fresh/second", "a", "fresh-session")?.slot, "A");
+            if (scenario === "protected") {
+              assert.equal(store.getWorkspaceBinding("/old/1", "a", "old-session")?.slot, undefined);
+              assert.equal(store.getWorkspaceBinding("/old/0", "a", "old-session")?.slot, undefined);
+              assert.equal(admission.read().fence, undefined);
+            }
           } else {
             assert.ok(responses.every((response) => response?.kind === "bus.ack" && !response.ok));
-            assert.deepEqual(effects, scenario === "protected" ? [] : ["delete:101"]);
+            assert.deepEqual(effects, ["delete:101"]);
             assert.equal(store.getWorkspaceBinding("/old/1", "a", "old-session")?.slot, "B");
-            assert.equal(admission.read().fence?.phase, scenario === "protected" ? undefined : "deletion-issued");
+            assert.equal(admission.read().fence?.phase, "deletion-issued");
           }
         }
-        assert.equal(store.listWorkspaceBindings().length, 26);
+        assert.equal(store.listWorkspaceBindings().length, scenario === "protected" ? 28 : 26);
       } finally {
         await runtime.stopPolling();
         rmSync(dir, { recursive: true, force: true });

@@ -12,6 +12,31 @@ export class TelegramWorkspaceSlotUnavailableError extends Error {
         this.name = "TelegramWorkspaceSlotUnavailableError";
     }
 }
+/**
+ * Metadata-only fallback for a full A-Z pool: pick the least recently used letter,
+ * preferring detached bindings over live ones. Unlike pressure retirement this
+ * ignores accepted-work protection because reuse deletes nothing.
+ * Returns undefined for an empty or malformed candidate set.
+ */
+export function selectTelegramWorkspaceReusableSlot(candidates) {
+    const slots = new Set();
+    const keys = new Set();
+    for (const candidate of candidates) {
+        if (!/^[A-Z]$/u.test(candidate.slot) ||
+            !candidate.bindingKey ||
+            !Number.isSafeInteger(candidate.lastUsedMs) ||
+            candidate.lastUsedMs < 0 ||
+            slots.has(candidate.slot) ||
+            keys.has(candidate.bindingKey))
+            return undefined;
+        slots.add(candidate.slot);
+        keys.add(candidate.bindingKey);
+    }
+    const [selected] = [...candidates].sort((left, right) => Number(left.live) - Number(right.live) ||
+        left.lastUsedMs - right.lastUsedMs ||
+        left.slot.localeCompare(right.slot));
+    return selected ? { ...selected } : undefined;
+}
 function isSlot(slot) {
     return /^[a-z]$/u.test(slot);
 }

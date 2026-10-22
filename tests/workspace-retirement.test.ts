@@ -15,6 +15,7 @@ import test from "node:test";
 import {
   createTelegramTopicTargetStore,
   createTelegramWorkspaceBindingIdentity,
+  type TelegramTopicTargetStore,
   type TelegramWorkspaceExternalProtectionEvidence,
   type TelegramWorkspaceThreadBinding,
 } from "../lib/threads.ts";
@@ -1102,14 +1103,20 @@ for (const scenario of ["queued", "pending", "delivery-protected", "corrupt", "e
         allocations++; return claim.slot;
       });
       if (scenario === "queued" || scenario === "no-pressure") assert.equal(await attempt(), scenario === "queued" ? "A" : "Z");
-      else await assert.rejects(attempt(), scenario === "epoch-loss" ? /lost leader authority/ : /rotation blocked/);
+      else if (scenario === "epoch-loss") await assert.rejects(attempt(), /lost leader authority/);
+      // Still-protected capacity reassigns the least recently used letter as metadata instead of refusing.
+      else assert.equal(await attempt(), "A");
       assert.equal(prunes, scenario === "no-pressure" ? 0 : 1); assert.equal(captures, prunes);
       assert.equal(deletions, scenario === "queued" ? 1 : 0);
-      assert.equal(allocations, scenario === "queued" || scenario === "no-pressure" ? 1 : 0);
+      assert.equal(allocations, scenario === "epoch-loss" ? 0 : 1);
       assert.equal(reclaimed, scenario === "queued" || scenario === "pending" ? 1 : 0);
       const cold = createTelegramTopicTargetStore({ path: join(dir, "state.json") }); await cold.load();
       if (scenario === "queued") assert.equal(cold.getWorkspaceBinding("/repo/0"), undefined);
-      else assert.deepEqual(cold.getWorkspaceBinding("/repo/0")?.journalSources,
+      else if (scenario !== "no-pressure" && scenario !== "epoch-loss") {
+        assert.equal(cold.getWorkspaceBinding("/repo/0")?.slot, undefined, "reuse strips only the letter");
+        assert.ok(cold.getWorkspaceBinding("/repo/0")?.target, "the reused binding keeps its Thread");
+      }
+      if (scenario !== "queued") assert.deepEqual(cold.getWorkspaceBinding("/repo/0")?.journalSources,
         scenario === "corrupt" || scenario === "no-pressure" ? addresses : scenario === "delivery-protected" ? undefined : [addresses[1]]);
       assert.deepEqual(await readFile(paths[1]!), oldImage, "the dropped metadata address's physical source remains untouched");
       if (scenario !== "corrupt") assert.deepEqual(journals[2]!.read().entries.map(entry => entry.updateId),
@@ -2132,4 +2139,168 @@ test("Preparation removes an unpersisted intent when protection or leader author
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// --- Metadata-only slot reuse ---
+
+const protectedEvidence = (): TelegramWorkspaceExternalProtectionEvidence => ({
+  liveOwner: "protected", acceptedWork: "protected", deliveryAuthority: "protected",
+});
+
+function addReuseBinding(store: TelegramTopicTargetStore, index: number, inactiveSinceMs?: number): void {
+  store.upsertWorkspaceBinding({
+    ...createTelegramWorkspaceBindingIdentity(`/repo/${index}`, 0)!,
+    target: { chatId: 7, threadId: 40 + index },
+    slot: String.fromCharCode("A".charCodeAt(0) + index),
+    threadName: `Workspace${index}`,
+    ...(inactiveSinceMs === undefined ? {} : { inactiveSinceMs }),
+    updatedAtMs: 100,
+  });
+}
+
+async function withFullPool<T>(
+  run: (context: {
+    dir: string; store: TelegramTopicTargetStore; deletions: () => number;
+    rotation: ReturnType<typeof createTelegramWorkspaceSlotRotation>;
+    claim: () => string | undefined; reserved: { slots: string[] }; epoch: { value: number };
+  }) => Promise<T>,
+  options: { inactive?: (index: number) => number | undefined; canPersist?: () => boolean } = {},
+): Promise<T> {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-slot-reuse-")));
+  try {
+    const admission = createRetirementAdmission(join(dir, "admission.json"), "reuse");
+    const reserved = { slots: [] as string[] };
+    const store = createTelegramTopicTargetStore({
+      path: join(dir, "state.json"),
+      getExternalReservedSlots: () => [...admission.listReservedSlots(), ...reserved.slots],
+      ...(options.canPersist ? { canPersist: options.canPersist } : {}),
+    });
+    for (let index = 0; index < 26; index++) addReuseBinding(store, index, (options.inactive ?? ((i) => i + 1))(index));
+    await store.persist();
+    let deletions = 0;
+    const epoch = { value: 1 };
+    const rotation = createTelegramWorkspaceSlotRotation({
+      store, getAdmission: () => admission, getLeaderEpoch: () => epoch.value,
+      runExclusive: createTelegramWorkspaceOperationGate().runExclusive,
+      getExternalProtection: protectedEvidence, recordEvent() {},
+      async deleteThread() { deletions++; },
+    });
+    const claim = () => {
+      const claimed = store.claimWorkspaceIdentity("/fresh", "fresh");
+      if (!claimed) throw new TelegramWorkspaceSlotUnavailableError();
+      return claimed.slot;
+    };
+    return await run({ dir, store, deletions: () => deletions, rotation, claim, reserved, epoch });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("A full protected pool gives a fresh claim the least recently used letter without deleting its Thread", async () => {
+  await withFullPool(async ({ dir, store, deletions, rotation, claim }) => {
+    const victim = store.getWorkspaceBinding("/repo/0")!;
+    assert.equal(await rotation(async () => claim()), "A");
+    assert.equal(deletions(), 0, "protected capacity never deletes a Thread");
+    const reused = store.getWorkspaceBinding("/repo/0")!;
+    assert.equal(reused.slot, undefined, "the previous holder loses only its letter");
+    assert.deepEqual({ ...reused, slot: undefined }, { ...victim, slot: undefined });
+    assert.equal(store.listWorkspaceBindings().filter((binding) => binding.slot === "A").length, 0);
+    const cold = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+    await cold.load();
+    assert.equal(cold.getWorkspaceBinding("/repo/0")?.slot, undefined);
+    assert.equal(cold.getWorkspaceBinding("/repo/0")?.target.threadId, victim.target.threadId);
+    assert.equal(cold.listWorkspaceBindings().length, 26, "no binding is removed");
+  });
+});
+
+test("Reuse picks the oldest detached binding rather than the alphabetically first", async () => {
+  await withFullPool(async ({ store, rotation, claim }) => {
+    assert.equal(await rotation(async () => claim()), "N");
+    assert.equal(store.getWorkspaceBinding("/repo/13")?.slot, undefined);
+    assert.equal(store.getWorkspaceBinding("/repo/0")?.slot, "A");
+  }, { inactive: (index) => (index === 13 ? 1 : index + 50) });
+});
+
+test("A live owner is reused only after every detached binding", async () => {
+  await withFullPool(async ({ store, rotation, claim }) => {
+    // Only binding 0 has an owner Thread record, so it counts as most recently used despite its old clock.
+    store.upsert({
+      profileKey: "leader:/repo/0", owner: { kind: "leader", cwd: "/repo/0", instanceId: "live" },
+      target: { chatId: 7, threadId: 40 }, status: "active", createdAtMs: 1, updatedAtMs: 100,
+      instanceId: "live", slot: "A",
+    });
+    assert.equal(await rotation(async () => claim()), "B");
+    assert.equal(store.getWorkspaceBinding("/repo/0")?.slot, "A");
+    assert.equal(store.getWorkspaceBinding("/repo/1")?.slot, undefined);
+  });
+});
+
+test("An all-live pool still reuses its oldest binding and clears the Thread record letter", async () => {
+  await withFullPool(async ({ store, rotation, claim }) => {
+    for (let index = 0; index < 26; index++) {
+      store.upsert({
+        profileKey: `leader:/repo/${index}`, owner: { kind: "leader", cwd: `/repo/${index}`, instanceId: `live${index}` },
+        target: { chatId: 7, threadId: 40 + index }, status: "active", createdAtMs: 1, updatedAtMs: 100,
+        instanceId: `live${index}`, slot: String.fromCharCode(65 + index),
+      });
+    }
+    assert.equal(await rotation(async () => claim()), "A");
+    assert.equal(store.getWorkspaceBinding("/repo/0")?.slot, undefined);
+    assert.equal(store.list().filter((record) => record.slot === "A").length, 0, "no second Thread record keeps the letter");
+    assert.equal(store.list().length, 26, "records are kept");
+  }, { inactive: () => undefined });
+});
+
+test("Letters held by an external reservation are skipped", async () => {
+  await withFullPool(async ({ store, rotation, claim, reserved }) => {
+    reserved.slots.push("A");
+    assert.equal(await rotation(async () => claim()), "B");
+    assert.equal(store.getWorkspaceBinding("/repo/0")?.slot, "A");
+  });
+});
+
+test("A pool with every letter externally held still refuses without changing any binding", async () => {
+  await withFullPool(async ({ store, rotation, claim, reserved }) => {
+    reserved.slots.push(...Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+    await assert.rejects(rotation(async () => claim()), /rotation blocked/);
+    assert.equal(store.listWorkspaceBindings().filter((binding) => binding.slot).length, 26);
+  });
+});
+
+test("Restore-only claims never evict another assignment", async () => {
+  await withFullPool(async ({ store }) => {
+    const before = store.listWorkspaceBindings().map((binding) => binding.slot);
+    assert.equal(store.claimWorkspaceIdentity("/other", "other", undefined, { existingBindingOnly: true, sessionId: "restored" }), undefined);
+    assert.deepEqual(store.listWorkspaceBindings().map((binding) => binding.slot), before);
+  });
+});
+
+test("A refused publication leaves the previous assignment intact and the claim blocked", async () => {
+  let writable = true;
+  await withFullPool(async ({ store, rotation, claim }) => {
+    writable = false;
+    await assert.rejects(rotation(async () => claim()), /rotation blocked/);
+    assert.equal(store.getWorkspaceBinding("/repo/0")?.slot, "A");
+  }, { canPersist: () => writable });
+});
+
+test("Lost leader authority never reassigns a letter", async () => {
+  await withFullPool(async ({ store, rotation, claim, epoch }) => {
+    await assert.rejects(rotation(async () => { epoch.value = 2; return claim(); }), /lost leader authority|rotation blocked/);
+    assert.equal(store.getWorkspaceBinding("/repo/0")?.slot, "A");
+  });
+});
+
+test("A reassigned letter is not handed out twice", async () => {
+  await withFullPool(async ({ store, rotation, claim }) => {
+    assert.equal(await rotation(async () => claim()), "A");
+    assert.equal(store.claimWorkspaceIdentity("/second", "second"), undefined, "the pool is full again until another letter is reassigned");
+    assert.equal(await rotation(async () => {
+      const claimed = store.claimWorkspaceIdentity("/second", "second");
+      if (!claimed) throw new TelegramWorkspaceSlotUnavailableError();
+      return claimed.slot;
+    }), "B");
+    const letters = store.listWorkspaceBindings().flatMap((binding) => binding.slot ? [binding.slot] : []);
+    assert.equal(new Set(letters).size, letters.length);
+  });
 });

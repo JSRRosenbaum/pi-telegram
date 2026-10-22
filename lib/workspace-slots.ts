@@ -27,6 +27,50 @@ export type TelegramWorkspaceSlotAllocation =
   | { kind: "reclaim"; candidate: TelegramWorkspaceSlotOccupancy }
   | { kind: "blocked"; reason: "invalid-state" | "protected-capacity" };
 
+/** A binding whose letter may be reassigned without touching its Thread, journals or accepted work. */
+export interface TelegramWorkspaceReusableSlot {
+  bindingKey: string;
+  /** Uppercase display letter currently held by the binding. */
+  slot: string;
+  /** A live owner counts as most recently used, whatever its stored clocks say. */
+  live: boolean;
+  /** Last known use: inactivity start for detached bindings, otherwise the last binding update. */
+  lastUsedMs: number;
+}
+
+/**
+ * Metadata-only fallback for a full A-Z pool: pick the least recently used letter,
+ * preferring detached bindings over live ones. Unlike pressure retirement this
+ * ignores accepted-work protection because reuse deletes nothing.
+ * Returns undefined for an empty or malformed candidate set.
+ */
+export function selectTelegramWorkspaceReusableSlot(
+  candidates: readonly TelegramWorkspaceReusableSlot[],
+): TelegramWorkspaceReusableSlot | undefined {
+  const slots = new Set<string>();
+  const keys = new Set<string>();
+  for (const candidate of candidates) {
+    if (
+      !/^[A-Z]$/u.test(candidate.slot) ||
+      !candidate.bindingKey ||
+      !Number.isSafeInteger(candidate.lastUsedMs) ||
+      candidate.lastUsedMs < 0 ||
+      slots.has(candidate.slot) ||
+      keys.has(candidate.bindingKey)
+    )
+      return undefined;
+    slots.add(candidate.slot);
+    keys.add(candidate.bindingKey);
+  }
+  const [selected] = [...candidates].sort(
+    (left, right) =>
+      Number(left.live) - Number(right.live) ||
+      left.lastUsedMs - right.lastUsedMs ||
+      left.slot.localeCompare(right.slot),
+  );
+  return selected ? { ...selected } : undefined;
+}
+
 function isSlot(slot: string): boolean {
   return /^[a-z]$/u.test(slot);
 }

@@ -7,6 +7,8 @@ import test from "node:test";
 import {
   TELEGRAM_WORKSPACE_SLOTS,
   planTelegramWorkspaceSlotAllocation,
+  selectTelegramWorkspaceReusableSlot,
+  type TelegramWorkspaceReusableSlot,
   type TelegramWorkspaceSlotOccupancy,
 } from "../lib/workspace-slots.ts";
 
@@ -18,6 +20,34 @@ function fullProfile(): TelegramWorkspaceSlotOccupancy[] {
     protection: "eligible",
   }));
 }
+
+function reusable(): TelegramWorkspaceReusableSlot[] {
+  return Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ", (slot, index) => ({
+    bindingKey: `/repo/${index}`, slot, live: false, lastUsedMs: 100 + index,
+  }));
+}
+
+test("Reusable letter selection prefers detached bindings by age and ignores protection", () => {
+  const candidates = reusable();
+  assert.equal(selectTelegramWorkspaceReusableSlot(candidates)?.slot, "A");
+  candidates[12].lastUsedMs = 1;
+  assert.equal(selectTelegramWorkspaceReusableSlot(candidates)?.slot, "M");
+  // A live owner is the most recently used binding, whatever its stored clock says.
+  candidates[12].live = true;
+  assert.equal(selectTelegramWorkspaceReusableSlot(candidates)?.slot, "A");
+  for (const candidate of candidates) candidate.live = true;
+  assert.equal(selectTelegramWorkspaceReusableSlot(candidates)?.slot, "M", "all-live pools still reuse the oldest");
+  candidates.forEach((candidate) => { candidate.live = false; candidate.lastUsedMs = 5; });
+  assert.equal(selectTelegramWorkspaceReusableSlot(candidates.toReversed())?.slot, "A", "ties resolve by letter");
+});
+
+test("Reusable letter selection refuses empty or malformed candidate sets", () => {
+  assert.equal(selectTelegramWorkspaceReusableSlot([]), undefined);
+  const base = reusable().slice(0, 2);
+  for (const patch of [{ slot: "a" }, { slot: "AB" }, { bindingKey: "" }, { lastUsedMs: -1 }, { lastUsedMs: 1.5 }, { slot: "A" }, { bindingKey: "/repo/0" }]) {
+    assert.equal(selectTelegramWorkspaceReusableSlot([base[0]!, { ...base[1]!, ...patch }]), undefined, JSON.stringify(patch));
+  }
+});
 
 test("Global allocation uses the first free letter across directories and claims", () => {
   const bindings = fullProfile().slice(0, 2);

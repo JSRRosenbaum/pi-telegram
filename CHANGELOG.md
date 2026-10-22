@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.57.5: Workspace Slot Reuse
+
+- `Slot reuse`: A full A–Z pool no longer refuses a new connection when every Thread is active or protected. After pressure retirement finds no candidate, the least recently used letter is reassigned as metadata: detached bindings first, live owners last. The previous holder keeps its Thread, history, journals and accepted work and only loses its letter label. Restore-only startup and background recovery never reassign a letter.
+
 ## 0.57.4: Prompt Cache Stability
 
 - `Prompt composition`: Telegram guidance uses native Pi sections instead of forcing the request head, preserving its prefix across tool/context updates, connection changes and resume. Stable connection guidance is separate from hidden Telegram-turn messages; local/custom starts do not add new turn notes, while earlier notes remain in their original history. Refs #353.

@@ -74,6 +74,7 @@ import {
 } from "./workspace-identity.ts";
 import {
   planTelegramWorkspaceSlotAllocation,
+  selectTelegramWorkspaceReusableSlot,
   TELEGRAM_WORKSPACE_SLOTS,
   TelegramWorkspaceSlotUnavailableError,
   type TelegramWorkspaceSlotOccupancy,
@@ -886,6 +887,19 @@ export interface TelegramTopicTargetStore {
     getExternalProtection: TelegramWorkspaceExternalProtectionCapture,
     options?: { expectedRetirement?: TelegramWorkspaceRetirementIntent },
   ) => TelegramWorkspaceSlotOccupancySnapshot;
+  /**
+   * Fallback for a full A-Z pool: strips the display letter from the least recently used
+   * binding (and its current Thread record) and persists, so a fresh allocation can take it.
+   * Metadata only: the Thread, journals and accepted work stay untouched, and a binding or
+   * letter held by a claim, reservation, provision, cleanup or retirement is never chosen.
+   */
+  reuseLeastRecentlyUsedWorkspaceSlot: (
+    isCurrent: () => boolean,
+  ) => Promise<
+    | { kind: "free" }
+    | { kind: "reused"; bindingKey: string; slot: string }
+    | undefined
+  >;
   hasWorkspaceBinding: (cwd: string, sessionId?: string) => boolean;
   setWorkspaceDisplayTitle: (
     expected: TelegramWorkspaceThreadBinding,
@@ -7420,8 +7434,9 @@ export function createTelegramTopicTargetStore(
       const nowMs = getNowMs();
       const inSnapshot =
         getExternalProtection.withSnapshot ?? ((capture) => capture());
-      const bindings = inSnapshot(() => Array.from(workspaceBindings.values()).map((binding) => {
-        const slot = binding.slot?.toLowerCase() ?? "";
+      // A slotless binding (legacy or reassigned) holds no letter, so it can neither block planning nor be retired for capacity.
+      const bindings = inSnapshot(() => Array.from(workspaceBindings.values()).filter((binding) => binding.slot).map((binding) => {
+        const slot = binding.slot!.toLowerCase();
         const locallyProtected = isWorkspaceBindingLocallyProtected(
           binding,
           nowMs,
@@ -7490,6 +7505,150 @@ export function createTelegramTopicTargetStore(
           ]
         : [...localReservedSlots, "invalid"];
       return { bindings, reservedSlots };
+    },
+    async reuseLeastRecentlyUsedWorkspaceSlot(isCurrent) {
+      if (workspaceRetirementCommitInFlight || !isCurrent()) return undefined;
+      const external = captureExternalReservedSlots();
+      if (!external) return undefined;
+      const nowMs = getNowMs();
+      const currentRecords = Array.from(records.values()).filter(
+        ThreadReconciler.isCurrentThreadRecord,
+      );
+      const held = new Set<string>(
+        [
+          ...external,
+          ...Array.from(workspaceClaims.values()).map(
+            (claim) => claim.identity.slot,
+          ),
+          ...reservations
+            .filter(
+              (reservation) =>
+                reservation.expiresAtMs === undefined ||
+                reservation.expiresAtMs > nowMs,
+            )
+            .map((reservation) => reservation.slot),
+          ...pendingProvisions
+            .filter((provision) =>
+              isPendingProvisionLiveOrTargeted(provision, nowMs),
+            )
+            .map((provision) => provision.slot),
+        ].filter((slot): slot is string => !!slot),
+      );
+      const occupied = new Set<string>([
+        ...held,
+        ...Array.from(workspaceBindings.values()).flatMap((binding) =>
+          binding.slot ? [binding.slot] : [],
+        ),
+        ...currentRecords.flatMap((record) => (record.slot ? [record.slot] : [])),
+      ]);
+      if (
+        Array.from(TELEGRAM_WORKSPACE_SLOTS, (slot) => slot.toUpperCase()).some(
+          (slot) => !occupied.has(slot),
+        )
+      )
+        return { kind: "free" };
+      const claimedKeys = new Set(
+        Array.from(workspaceClaims.values()).map(
+          (claim) => claim.identity.bindingKey,
+        ),
+      );
+      const candidates = Array.from(workspaceBindings.values()).flatMap(
+        (binding) => {
+          const slot = binding.slot;
+          if (
+            !slot ||
+            !/^[A-Z]$/u.test(slot) ||
+            held.has(slot) ||
+            claimedKeys.has(binding.bindingKey) ||
+            hasWorkspaceRetirementConflict({
+              bindingKey: binding.bindingKey,
+              target: binding.target,
+              slot,
+            }) ||
+            pendingCleanups.some((intent) =>
+              targetMatches(intent.target, binding.target),
+            ) ||
+            // Another Thread already holding the letter is unresolved duplication, not reusable metadata.
+            currentRecords.some(
+              (record) =>
+                record.slot === slot && !targetMatches(record.target, binding.target),
+            )
+          )
+            return [];
+          const live = currentRecords.some((record) =>
+            targetMatches(record.target, binding.target),
+          );
+          return [
+            {
+              bindingKey: binding.bindingKey,
+              slot,
+              live,
+              lastUsedMs:
+                !live && binding.inactiveSinceMs !== undefined
+                  ? binding.inactiveSinceMs
+                  : binding.updatedAtMs,
+            },
+          ];
+        },
+      );
+      const selected = selectTelegramWorkspaceReusableSlot(candidates);
+      if (!selected) return undefined;
+      const mapKey = Array.from(workspaceBindings.entries()).find(
+        ([, binding]) => binding.bindingKey === selected.bindingKey,
+      )?.[0];
+      const binding = mapKey ? workspaceBindings.get(mapKey) : undefined;
+      if (!mapKey || !binding) return undefined;
+      const affected = currentRecords.filter(
+        (record) =>
+          record.slot === selected.slot && targetMatches(record.target, binding.target),
+      );
+      const previousBinding = cloneWorkspaceBinding(binding);
+      const previousRecords = affected.map((record) => ({
+        key: getRecordOwnerKey(record),
+        record: cloneRecord(record),
+        identity: identities.get(getRecordOwnerKey(record)),
+      }));
+      const { slot: _slot, ...slotless } = previousBinding;
+      workspaceRetirementCommitInFlight = true;
+      workspaceBindings.set(mapKey, slotless);
+      for (const record of affected) {
+        delete record.slot;
+        const key = getRecordOwnerKey(record);
+        const identity = identities.get(key);
+        if (identity?.slot === selected.slot) {
+          const { slot: _identitySlot, ...rest } = identity;
+          identities.set(key, rest);
+        }
+      }
+      markDirty();
+      const restoreInMemory = () => {
+        workspaceBindings.set(mapKey, cloneWorkspaceBinding(previousBinding));
+        for (const previous of previousRecords) {
+          records.set(previous.key, cloneRecord(previous.record));
+          if (previous.identity) identities.set(previous.key, previous.identity);
+        }
+        markDirty();
+      };
+      try {
+        if (!isCurrent() || !(await persistSnapshot())) {
+          restoreInMemory();
+          return undefined;
+        }
+        return {
+          kind: "reused" as const,
+          bindingKey: selected.bindingKey,
+          slot: selected.slot,
+        };
+      } catch (error) {
+        try {
+          await loadFromDisk();
+        } catch {
+          restoreInMemory();
+        }
+        throw error;
+      } finally {
+        workspaceRetirementCommitInFlight = false;
+      }
     },
     hasWorkspaceBinding(cwd, sessionId) {
       const normalizedCwd = normalizeTelegramWorkspacePath(cwd);
