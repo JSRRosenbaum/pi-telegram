@@ -27,7 +27,6 @@ test("Public package subpaths expose the stable extension API", async () => {
     activity,
     updates,
     commands,
-    sections,
     status,
     voice,
     keyboard,
@@ -39,7 +38,6 @@ test("Public package subpaths expose the stable extension API", async () => {
     import("@llblab/pi-telegram/activity"),
     import("@llblab/pi-telegram/updates"),
     import("@llblab/pi-telegram/commands"),
-    import("@llblab/pi-telegram/sections"),
     import("@llblab/pi-telegram/status"),
     import("@llblab/pi-telegram/voice"),
     import("@llblab/pi-telegram/keyboard"),
@@ -70,10 +68,6 @@ test("Public package subpaths expose the stable extension API", async () => {
     "registerTelegramUpdateHandler",
   ]);
   assert.deepEqual(Object.keys(commands).sort(), ["registerTelegramCommand"]);
-  assert.deepEqual(Object.keys(sections).sort(), [
-    "getTelegramSectionDiagnostics",
-    "registerTelegramSection",
-  ]);
   assert.deepEqual(Object.keys(status).sort(), [
     "registerTelegramStatusLineProvider",
   ]);

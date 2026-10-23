@@ -7,6 +7,7 @@
 export type { TelegramInputRichBlock, TelegramInputRichMessage, TelegramRichText } from "../lib/telegram-api.ts";
 
 export {
+  getTelegramSectionCallbackData,
   getTelegramSectionDiagnostics,
   registerTelegramSection,
   type TelegramSectionCallbackContext,

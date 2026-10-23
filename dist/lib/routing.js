@@ -1010,6 +1010,9 @@ export function createTelegramInboundBusProjectionRuntime(deps) {
                 followers: deps.listFollowers(),
             });
         },
+        getRegisteredFollowerTarget() {
+            return deps.isFollowerRegistered() ? deps.getFollowerTarget() : undefined;
+        },
         getLocalThreadLabelForTarget(target) {
             const followerTarget = deps.getFollowerTarget();
             const leaderTarget = deps.getLeaderTarget();
@@ -8301,6 +8304,14 @@ export function createTelegramInboundRouteRuntime(deps) {
                 }
                 const target = Updates.getTelegramMessageTarget(message);
                 if (!target?.threadId) {
+                    await textDispatch.handleMessage(message, ctx);
+                    return;
+                }
+                // Acknowledged bus registration is routing authority; a dirty shared-store
+                // projection can still describe this follower's previous Thread after rebind.
+                const registeredTarget = deps.getRegisteredFollowerTarget?.();
+                if (registeredTarget?.chatId === target.chatId &&
+                    registeredTarget.threadId === target.threadId) {
                     await textDispatch.handleMessage(message, ctx);
                     return;
                 }

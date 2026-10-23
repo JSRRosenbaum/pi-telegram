@@ -47,6 +47,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND_EXECUTION,
   TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
+  TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
@@ -192,6 +193,7 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
     target: TelegramTarget & { threadId: number },
   ) => Promise<string>;
   setThreadDisplayMode?: (mode: TelegramThreadDisplayMode) => Promise<void>;
+  prepareRestart?: () => Promise<boolean>;
   /** Leader-mediated durable publication or successor claim; true only after exact commit. */
   requestSessionReplacement?: (
     operation: "publish" | "settle",
@@ -388,6 +390,8 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   getProcessBirthId?: () => string;
   getSessionId?: (ctx: TContext) => string | undefined;
   getSessionGeneration?: () => number;
+  getTelegramProfile?: () => string | undefined;
+  getLeaderEpoch?: () => number | string | undefined;
   timeoutMs?: number;
   registrationTimeoutMs?: number;
   registrationRetryAttempts?: number;
@@ -3512,6 +3516,76 @@ export function createTelegramBusFollowerRegistrationRuntime<
           ? (response.message ?? "Telegram follower disconnect was rejected.")
           : "Telegram follower disconnect was not acknowledged.",
       );
+    },
+    async prepareRestart() {
+      const registrationGeneration = activeRegistrationGeneration;
+      const ctx = activeContext;
+      const socketPath = activeLeaderSocketPath;
+      const authSecret = activeAuthSecret;
+      const target = deps.registrationState?.getTarget();
+      const profileKey = ctx ? deps.getProfileKey?.(ctx) : undefined;
+      const sessionId = ctx ? deps.getSessionId?.(ctx) : undefined;
+      const leaderEpoch = deps.getLeaderEpoch?.();
+      const telegramProfile = deps.getTelegramProfile?.();
+      const sessionGeneration = deps.getSessionGeneration?.();
+      const leaderProtocol = deps.registrationState?.getLeaderProtocol();
+      if (
+        !socketPath ||
+        !registrationGeneration ||
+        !target ||
+        target.threadId === undefined ||
+        !profileKey ||
+        !sessionId ||
+        leaderEpoch === undefined ||
+        !deps.getTelegramProfile ||
+        !hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF) ||
+        !hasTelegramBusCapability(leaderProtocol, TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF)
+      ) return false;
+      const timeoutMs = Math.min(1000, registrationTimeoutMs);
+      const deadlineAtMs = getNowMs() + timeoutMs;
+      const expected = {
+        instanceId: deps.instanceId,
+        registrationGeneration,
+        profileKey,
+        sessionId,
+        leaderEpoch: String(leaderEpoch),
+        ...(telegramProfile !== undefined ? { telegramProfile } : {}),
+        deadlineAtMs,
+        target: { chatId: target.chatId, threadId: target.threadId },
+      };
+      const isCurrent = () =>
+        getNowMs() < deadlineAtMs &&
+        activeLeaderSocketPath === socketPath &&
+        activeRegistrationGeneration === registrationGeneration &&
+        activeAuthSecret === authSecret &&
+        activeContext !== undefined &&
+        deps.getSessionGeneration?.() === sessionGeneration &&
+        deps.getSessionId?.(activeContext) === sessionId &&
+        deps.getProfileKey?.(activeContext) === profileKey &&
+        deps.isContextActive?.(activeContext) !== false &&
+        deps.getTelegramProfile?.() === telegramProfile &&
+        String(deps.getLeaderEpoch?.()) === String(leaderEpoch) &&
+        isDeepStrictEqual(deps.registrationState?.getTarget(), expected.target) &&
+        deps.registrationState?.getGeneration() === registrationGeneration;
+      try {
+        const response = await sendTelegramBusOperation(
+          socketPath,
+          timeoutMs,
+          {
+            kind: "follower.prepareRestart",
+            requestId: deps.createRequestId(),
+            auth: authSecret,
+            ...expected,
+          },
+        );
+        return isCurrent() &&
+          response?.kind === "bus.ack" &&
+          response.ok === true &&
+          isDeepStrictEqual(response.result, expected);
+      } catch (error) {
+        deps.recordRuntimeEvent?.("bus", error, { phase: "prepare-restart" });
+        return false;
+      }
     },
     stop,
   };

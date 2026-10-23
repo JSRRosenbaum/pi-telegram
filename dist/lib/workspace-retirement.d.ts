@@ -196,7 +196,7 @@ export type TelegramWorkspaceDeadQueueReclamation = {
     updateIds: number[];
 } | {
     kind: "blocked";
-    reason: "authority-changed" | "live-owner" | "local-work" | "incomplete-source" | "unsupported-custody" | "owner-alive" | "owner-unverifiable" | "mutation-refused" | "protection-retained";
+    reason: "authority-changed" | "live-owner" | "local-work" | "incomplete-source" | "unsupported-custody" | "owner-alive" | "owner-unverifiable" | "outcome-unknown" | "mutation-refused" | "protection-retained";
 };
 /**
  * Demand-only preparation for pressure retirement. Every removed group is still

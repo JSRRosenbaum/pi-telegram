@@ -1421,6 +1421,7 @@ export type TelegramRoutedCallbackQuery = Updates.TelegramCallbackQuery &
 export interface TelegramInboundBusProjectionRuntime {
   getTargetOwnership: Updates.TelegramTargetOwnershipLookup;
   getLiveThreadTargets(): Queue.TelegramQueueTarget[];
+  getRegisteredFollowerTarget(): Queue.TelegramQueueTarget | undefined;
   getLocalThreadLabelForTarget(
     target: Queue.TelegramQueueTarget,
   ): string | undefined;
@@ -1451,6 +1452,9 @@ export function createTelegramInboundBusProjectionRuntime(deps: {
         leaderTarget: deps.getLeaderTarget(),
         followers: deps.listFollowers(),
       });
+    },
+    getRegisteredFollowerTarget() {
+      return deps.isFollowerRegistered() ? deps.getFollowerTarget() : undefined;
     },
     getLocalThreadLabelForTarget(target) {
       const followerTarget = deps.getFollowerTarget();
@@ -1503,6 +1507,7 @@ export interface TelegramInboundRouteRuntimeDeps<
   getTargetOwnership?: Updates.TelegramTargetOwnershipLookup;
   recordMessageOwnership?: Updates.TelegramMessageOwnershipRecorder;
   getLiveThreadTargets?: () => Queue.TelegramQueueTarget[];
+  getRegisteredFollowerTarget?: () => Queue.TelegramQueueTarget | undefined;
   getDisplayTitle?: Threads.TelegramCurrentThreadAssembly["getDisplayTitle"];
   getLocalThreadLabelForTarget?: (
     target: Queue.TelegramQueueTarget,
@@ -11796,6 +11801,16 @@ export function createTelegramInboundRouteRuntime<
         }
         const target = Updates.getTelegramMessageTarget(message);
         if (!target?.threadId) {
+          await textDispatch.handleMessage(message as TMessage, ctx);
+          return;
+        }
+        // Acknowledged bus registration is routing authority; a dirty shared-store
+        // projection can still describe this follower's previous Thread after rebind.
+        const registeredTarget = deps.getRegisteredFollowerTarget?.();
+        if (
+          registeredTarget?.chatId === target.chatId &&
+          registeredTarget.threadId === target.threadId
+        ) {
           await textDispatch.handleMessage(message as TMessage, ctx);
           return;
         }

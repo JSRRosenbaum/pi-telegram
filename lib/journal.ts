@@ -777,7 +777,7 @@ export interface TelegramUpdateJournalDeadQueueOwnerRecoveryInput {
 
 export type TelegramUpdateJournalDeadQueueOwnerRecoveryResult =
   | {
-      status: "owner-alive" | "owner-unverifiable";
+      status: "owner-alive" | "owner-unverifiable" | "owner-dead-retained";
       previousOwner: TelegramUpdateJournalQueueOwner;
       recoveredUpdateIds: [];
       entryCount: number;
@@ -8357,20 +8357,15 @@ function createJournalStoreCore(
             serializedBytes: current.serializedBytes,
           };
         }
-        const recoveredUpdateIds = [...requestedIds].sort((a, b) => a - b);
-        const published = publishMutation(
-          current,
-          current.file.entries.filter(
-            (entry) => !requestedIds.has(entry.updateId),
-          ),
-          true,
-        );
+        // Process death proves that the owner cannot settle, not that its
+        // accepted work had no effects. Keep the exact receipt as protective
+        // outcome-unknown evidence; neither recovery nor restart may replay it.
         return {
-          status: "recovered" as const,
+          status: "owner-dead-retained" as const,
           previousOwner: cloneJournalQueueOwner(deadOwner),
-          recoveredUpdateIds,
-          entryCount: published.file.entries.length,
-          serializedBytes: published.serializedBytes,
+          recoveredUpdateIds: [] as [],
+          entryCount: current.file.entries.length,
+          serializedBytes: current.serializedBytes,
         };
       });
     },

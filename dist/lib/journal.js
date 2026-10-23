@@ -4942,14 +4942,15 @@ function createJournalStoreCore(options, getInputContext) {
                         serializedBytes: current.serializedBytes,
                     };
                 }
-                const recoveredUpdateIds = [...requestedIds].sort((a, b) => a - b);
-                const published = publishMutation(current, current.file.entries.filter((entry) => !requestedIds.has(entry.updateId)), true);
+                // Process death proves that the owner cannot settle, not that its
+                // accepted work had no effects. Keep the exact receipt as protective
+                // outcome-unknown evidence; neither recovery nor restart may replay it.
                 return {
-                    status: "recovered",
+                    status: "owner-dead-retained",
                     previousOwner: cloneJournalQueueOwner(deadOwner),
-                    recoveredUpdateIds,
-                    entryCount: published.file.entries.length,
-                    serializedBytes: published.serializedBytes,
+                    recoveredUpdateIds: [],
+                    entryCount: current.file.entries.length,
+                    serializedBytes: current.serializedBytes,
                 };
             });
         },

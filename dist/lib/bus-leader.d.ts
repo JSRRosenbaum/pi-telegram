@@ -177,6 +177,10 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> extends Omit<TelegramBus
     /** True settles this observation; false needs fresh proof before another attempt. */
     onFollowerConfirmedDeadPreserved?: (follower: TelegramBusFollowerView, isDetached: () => boolean, operationId: string) => Promise<boolean> | boolean;
 }
+export declare function createTelegramBusFollowerRestartPreparer(deps: {
+    store: Pick<Threads.TelegramTopicTargetStore, "load" | "getActiveByInstanceId" | "getWorkspaceBindingByTarget" | "detachTargetOwner" | "releaseWorkspaceClaim">;
+    runWorkspaceOperation: TelegramWorkspaceOperationRunner;
+}): NonNullable<TelegramBusLeaderEnvelopeHandlerDeps["prepareFollowerRestart"]>;
 export declare function createTelegramBusInstanceLifecycleAnnouncement(input: {
     target: TelegramTarget & {
         threadId: number;
@@ -259,6 +263,9 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
     }) | undefined;
     commitFollowerRegistration?: TelegramBusFollowerRegistrationCommitter;
     onFollowerDisconnected?: (follower: TelegramBusFollowerView) => Promise<void> | void;
+    prepareFollowerRestart?: (follower: TelegramBusFollowerView, input: Extract<TelegramBusEnvelope, {
+        kind: "follower.prepareRestart";
+    }>, isCurrent: () => boolean) => Promise<boolean>;
     renameFollowerThread?: (follower: TelegramBusFollowerView, threadName: string) => Promise<{
         threadName: string;
     }> | {

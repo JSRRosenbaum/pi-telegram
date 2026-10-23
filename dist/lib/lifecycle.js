@@ -261,6 +261,7 @@ export function createTelegramBridgeSessionLifecycleDeps(ports) {
             queueWatchdog: ports.services.queueWatchdog,
             guestPlaceholder: ports.services.guestPlaceholder,
             prepareThreadPreservationOnQuit: ports.services.prepareThreadPreservationOnQuit,
+            prepareFollowerRestart: ports.services.prepareFollowerRestart,
         },
     };
 }
@@ -269,13 +270,17 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
         registrationState: deps.follower.registrationState,
         instanceId: deps.follower.instanceId,
         suspendPolling: deps.follower.suspendPolling,
+        isLeader: deps.follower.isLeader,
+        getLeaderBinding: deps.follower.getLeaderBinding,
+        getActiveContext: deps.follower.getActiveContext,
+        getActiveProfileName: deps.follower.getActiveProfileName,
         recordRuntimeEvent: deps.follower.recordRuntimeEvent,
     });
     // A reused context can be current for a successor; inner awaits need this invocation's generation too.
-    const queueLifecycle = (ctx, generation, preserveTarget = true) => Queue.createTelegramSessionLifecycleRuntime({
+    const queueLifecycle = (ctx, generation, preserveTarget = true, stopPolling) => Queue.createTelegramSessionLifecycleRuntime({
         ...deps.queue,
         isSessionActive: () => deps.contextStore.isCurrent(ctx, generation),
-        stopPolling: () => suspendForReplacement(preserveTarget),
+        stopPolling: stopPolling ?? (() => suspendForReplacement(preserveTarget)),
         clearPendingMediaGroups: deps.services.suspendGroupedInput,
     });
     const servicesLifecycle = {
@@ -313,9 +318,12 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
             if (!isCurrent())
                 return;
             deps.services.connection?.onSessionShutdown(event, ctx);
-            const preserveTarget = event.reason !== "resume";
+            const isRestart = String(event.reason) === "restart";
+            const wasLeader = deps.follower.isLeader?.() === true;
+            let preserveTarget = event.reason === "new" || event.reason === "fork" || event.reason === "reload";
             let preserveThread;
-            if (event.reason === "quit") {
+            let restartHandoffAcknowledged = false;
+            if (event.reason === "quit" || (isRestart && wasLeader)) {
                 try {
                     preserveThread =
                         deps.services.prepareThreadPreservationOnQuit?.(isCurrent);
@@ -326,13 +334,67 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
                     });
                 }
             }
+            if (isRestart && !wasLeader) {
+                try {
+                    restartHandoffAcknowledged =
+                        (await deps.services.prepareFollowerRestart?.()) === true;
+                }
+                catch (error) {
+                    deps.follower.recordRuntimeEvent("session", error, {
+                        phase: "prepare-follower-restart",
+                        outcome: "not-confirmed",
+                    });
+                }
+                if (!isCurrent())
+                    return;
+                if (!restartHandoffAcknowledged) {
+                    deps.follower.recordRuntimeEvent("session", "Restart handoff was not confirmed; outcome remains held or unknown.", { phase: "prepare-follower-restart", outcome: "not-confirmed" });
+                }
+            }
+            preserveTarget ||= isRestart && (wasLeader || restartHandoffAcknowledged);
+            let replacementPollingSuspended = false;
+            const suspendForShutdown = async () => {
+                if (!isCurrent() || replacementPollingSuspended)
+                    return;
+                await suspendForReplacement(preserveTarget);
+                if (!isCurrent())
+                    return;
+                replacementPollingSuspended = true;
+            };
+            if (isRestart) {
+                try {
+                    await suspendForShutdown();
+                }
+                catch (error) {
+                    deps.follower.recordRuntimeEvent("session", error, {
+                        phase: "suspend-for-restart",
+                    });
+                }
+                if (!isCurrent())
+                    return;
+                if (!wasLeader)
+                    deps.follower.registrationRuntime.stop();
+                else if (replacementPollingSuspended && preserveThread) {
+                    try {
+                        await preserveThread();
+                    }
+                    catch (error) {
+                        deps.follower.recordRuntimeEvent("session", error, {
+                            phase: "preserve-thread-on-restart",
+                        });
+                    }
+                    if (!isCurrent())
+                        return;
+                    preserveThread = undefined;
+                }
+            }
             deps.services.guestPlaceholder?.stopAll();
             await deps.services.delivery.onSessionShutdown();
             if (!isCurrent())
                 return;
             deps.services.queueWatchdog.stop();
             deps.services.capabilityMonitor.stop();
-            await queueLifecycle(ctx, generation, preserveTarget).onSessionShutdown(event, ctx);
+            await queueLifecycle(ctx, generation, preserveTarget, suspendForShutdown).onSessionShutdown(event, ctx);
             if (!isCurrent())
                 return;
             await deps.services.inboundWorker.onSessionShutdown();

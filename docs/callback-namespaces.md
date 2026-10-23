@@ -49,4 +49,4 @@ Conceptual form:
 section:<token>:<action>[:<payload>]
 ```
 
-The token maps back to the full section identity inside the section registry. Section authors should not hand-roll `section:` callbacks outside the section context helpers, and ordinary layered extensions should continue using their own namespace plus update handlers or the `[callback]` fallback.
+The token maps back to the full section identity inside the section registry. Section authors should not hand-roll `section:` callbacks: use `ctx.callbackData(action, payload?)` in a section context or the public `getTelegramSectionCallbackData(sectionId, action, payload?)` accessor for producer-owned proactive views. The accessor addresses only a current registration and adds no producer-lifetime or request-authorization fence; see [Sections](./sections.md#producer-owned-proactive-callbacks). Ordinary layered extensions should continue using their own namespace plus update handlers or the `[callback]` fallback. Unhandled `section:` actions never use that inference fallback.

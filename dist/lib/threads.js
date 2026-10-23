@@ -13,7 +13,7 @@ import { isTelegramApiCommitUnknownError, TelegramApiCommitUnknownError, } from 
 import { getTelegramTopicName as buildTelegramTopicName, chooseTelegramThreadName, getTelegramManualThreadDisplayNameValidationError, getTelegramThreadNameLeadingSlot, getTelegramTopicIdentityName, getTelegramTopicTitleForThreadName, isTelegramTopicThreadNameValidForSlot, normalizeTelegramTopicTargetThreadName, } from "./thread-naming.js";
 import { isWireRecord as restoreObject, isNonEmptyWireString as restoreText, } from "./wire.js";
 import { renameTelegramPathWithRetry, isTelegramOwnerPrivate, TELEGRAM_STRICT_READ_FLAGS, readTelegramRuntimeState, withTelegramFileTransaction, } from "./locks.js";
-import { resolveTelegramProfileTempFilePath } from "./paths.js";
+import { resolveTelegramProfileTempFilePath, resolveTelegramStatePath } from "./paths.js";
 import { createTelegramRuntimeProjectionStore } from "./status.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
 import { createTelegramSessionKey, createTelegramWorkspaceBindingIdentityWithKey, createTelegramWorkspaceDirectoryKey, normalizeTelegramSessionId, normalizeTelegramWorkspacePath, TELEGRAM_WORKSPACE_KEY_MAX_LENGTH, } from "./workspace-identity.js";
@@ -199,7 +199,10 @@ export function getTelegramLeaderSessionHandoff() {
     const value = globalThis[TELEGRAM_LEADER_SESSION_HANDOFF_KEY];
     if (!value || typeof value !== "object")
         return undefined;
-    const handoff = value;
+    const scoped = value;
+    if (scoped.statePath !== resolveTelegramStatePath() || !scoped.handoff || typeof scoped.handoff !== "object")
+        return undefined;
+    const handoff = scoped.handoff;
     if (typeof handoff.pid !== "number" ||
         typeof handoff.instanceId !== "string" ||
         typeof handoff.createdAtMs !== "number" ||
@@ -215,9 +218,9 @@ export function setTelegramLeaderSessionHandoff(handoff) {
     if (!handoff)
         delete store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY];
     else
-        store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY] = handoff;
+        store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY] = { statePath: resolveTelegramStatePath(), handoff };
 }
-function isTelegramLeaderSessionHandoffFresh(handoff, options = {}) {
+export function isTelegramLeaderSessionHandoffFresh(handoff, options = {}) {
     if (!handoff)
         return false;
     const pid = options.pid ?? process.pid;

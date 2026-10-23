@@ -675,6 +675,11 @@ export interface TelegramLeaderSessionHandoff {
 }
 export declare function getTelegramLeaderSessionHandoff(): TelegramLeaderSessionHandoff | undefined;
 export declare function setTelegramLeaderSessionHandoff(handoff: TelegramLeaderSessionHandoff | undefined): void;
+export declare function isTelegramLeaderSessionHandoffFresh(handoff: TelegramLeaderSessionHandoff | undefined, options?: {
+    pid?: number;
+    nowMs?: number;
+    ttlMs?: number;
+}): handoff is TelegramLeaderSessionHandoff;
 export declare function getTelegramThreadOwnerKey(owner: TelegramThreadOwner): string;
 export declare function getTelegramThreadOwnerFromProfileKey(profileKey: string): TelegramThreadOwner;
 export declare function normalizeTelegramSessionReplacementIntent(value: unknown): TelegramSessionReplacementIntent | undefined;

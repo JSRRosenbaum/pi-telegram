@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- `Sections API`: Added proactive callback-data lookup for a current section registration; producers retain request lifetime and validation while callbacks use ordinary section routing.
+- `Queue recovery`: Proven-dead queue owners now retain exact outcome-unknown receipts without replay or deletion, protecting Workspace capacity; historical journal namespaces are not migrated.
+- `Delivery API`: `sendTelegramView(..., { requestReply: true })` opens Telegram's reply composer on the final chunk, allowing companions to collect exact-handle text answers without a transient-toast-only interaction. Inline-button conflicts fail before sending.
+- `Bus lifecycle`: Registered followers use an exact-generation, profile/epoch/session/target-fenced restart handoff that preserves the existing Workspace binding and slot without deleting a Thread or transferring accepted work; missing, incompatible, rejected, or unknown acknowledgements remain explicitly unconfirmed.
+- `Leader session continuity`: Lifecycle assembly now captures leader handoffs, and fresh exact-process handoffs re-key the Workspace binding before allocation. Native `/new`, fork and reload retain the same Thread; quit/resume clear transient handoffs. Expired, wrong-process and wrong-profile handoffs cannot adopt another session's binding.
+- `Reply ownership`: A cancelled or suppressed run cannot reuse an assistant answer from before its latest user request.
+- `Follower input`: A rebound follower routes messages using its acknowledged bus target before consulting cached topic records, preventing stale metadata from triggering an unauthorized typing probe against its former Thread. Sender checks, target-scoped API authorization and retained queue/journal state are unchanged.
+
 ## 0.57.3: Session Thread Continuity
 
 - `Session handoff`: A session replaced inside one Pi process now reuses its preserved Thread on every registration path, not only connect recovery. The successor re-keys onto the same tab and slot with the new session id, so `/new` no longer provisions a second tab and leaves the previous one without an owner.

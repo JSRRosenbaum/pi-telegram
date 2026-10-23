@@ -32,6 +32,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
+  TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF,
   type TelegramBusEnvelope,
   type TelegramBusLeaderQueueHandoffOffer,
   type TelegramBusFollowerRegistry,
@@ -40,6 +41,7 @@ import {
   type TelegramBusProtocolIdentity,
   type TelegramBusSelectedMenuDelivery,
   type TelegramBusSocketPathSource,
+  isSameTelegramBusFollowerRegistration,
 } from "./bus.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
 import type { TelegramAttachmentSource } from "./media.ts";
@@ -676,6 +678,10 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
   const disconnectFollower = createTelegramBusFollowerDisconnectHandler({
     ...provisionerPorts,
   });
+  const prepareFollowerRestart = createTelegramBusFollowerRestartPreparer({
+    store: deps.topicTargetStore,
+    runWorkspaceOperation,
+  });
   const cleanupConfirmedDeadFollower =
     createTelegramBusFollowerConfirmedDeadHandler({
       ...provisionerPorts,
@@ -1137,6 +1143,7 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
       );
       scheduleDisplay();
     },
+    prepareFollowerRestart,
     async renameFollowerThread(follower, threadName) {
       return runWorkspaceOperation(
         {
@@ -1471,6 +1478,62 @@ export interface TelegramBusLeaderRuntimeDeps<TContext> extends Omit<
   ) => Promise<boolean> | boolean;
 }
 
+
+export function createTelegramBusFollowerRestartPreparer(deps: {
+  store: Pick<
+    Threads.TelegramTopicTargetStore,
+    | "load"
+    | "getActiveByInstanceId"
+    | "getWorkspaceBindingByTarget"
+    | "detachTargetOwner"
+    | "releaseWorkspaceClaim"
+  >;
+  runWorkspaceOperation: TelegramWorkspaceOperationRunner;
+}): NonNullable<TelegramBusLeaderEnvelopeHandlerDeps["prepareFollowerRestart"]> {
+  return (follower, input, isCurrent) =>
+    deps.runWorkspaceOperation(
+      {
+        operationId: createTelegramWorkspaceAdmissionOperationId(),
+        operationKind: "workspace.prepare-follower-restart",
+        scopes: [{ kind: "profile" }],
+      },
+      async () => {
+        if (
+          !isCurrent() ||
+          follower.instanceId !== input.instanceId ||
+          follower.registrationGeneration !== input.registrationGeneration ||
+          follower.profileKey !== input.profileKey ||
+          follower.sessionId !== input.sessionId ||
+          follower.target?.chatId !== input.target.chatId ||
+          follower.target.threadId !== input.target.threadId
+        ) return false;
+        await deps.store.load();
+        if (!isCurrent()) return false;
+        const record = deps.store.getActiveByInstanceId(follower.instanceId);
+        const binding = deps.store.getWorkspaceBindingByTarget(
+          input.target,
+          input.sessionId,
+        );
+        if (
+          !record ||
+          record.profileKey !== input.profileKey ||
+          record.owner?.kind !== "manual-follower" ||
+          Threads.getTelegramThreadOwnerKey(record.owner) !== input.profileKey ||
+          record.target.chatId !== input.target.chatId ||
+          record.target.threadId !== input.target.threadId ||
+          !binding ||
+          binding.sessionId !== input.sessionId ||
+          binding.target.chatId !== input.target.chatId ||
+          binding.target.threadId !== input.target.threadId ||
+          !isCurrent()
+        ) return false;
+        const committed = await deps.store.detachTargetOwner(record, isCurrent);
+        if (!committed || !isCurrent()) return false;
+        deps.store.releaseWorkspaceClaim(follower.instanceId);
+        return true;
+      },
+    );
+}
 export function createTelegramBusInstanceLifecycleAnnouncement(input: {
   target: TelegramTarget & { threadId: number };
   threadName?: string;
@@ -3066,6 +3129,11 @@ export interface TelegramBusLeaderEnvelopeHandlerDeps {
   onFollowerDisconnected?: (
     follower: TelegramBusFollowerView,
   ) => Promise<void> | void;
+  prepareFollowerRestart?: (
+    follower: TelegramBusFollowerView,
+    input: Extract<TelegramBusEnvelope, { kind: "follower.prepareRestart" }>,
+    isCurrent: () => boolean,
+  ) => Promise<boolean>;
   renameFollowerThread?: (
     follower: TelegramBusFollowerView,
     threadName: string,
@@ -4001,6 +4069,81 @@ export function createTelegramBusLeaderEnvelopeHandler(
           },
         );
       }
+      case "follower.prepareRestart": {
+        const follower = deps.followerRegistry.get(envelope.instanceId);
+        const epoch = deps.getCurrentLeaderEpoch?.();
+        const profile = deps.getTelegramProfile?.();
+        const current = () => {
+          const registered = deps.followerRegistry.get(envelope.instanceId);
+          return (
+            epoch !== undefined &&
+            deps.getCurrentLeaderEpoch?.() === epoch &&
+            String(epoch) === envelope.leaderEpoch &&
+            profile === deps.getTelegramProfile?.() &&
+            profile === envelope.telegramProfile &&
+            follower !== undefined &&
+            registered !== undefined &&
+            isSameTelegramBusFollowerRegistration(registered, follower) &&
+            registered.profileKey === envelope.profileKey &&
+            registered.sessionId === envelope.sessionId &&
+            registered.target?.chatId === envelope.target.chatId &&
+            registered.target?.threadId === envelope.target.threadId &&
+            getNowMs() < envelope.deadlineAtMs
+          );
+        };
+        const capability = TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF;
+        if (
+          !deps.getTelegramProfile ||
+          !follower ||
+          !current() ||
+          envelope.deadlineAtMs <= getNowMs() ||
+          envelope.deadlineAtMs > getNowMs() + 1000 ||
+          follower.profileKey !== envelope.profileKey ||
+          follower.sessionId !== envelope.sessionId ||
+          !follower.registrationGeneration ||
+          follower.registrationGeneration !== envelope.registrationGeneration ||
+          !follower.target ||
+          follower.target.chatId !== envelope.target.chatId ||
+          follower.target.threadId !== envelope.target.threadId ||
+          !deps.prepareFollowerRestart ||
+          !getTelegramBusProtocolCompatibility({
+            local: deps.protocolIdentity,
+            remote: follower.protocol,
+          }).compatible ||
+          !hasTelegramBusCapability(deps.protocolIdentity, capability) ||
+          !hasTelegramBusCapability(follower.protocol, capability)
+        ) {
+          return rejectTelegramBusRequest(
+            envelope.requestId,
+            "Restart handoff requires exact current registration and compatible leader authority.",
+          );
+        }
+        return runFollowerMutation(follower, async () => {
+          const prepared = await deps.prepareFollowerRestart!(follower, envelope, current);
+          if (!prepared || !current()) {
+            return rejectTelegramBusRequest(
+              envelope.requestId,
+              "Restart handoff was not committed.",
+            );
+          }
+          deps.followerRegistry.remove(follower.instanceId);
+          return {
+            kind: "bus.ack" as const,
+            requestId: envelope.requestId,
+            ok: true,
+            result: {
+              instanceId: follower.instanceId,
+              registrationGeneration: envelope.registrationGeneration,
+              profileKey: envelope.profileKey,
+              sessionId: envelope.sessionId,
+              leaderEpoch: envelope.leaderEpoch,
+              telegramProfile: envelope.telegramProfile,
+              deadlineAtMs: envelope.deadlineAtMs,
+              target: envelope.target,
+            },
+          };
+        });
+      }
       case "follower.heartbeat": {
         const current = resolveRegisteredTelegramBusFollower(
           deps.followerRegistry,
@@ -4555,6 +4698,7 @@ export function createTelegramBusLeaderRuntime<TContext>(
       : undefined,
     commitFollowerRegistration: deps.commitFollowerRegistration,
     onFollowerDisconnected: deps.onFollowerDisconnected,
+    prepareFollowerRestart: deps.prepareFollowerRestart,
     renameFollowerThread: deps.renameFollowerThread,
     resetFollowerThreadName: deps.resetFollowerThreadName,
     publishFollowerSessionReplacement: deps.publishFollowerSessionReplacement,

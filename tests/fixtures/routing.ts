@@ -135,6 +135,7 @@ export interface RouteHarnessOptions {
     TestModel
   >["setCurrentLeaderIdentity"];
   getLiveThreadTargets?: () => Queue.TelegramQueueTarget[];
+  getRegisteredFollowerTarget?: () => Queue.TelegramQueueTarget | undefined;
   getDisplayTitle?: (target: Queue.TelegramQueueTarget) => string | undefined;
   getLocalThreadLabelForTarget?: (
     target: Queue.TelegramQueueTarget,
@@ -270,6 +271,7 @@ export function createRouteHarness(options: RouteHarnessOptions = {}) {
     getAdmissionJournalBinding: options.getAdmissionJournalBinding,
     isContextActive: options.isContextActive,
     getLiveThreadTargets: options.getLiveThreadTargets,
+    getRegisteredFollowerTarget: options.getRegisteredFollowerTarget,
     getDisplayTitle: options.getDisplayTitle,
     getLocalThreadLabelForTarget: options.getLocalThreadLabelForTarget,
     getCurrentLeaderEpoch: options.getCurrentLeaderEpoch,

@@ -31,6 +31,8 @@ export declare function extractLatestAssistantMessageText(messages: readonly unk
  * State Flow's fallback final:true patch turn). In that case the run's answer
  * is the latest earlier completed assistant message that carries text;
  * tool-use prefaces, errors, and aborts stay excluded.
+ * Never cross the latest user message: a run cancelled before producing any
+ * assistant output must not republish a previous request's answer.
  */
 export declare function extractRunAssistantMessage(messages: readonly unknown[]): {
     text?: string;

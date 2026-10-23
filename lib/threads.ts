@@ -60,7 +60,7 @@ import {
   type TelegramOwnedStatePublicationResult,
   type TelegramRuntimeStateMutation,
 } from "./locks.ts";
-import { resolveTelegramProfileTempFilePath } from "./paths.ts";
+import { resolveTelegramProfileTempFilePath, resolveTelegramStatePath } from "./paths.ts";
 import { createTelegramRuntimeProjectionStore } from "./status.ts";
 import * as ThreadReconciler from "./thread-reconciler.ts";
 import {
@@ -1296,7 +1296,10 @@ export function getTelegramLeaderSessionHandoff():
     TELEGRAM_LEADER_SESSION_HANDOFF_KEY
   ];
   if (!value || typeof value !== "object") return undefined;
-  const handoff = value as Partial<TelegramLeaderSessionHandoff>;
+  const scoped = value as { statePath?: unknown; handoff?: unknown };
+  if (scoped.statePath !== resolveTelegramStatePath() || !scoped.handoff || typeof scoped.handoff !== "object")
+    return undefined;
+  const handoff = scoped.handoff as Partial<TelegramLeaderSessionHandoff>;
   if (
     typeof handoff.pid !== "number" ||
     typeof handoff.instanceId !== "string" ||
@@ -1315,10 +1318,10 @@ export function setTelegramLeaderSessionHandoff(
 ): void {
   const store = globalThis as Record<string, unknown>;
   if (!handoff) delete store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY];
-  else store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY] = handoff;
+  else store[TELEGRAM_LEADER_SESSION_HANDOFF_KEY] = { statePath: resolveTelegramStatePath(), handoff };
 }
 
-function isTelegramLeaderSessionHandoffFresh(
+export function isTelegramLeaderSessionHandoffFresh(
   handoff: TelegramLeaderSessionHandoff | undefined,
   options: { pid?: number; nowMs?: number; ttlMs?: number } = {},
 ): handoff is TelegramLeaderSessionHandoff {

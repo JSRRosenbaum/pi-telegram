@@ -7249,7 +7249,7 @@ test("Replacement registration stays live while its process races dead-owner rec
   }
 }, 10_000);
 
-test("Replacement process discards dead session-owned queue authority", async () => {
+test("Replacement process retains dead session-owned queue authority without replay", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-dead-owner-"));
   const path = join(dir, "inbox.json");
   const deadOwner = {
@@ -7282,6 +7282,7 @@ test("Replacement process discards dead session-owned queue authority", async ()
     }),
     "utf8",
   );
+  const queuedBefore = await readFile(path, "utf8");
   try {
     const replacement = await runQueueOwnerReplacementProcess(
       path,
@@ -7289,11 +7290,11 @@ test("Replacement process discards dead session-owned queue authority", async ()
     );
     assert.deepEqual(replacement, {
       executionCount: 0,
-      foreignQueuedCount: 0,
+      foreignQueuedCount: 1,
       queuedClaimCount: 0,
-      entryCount: 0,
+      entryCount: 1,
       directCompletionError: "conflict",
-      recoveryStatus: "recovered",
+      recoveryStatus: "owner-dead-retained",
     });
     const journal = Journal.createTelegramUpdateJournalStore({
       path,
@@ -7301,7 +7302,9 @@ test("Replacement process discards dead session-owned queue authority", async ()
         botToken: "123:queue-owner-worker",
       }),
     });
-    assert.deepEqual(journal.read().entries, []);
+    assert.deepEqual(journal.read().entries[0]?.queueOwner, deadOwner);
+    assert.equal(journal.read().entries[0]?.state, "queued");
+    assert.equal(await readFile(path, "utf8"), queuedBefore, "process replacement preserves complete uncertain custody");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

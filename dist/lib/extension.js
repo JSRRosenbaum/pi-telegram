@@ -75,6 +75,7 @@ const telegramBusProtocolIdentity = Bus.createTelegramCurrentBusProtocolIdentity
     Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_SETTLE,
     Bus.TELEGRAM_BUS_CAPABILITY_LIVE_REBIND_COMMAND_SET,
     Bus.TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
+    Bus.TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF,
 ]);
 // --- Extension Runtime ---
 export default function (pi) {
@@ -1646,6 +1647,13 @@ export default function (pi) {
             },
             getSessionId: Pi.getExtensionContextSessionId,
             getSessionGeneration: telegramSessionContextStore.getGeneration,
+            getLeaderEpoch() {
+                const state = lockRuntime.getState();
+                return state.kind === "active-elsewhere"
+                    ? state.lock.leaderEpoch
+                    : undefined;
+            },
+            getTelegramProfile: configStore.getActiveProfileName,
             async onRegistered(ctx) {
                 await followerAdmissionLifecycleRuntime.onTransportChanged(ctx);
                 queueHandoffReconciliationBinding.request(ctx);
@@ -2080,6 +2088,7 @@ export default function (pi) {
             queueWatchdog: queueDispatchWatchdogRuntime,
             guestPlaceholder: { stopAll: guestPlaceholderRuntime.stopAll },
             prepareThreadPreservationOnQuit,
+            prepareFollowerRestart: () => telegramBusFollowerRegistration.prepareRestart?.() ?? Promise.resolve(false),
         },
     });
     const sessionLifecycleRuntime = Lifecycle.createTelegramBridgeSessionLifecycleAssembly(telegramBridgeSessionLifecycleDeps);
