@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- `Reply ownership`: A cancelled or suppressed run cannot reuse an assistant answer from before its latest user request.
+
 ## 0.57.7: Routing Cleanup and Recipient Recovery
 
 - `Recipient recovery`: A forwarded input journaled for a follower whose Thread was re-created no longer retries forever against the old Thread. After the leader refuses that reply, the input re-runs once against the follower's current Thread; a second refusal or any other failure keeps the durable retry state, and nothing is dropped.

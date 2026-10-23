@@ -291,6 +291,28 @@ test("Run assistant extraction never promotes tool-use prefaces or errors", () =
   );
 });
 
+test("Cancelled and suppressed runs never republish an earlier user's answer", () => {
+  const history = [
+    { role: "user", content: [{ type: "text", text: "previous request" }] },
+    {
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "previous answer" }],
+    },
+    { role: "user", content: [{ type: "text", text: "current request" }] },
+  ];
+  // Cancellation before any new assistant output must not reuse history.
+  assert.deepEqual(extractRunAssistantMessage(history), {});
+  // A suppressed empty final may recover only within the current request.
+  assert.deepEqual(
+    extractRunAssistantMessage([
+      ...history,
+      { role: "assistant", stopReason: "stop", content: [] },
+    ]),
+    { text: undefined, stopReason: "stop", errorMessage: undefined },
+  );
+});
+
 test("Reply transport forwards send and edit operations through delivery helpers", async () => {
   const events: string[] = [];
   const transport = buildTelegramReplyTransport({

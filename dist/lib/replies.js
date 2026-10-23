@@ -102,6 +102,8 @@ export function getAgentMessageText(message) {
 export function extractLatestAssistantMessageText(messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
         const message = messages[i];
+        if (getAgentMessageField(message, "role") === "user")
+            break;
         if (!message || !isAssistantAgentMessage(message))
             continue;
         const rawStopReason = getAgentMessageField(message, "stopReason");
@@ -120,6 +122,8 @@ export function extractLatestAssistantMessageText(messages) {
  * State Flow's fallback final:true patch turn). In that case the run's answer
  * is the latest earlier completed assistant message that carries text;
  * tool-use prefaces, errors, and aborts stay excluded.
+ * Never cross the latest user message: a run cancelled before producing any
+ * assistant output must not republish a previous request's answer.
  */
 export function extractRunAssistantMessage(messages) {
     const latest = extractLatestAssistantMessageText(messages);
@@ -127,6 +131,8 @@ export function extractRunAssistantMessage(messages) {
         return latest;
     for (let i = messages.length - 1; i >= 0; i--) {
         const message = messages[i];
+        if (getAgentMessageField(message, "role") === "user")
+            break;
         if (!message || !isAssistantAgentMessage(message))
             continue;
         const rawStopReason = getAgentMessageField(message, "stopReason");
