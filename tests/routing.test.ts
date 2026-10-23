@@ -6097,6 +6097,75 @@ test("Routing runtime prefers local thread label over stale shared store binding
   });
 });
 
+for (const scenario of ["rebound", "conflicting-cache", "foreign-user", "foreign-target", "unregistered"] as const) {
+  test(`Rebound follower routes only its acknowledged target despite stale topic metadata (${scenario})`, async () => {
+    await withTopicStore(async (threadStore) => {
+      threadStore.upsert({
+        profileKey: "manual:follower-b",
+        target: { chatId: 100, threadId: 7 },
+        status: "active",
+        createdAtMs: 1000,
+        updatedAtMs: 1000,
+        instanceId: "follower-b",
+        slot: "B",
+        threadName: "Old",
+      });
+      await threadStore.persist();
+      // A local projection can stay dirty while the owner publishes a new binding.
+      threadStore.upsert({ ...threadStore.getByProfileKey("manual:follower-b")!, updatedAtMs: 2000 });
+      if (scenario === "conflicting-cache") threadStore.upsert({
+        profileKey: "manual:previous-owner", target: { chatId: 100, threadId: 42 },
+        status: "active", createdAtMs: 1000, updatedAtMs: 1000, instanceId: "previous-owner",
+      });
+      const before = threadStore.list();
+      const follower = {
+        instanceId: "follower-b", profileKey: "manual:follower-b",
+        connectedAtMs: 1, lastHeartbeatMs: 2,
+        target: { chatId: 100, threadId: 42 },
+      };
+      const projection = Routing.createTelegramInboundBusProjectionRuntime({
+        instanceId: follower.instanceId,
+        listFollowers: () => [],
+        listThreadRecords: threadStore.list,
+        getLeaderTarget: () => undefined,
+        isFollowerRegistered: () => scenario !== "unregistered",
+        getFollowerTarget: () => follower.target,
+        getCurrentIdentity: (target) => ({ target, slot: "B", threadName: "Juno" }),
+      });
+      const calls: unknown[] = [];
+      const denied = new Error("fixture target-scoped authorization refused");
+      const { routeRuntime, telegramQueueStore } = createRouteHarness({
+        ...projection, threadStore, instanceId: follower.instanceId,
+        callApi: async (method, body) => {
+          calls.push({ method, body });
+          if (!Bus.isTelegramFollowerApiCallAllowed({ follower, method: "call", args: [method, body] })) throw denied;
+          return {} as never;
+        },
+      });
+      const update = unboundTopicUpdate("new binding input");
+      if (scenario === "foreign-user") update.message!.from!.id = 8;
+      if (scenario === "foreign-target") update.message!.message_thread_id = 99;
+      if (scenario === "unregistered" || scenario === "foreign-target") {
+        await assert.rejects(routeRuntime.handleUpdate(update, { cwd: "/repo" }), error => error === denied);
+        assert.deepEqual(telegramQueueStore.getQueuedItems(), []);
+      } else {
+        await routeRuntime.handleUpdate(update, { cwd: "/repo" });
+        if (scenario === "foreign-user") {
+          assert.deepEqual(telegramQueueStore.getQueuedItems(), []);
+        } else {
+          const queued = telegramQueueStore.getQueuedItems();
+          assert.equal(queued.length, 1);
+          assert.deepEqual(queued[0]!.target, follower.target);
+          assert.equal(queued[0]!.kind === "prompt" && queued[0]!.content[0]?.type === "text"
+            ? queued[0]!.content[0].text : "", "[telegram|thread:Juno] new binding input");
+          assert.deepEqual(calls, []);
+        }
+      }
+      assert.deepEqual(threadStore.list(), before);
+    });
+  });
+}
+
 for (const bound of [false, true]) for (const media of [false, true]) {
   test(`All routing without temporary-tab authority retains its durable source (bound=${bound}, media=${media})`, async () => {
     await withTopicStore(async (threadStore, path) => {

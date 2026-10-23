@@ -155,6 +155,7 @@ export type TelegramRoutedCallbackQuery = Updates.TelegramCallbackQuery & Menu.M
 export interface TelegramInboundBusProjectionRuntime {
     getTargetOwnership: Updates.TelegramTargetOwnershipLookup;
     getLiveThreadTargets(): Queue.TelegramQueueTarget[];
+    getRegisteredFollowerTarget(): Queue.TelegramQueueTarget | undefined;
     getLocalThreadLabelForTarget(target: Queue.TelegramQueueTarget): string | undefined;
 }
 export declare function createTelegramInboundBusProjectionRuntime(deps: {
@@ -178,6 +179,7 @@ export interface TelegramInboundRouteRuntimeDeps<TMessage extends TelegramRouted
     getTargetOwnership?: Updates.TelegramTargetOwnershipLookup;
     recordMessageOwnership?: Updates.TelegramMessageOwnershipRecorder;
     getLiveThreadTargets?: () => Queue.TelegramQueueTarget[];
+    getRegisteredFollowerTarget?: () => Queue.TelegramQueueTarget | undefined;
     getDisplayTitle?: Threads.TelegramCurrentThreadAssembly["getDisplayTitle"];
     getLocalThreadLabelForTarget?: (target: Queue.TelegramQueueTarget) => string | undefined;
     getCurrentLeaderEpoch?: () => number | string | undefined;
