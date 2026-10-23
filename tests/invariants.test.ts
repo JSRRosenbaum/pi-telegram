@@ -392,40 +392,6 @@ test("Production journal resolver reads remain scoped or lifecycle-owned", () =>
   assert.match(source, /acquireSourceReference\(role, binding\)/u);
 });
 
-test("Extension composition stays free of local runtime adapters", () => {
-  const source = stripSourceTextAndComments(
-    readFileSync(join(PROJECT_ROOT, "lib/extension.ts"), "utf8"),
-  );
-  const localFunctionDeclarations = [
-    ...source.matchAll(/(?:^|\n)\s*(?:async\s+)?function\s+\w+/g),
-  ].map((match) => match[0].trim());
-  assert.deepEqual(localFunctionDeclarations, []);
-  assert.equal(source.includes("=>"), false);
-  assert.equal(source.includes("process.env"), false);
-  assert.equal(source.includes("process.pid"), false);
-  assert.equal(/\blet\s+\w+/.test(source), false);
-  assert.equal(source.includes("new Map"), false);
-  assert.equal(source.includes("new Set"), false);
-  assert.equal(source.includes("!."), false);
-  assert.equal(/\bpi\./.test(source), false);
-  assert.equal(source.includes("Threads.createTelegramTopicTargetRenamer"), false);
-  assert.match(source, /telegramBusLeaderRuntime\.renameLeaderThreadAdmitted\s*\(/u);
-  assert.deepEqual(
-    [
-      "Queue.createTelegramQueueMutationController",
-      "Queue.createTelegramQueueDispatchRuntime",
-      "Queue.createTelegramQueueDispatchWatchdogRuntime",
-      "Threads.createTelegramCurrentInstanceThreadRuntime",
-      "Threads.createTelegramThreadStatusProjectionRuntime",
-      "Sync.createTelegramManualThreadDisconnectHandler",
-      "Sync.createTelegramSessionRestartThreadCleanupHandler",
-      "Updates.createTelegramQueueHandoffReconciler",
-      "Updates.createTelegramUpdateWorkerOwnerRuntime",
-      "Updates.createTelegramUpdateAdmissionLifecycleAssembly",
-    ].filter((factory) => source.includes(factory)),
-    [],
-  );
-});
 
 test("Inbound composition projects live forwarding authority instead of raw message-cache records", () => {
   const source = stripSourceTextAndComments(

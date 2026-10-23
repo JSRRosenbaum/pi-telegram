@@ -148,17 +148,22 @@ export interface TelegramBridgeSessionServiceRuntime {
         stopAll(): void;
     };
     prepareThreadPreservationOnQuit?: (isSessionCurrent: () => boolean) => (() => Promise<void>) | undefined;
+    prepareFollowerRestart?: () => Promise<boolean>;
 }
 export interface TelegramBridgeSessionLifecycleAssemblyDeps<TQueueItem, TModel = unknown> {
     contextStore: TelegramSessionContextStore<ExtensionContext>;
     queue: Omit<Queue.TelegramSessionLifecycleRuntimeDeps<ExtensionContext, TQueueItem, TModel>, "isSessionActive" | "stopPolling" | "clearPendingMediaGroups">;
-    follower: Omit<BusFollower.TelegramBusFollowerSessionRefreshHookDeps<ExtensionContext>, "isSessionActive"> & BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps;
+    follower: Omit<BusFollower.TelegramBusFollowerSessionRefreshHookDeps<ExtensionContext>, "isSessionActive"> & BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps & {
+        registrationRuntime: Pick<BusFollower.TelegramBusFollowerRegistrationRuntime<ExtensionContext>, "stop">;
+    };
     services: TelegramBridgeSessionServiceRuntime;
 }
 export interface TelegramBridgeSessionLifecyclePorts<TQueueItem, TModel = unknown> {
     contextStore: TelegramSessionContextStore<ExtensionContext>;
     queue: Omit<Queue.TelegramSessionLifecycleRuntimeDeps<ExtensionContext, TQueueItem, TModel>, "isSessionActive" | "stopPolling" | "clearPendingMediaGroups">;
-    follower: Omit<BusFollower.TelegramBusFollowerSessionRefreshHookDeps<ExtensionContext>, "isSessionActive"> & BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps;
+    follower: Omit<BusFollower.TelegramBusFollowerSessionRefreshHookDeps<ExtensionContext>, "isSessionActive"> & BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps & {
+        registrationRuntime: Pick<BusFollower.TelegramBusFollowerRegistrationRuntime<ExtensionContext>, "stop">;
+    };
     services: {
         mediaGroup: {
             resume(ctx: ExtensionContext): void;
@@ -176,6 +181,7 @@ export interface TelegramBridgeSessionLifecyclePorts<TQueueItem, TModel = unknow
         queueWatchdog: TelegramBridgeSessionServiceRuntime["queueWatchdog"];
         guestPlaceholder?: TelegramBridgeSessionServiceRuntime["guestPlaceholder"];
         prepareThreadPreservationOnQuit?: TelegramBridgeSessionServiceRuntime["prepareThreadPreservationOnQuit"];
+        prepareFollowerRestart?: TelegramBridgeSessionServiceRuntime["prepareFollowerRestart"];
     };
 }
 export declare function createTelegramBridgeSessionLifecycleDeps<TQueueItem, TModel = unknown>(ports: TelegramBridgeSessionLifecyclePorts<TQueueItem, TModel>): TelegramBridgeSessionLifecycleAssemblyDeps<TQueueItem, TModel>;

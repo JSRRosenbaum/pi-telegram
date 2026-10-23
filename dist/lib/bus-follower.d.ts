@@ -48,6 +48,7 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
         threadId: number;
     }) => Promise<string>;
     setThreadDisplayMode?: (mode: TelegramThreadDisplayMode) => Promise<void>;
+    prepareRestart?: () => Promise<boolean>;
     /** Leader-mediated durable publication or successor claim; true only after exact commit. */
     requestSessionReplacement?: (operation: "publish" | "settle", intent: Threads.TelegramSessionReplacementIntent) => Promise<boolean>;
     stop: () => void;
@@ -185,6 +186,8 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<TContext extends {
     getProcessBirthId?: () => string;
     getSessionId?: (ctx: TContext) => string | undefined;
     getSessionGeneration?: () => number;
+    getTelegramProfile?: () => string | undefined;
+    getLeaderEpoch?: () => number | string | undefined;
     timeoutMs?: number;
     registrationTimeoutMs?: number;
     registrationRetryAttempts?: number;

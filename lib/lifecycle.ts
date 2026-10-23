@@ -479,6 +479,7 @@ export interface TelegramBridgeSessionServiceRuntime {
   prepareThreadPreservationOnQuit?: (
     isSessionCurrent: () => boolean,
   ) => (() => Promise<void>) | undefined;
+  prepareFollowerRestart?: () => Promise<boolean>;
 }
 
 export interface TelegramBridgeSessionLifecycleAssemblyDeps<
@@ -498,7 +499,12 @@ export interface TelegramBridgeSessionLifecycleAssemblyDeps<
     BusFollower.TelegramBusFollowerSessionRefreshHookDeps<ExtensionContext>,
     "isSessionActive"
   > &
-    BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps;
+    BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps & {
+      registrationRuntime: Pick<
+        BusFollower.TelegramBusFollowerRegistrationRuntime<ExtensionContext>,
+        "stop"
+      >;
+    };
   services: TelegramBridgeSessionServiceRuntime;
 }
 
@@ -519,7 +525,12 @@ export interface TelegramBridgeSessionLifecyclePorts<
     BusFollower.TelegramBusFollowerSessionRefreshHookDeps<ExtensionContext>,
     "isSessionActive"
   > &
-    BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps;
+    BusFollower.TelegramBusFollowerSessionReplacementSuspenderDeps & {
+      registrationRuntime: Pick<
+        BusFollower.TelegramBusFollowerRegistrationRuntime<ExtensionContext>,
+        "stop"
+      >;
+    };
   services: {
     mediaGroup: {
       resume(ctx: ExtensionContext): void;
@@ -537,6 +548,7 @@ export interface TelegramBridgeSessionLifecyclePorts<
     queueWatchdog: TelegramBridgeSessionServiceRuntime["queueWatchdog"];
     guestPlaceholder?: TelegramBridgeSessionServiceRuntime["guestPlaceholder"];
     prepareThreadPreservationOnQuit?: TelegramBridgeSessionServiceRuntime["prepareThreadPreservationOnQuit"];
+    prepareFollowerRestart?: TelegramBridgeSessionServiceRuntime["prepareFollowerRestart"];
   };
 }
 
@@ -568,6 +580,7 @@ export function createTelegramBridgeSessionLifecycleDeps<
       guestPlaceholder: ports.services.guestPlaceholder,
       prepareThreadPreservationOnQuit:
         ports.services.prepareThreadPreservationOnQuit,
+      prepareFollowerRestart: ports.services.prepareFollowerRestart,
     },
   };
 }
@@ -590,11 +603,16 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       recordRuntimeEvent: deps.follower.recordRuntimeEvent,
     });
   // A reused context can be current for a successor; inner awaits need this invocation's generation too.
-  const queueLifecycle = (ctx: ExtensionContext, generation: number, preserveTarget = true) =>
+  const queueLifecycle = (
+    ctx: ExtensionContext,
+    generation: number,
+    preserveTarget = true,
+    stopPolling?: () => Promise<void>,
+  ) =>
     Queue.createTelegramSessionLifecycleRuntime({
       ...deps.queue,
       isSessionActive: () => deps.contextStore.isCurrent(ctx, generation),
-      stopPolling: () => suspendForReplacement(preserveTarget),
+      stopPolling: stopPolling ?? (() => suspendForReplacement(preserveTarget)),
       clearPendingMediaGroups: deps.services.suspendGroupedInput,
     });
   const servicesLifecycle: TelegramSessionLifecycleHooks = {
@@ -626,9 +644,13 @@ export function createTelegramBridgeSessionLifecycleAssembly<
       const isCurrent = () => deps.contextStore.isCurrent(ctx, generation);
       if (!isCurrent()) return;
       deps.services.connection?.onSessionShutdown(event, ctx);
-      const preserveTarget = event.reason === "new" || event.reason === "fork" || event.reason === "reload";
+      const isRestart = String(event.reason) === "restart";
+      const wasLeader = deps.follower.isLeader?.() === true;
+      let preserveTarget =
+        event.reason === "new" || event.reason === "fork" || event.reason === "reload";
       let preserveThread: (() => Promise<void>) | undefined;
-      if (event.reason === "quit") {
+      let restartHandoffAcknowledged = false;
+      if (event.reason === "quit" || (isRestart && wasLeader)) {
         try {
           preserveThread =
             deps.services.prepareThreadPreservationOnQuit?.(isCurrent);
@@ -638,12 +660,62 @@ export function createTelegramBridgeSessionLifecycleAssembly<
           });
         }
       }
+      if (isRestart && !wasLeader) {
+        try {
+          restartHandoffAcknowledged =
+            (await deps.services.prepareFollowerRestart?.()) === true;
+        } catch (error) {
+          deps.follower.recordRuntimeEvent("session", error, {
+            phase: "prepare-follower-restart",
+            outcome: "not-confirmed",
+          });
+        }
+        if (!isCurrent()) return;
+        if (!restartHandoffAcknowledged) {
+          deps.follower.recordRuntimeEvent(
+            "session",
+            "Restart handoff was not confirmed; outcome remains held or unknown.",
+            { phase: "prepare-follower-restart", outcome: "not-confirmed" },
+          );
+        }
+      }
+      preserveTarget ||= isRestart && (wasLeader || restartHandoffAcknowledged);
+      let replacementPollingSuspended = false;
+      const suspendForShutdown = async () => {
+        if (!isCurrent() || replacementPollingSuspended) return;
+        await suspendForReplacement(preserveTarget);
+        if (!isCurrent()) return;
+        replacementPollingSuspended = true;
+      };
+      if (isRestart) {
+        try {
+          await suspendForShutdown();
+        } catch (error) {
+          deps.follower.recordRuntimeEvent("session", error, {
+            phase: "suspend-for-restart",
+          });
+        }
+        if (!isCurrent()) return;
+        if (!wasLeader)
+          deps.follower.registrationRuntime.stop();
+        else if (replacementPollingSuspended && preserveThread) {
+          try {
+            await preserveThread();
+          } catch (error) {
+            deps.follower.recordRuntimeEvent("session", error, {
+              phase: "preserve-thread-on-restart",
+            });
+          }
+          if (!isCurrent()) return;
+          preserveThread = undefined;
+        }
+      }
       deps.services.guestPlaceholder?.stopAll();
       await deps.services.delivery.onSessionShutdown();
       if (!isCurrent()) return;
       deps.services.queueWatchdog.stop();
       deps.services.capabilityMonitor.stop();
-      await queueLifecycle(ctx, generation, preserveTarget).onSessionShutdown(event, ctx);
+      await queueLifecycle(ctx, generation, preserveTarget, suspendForShutdown).onSessionShutdown(event, ctx);
       if (!isCurrent()) return;
       await deps.services.inboundWorker.onSessionShutdown();
       if (!isCurrent()) return;

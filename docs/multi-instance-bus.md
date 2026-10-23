@@ -120,6 +120,14 @@ Each eligible entry first commits away through private retention and a predecess
 
 Pending-entry deduplication does not prevent a generic delivery retry after the recipient entry completed and was removed; it can execute again, with or without adoption. Temporary-Thread Forward issuance is not a generic deduplication protocol. Native gateway/IPC fixtures supply Pi host hooks, not actual `newSession` ordering or live acceptance.
 
+#### Native Process Restart Handoff
+
+Before a registered follower enters native `/restart` teardown, it sends `follower.prepareRestart` only when both peers negotiate `follower-restart-handoff-v1`. The authenticated request binds the exact instance, registration generation, Workspace `profileKey`, session, leader epoch, Thread target, and a one-second deadline; a named Telegram profile is also bound when configured, while absence denotes the ordinary unnamed profile. The leader rechecks those fields and the deadline inside the serialized profile-wide Workspace operation immediately before durable owner detachment.
+
+An exact-identity acknowledgement is returned only after the active manual-follower owner is detached and its matching Workspace claim is released; then the registration is removed. The Workspace binding and slot remain unchanged. This handoff does not call Telegram, delete/provision a Thread, transfer or replay queued work, or bypass live-process checks. The leader restart path uses the existing preserved-leader quit operation.
+
+Missing capability, stale/foreign identity, rejected persistence, timeout, or lost acknowledgement is never reported as success. The lifecycle records an unconfirmed held/unknown outcome and does not take the ordinary destructive disconnect path. Ordinary quit and manual disconnect semantics are unchanged.
+
 #### Optimistic Session-Family Sweeping
 
 After a current follower-prune pass, the leader runs a best-effort sweep, throttled to once per 10 minutes by a process-local clock. All Workspace-bound sessions, live registrations and this process's own session are kept. In other canonical session folders it deletes only current-profile `journal.<hash>.json`, `.segments/` and `.retained/` families, including private originals, then removes the folder only if empty. Other profiles, unknown files and noncanonical folders remain. The matcher never selects any `inbox` family, so polling-host folders survive without a slot.

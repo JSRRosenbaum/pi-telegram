@@ -72,6 +72,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
   TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY,
+  TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF,
 } from "../lib/bus.ts";
 import { getTelegramProcessBirthIdentityLiveness } from "../lib/process-identity.ts";
 import {
@@ -862,6 +863,49 @@ test("Bus contract encodes and parses explicit follower disconnect envelopes", (
     parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
     envelope,
   );
+});
+test("Restart handoff is a strict generation-fenced exact-identity envelope", () => {
+  const envelope = {
+    kind: "follower.prepareRestart" as const,
+    requestId: "restart-request",
+    instanceId: "follower",
+    registrationGeneration: "follower:4",
+    profileKey: "cwd:/repo",
+    sessionId: "session-1",
+    leaderEpoch: "leader-epoch-2",
+    telegramProfile: "work",
+    deadlineAtMs: 10_000,
+    target: { chatId: 7, threadId: 42 },
+  };
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
+    envelope,
+  );
+  assert.equal(getTelegramBusEnvelopeTrafficClass(envelope), "generation-fenced");
+  assert.equal(
+    hasTelegramBusCapability(
+      createTelegramBusProtocolIdentity({
+        runtimeBuild: "restart-fixture",
+        capabilities: [TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF],
+      }),
+      TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF,
+    ),
+    true,
+  );
+  for (const malformed of [
+    { leaderEpoch: null },
+    { registrationGeneration: "" },
+    { profileKey: "" },
+    { sessionId: "" },
+    { telegramProfile: "" },
+    { deadlineAtMs: Infinity },
+    { target: { chatId: 7 } },
+  ]) {
+    assert.equal(
+      parseTelegramBusEnvelope(JSON.stringify({ ...envelope, ...malformed })),
+      undefined,
+    );
+  }
 });
 
 test("Bus contract validates exact-generation Thread display setting envelopes", () => {

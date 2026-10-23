@@ -6,7 +6,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.js";
-import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY, hasTelegramBusSteerQueueHandoffCapability, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, } from "./bus.js";
+import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY, hasTelegramBusSteerQueueHandoffCapability, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF, isSameTelegramBusFollowerRegistration, } from "./bus.js";
 import { escapeHtml } from "./rendering.js";
 import * as Sync from "./sync.js";
 import { parseTelegramIntegerId as asInteger, } from "./target.js";
@@ -298,6 +298,10 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
     });
     const disconnectFollower = createTelegramBusFollowerDisconnectHandler({
         ...provisionerPorts,
+    });
+    const prepareFollowerRestart = createTelegramBusFollowerRestartPreparer({
+        store: deps.topicTargetStore,
+        runWorkspaceOperation,
     });
     const cleanupConfirmedDeadFollower = createTelegramBusFollowerConfirmedDeadHandler({
         ...provisionerPorts,
@@ -627,6 +631,7 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
             }, () => disconnectFollower(follower));
             scheduleDisplay();
         },
+        prepareFollowerRestart,
         async renameFollowerThread(follower, threadName) {
             return runWorkspaceOperation({
                 operationId: createTelegramWorkspaceAdmissionOperationId(),
@@ -835,6 +840,44 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
         reconcileThreadDisplay,
         setThreadDisplayMode: (mode) => applyThreadDisplayMode(mode, () => true),
     };
+}
+export function createTelegramBusFollowerRestartPreparer(deps) {
+    return (follower, input, isCurrent) => deps.runWorkspaceOperation({
+        operationId: createTelegramWorkspaceAdmissionOperationId(),
+        operationKind: "workspace.prepare-follower-restart",
+        scopes: [{ kind: "profile" }],
+    }, async () => {
+        if (!isCurrent() ||
+            follower.instanceId !== input.instanceId ||
+            follower.registrationGeneration !== input.registrationGeneration ||
+            follower.profileKey !== input.profileKey ||
+            follower.sessionId !== input.sessionId ||
+            follower.target?.chatId !== input.target.chatId ||
+            follower.target.threadId !== input.target.threadId)
+            return false;
+        await deps.store.load();
+        if (!isCurrent())
+            return false;
+        const record = deps.store.getActiveByInstanceId(follower.instanceId);
+        const binding = deps.store.getWorkspaceBindingByTarget(input.target, input.sessionId);
+        if (!record ||
+            record.profileKey !== input.profileKey ||
+            record.owner?.kind !== "manual-follower" ||
+            Threads.getTelegramThreadOwnerKey(record.owner) !== input.profileKey ||
+            record.target.chatId !== input.target.chatId ||
+            record.target.threadId !== input.target.threadId ||
+            !binding ||
+            binding.sessionId !== input.sessionId ||
+            binding.target.chatId !== input.target.chatId ||
+            binding.target.threadId !== input.target.threadId ||
+            !isCurrent())
+            return false;
+        const committed = await deps.store.detachTargetOwner(record, isCurrent);
+        if (!committed || !isCurrent())
+            return false;
+        deps.store.releaseWorkspaceClaim(follower.instanceId);
+        return true;
+    });
 }
 export function createTelegramBusInstanceLifecycleAnnouncement(input) {
     return {
@@ -2647,6 +2690,71 @@ export function createTelegramBusLeaderEnvelopeHandler(deps) {
                     };
                 });
             }
+            case "follower.prepareRestart": {
+                const follower = deps.followerRegistry.get(envelope.instanceId);
+                const epoch = deps.getCurrentLeaderEpoch?.();
+                const profile = deps.getTelegramProfile?.();
+                const current = () => {
+                    const registered = deps.followerRegistry.get(envelope.instanceId);
+                    return (epoch !== undefined &&
+                        deps.getCurrentLeaderEpoch?.() === epoch &&
+                        String(epoch) === envelope.leaderEpoch &&
+                        profile === deps.getTelegramProfile?.() &&
+                        profile === envelope.telegramProfile &&
+                        follower !== undefined &&
+                        registered !== undefined &&
+                        isSameTelegramBusFollowerRegistration(registered, follower) &&
+                        registered.profileKey === envelope.profileKey &&
+                        registered.sessionId === envelope.sessionId &&
+                        registered.target?.chatId === envelope.target.chatId &&
+                        registered.target?.threadId === envelope.target.threadId &&
+                        getNowMs() < envelope.deadlineAtMs);
+                };
+                const capability = TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF;
+                if (!deps.getTelegramProfile ||
+                    !follower ||
+                    !current() ||
+                    envelope.deadlineAtMs <= getNowMs() ||
+                    envelope.deadlineAtMs > getNowMs() + 1000 ||
+                    follower.profileKey !== envelope.profileKey ||
+                    follower.sessionId !== envelope.sessionId ||
+                    !follower.registrationGeneration ||
+                    follower.registrationGeneration !== envelope.registrationGeneration ||
+                    !follower.target ||
+                    follower.target.chatId !== envelope.target.chatId ||
+                    follower.target.threadId !== envelope.target.threadId ||
+                    !deps.prepareFollowerRestart ||
+                    !getTelegramBusProtocolCompatibility({
+                        local: deps.protocolIdentity,
+                        remote: follower.protocol,
+                    }).compatible ||
+                    !hasTelegramBusCapability(deps.protocolIdentity, capability) ||
+                    !hasTelegramBusCapability(follower.protocol, capability)) {
+                    return rejectTelegramBusRequest(envelope.requestId, "Restart handoff requires exact current registration and compatible leader authority.");
+                }
+                return runFollowerMutation(follower, async () => {
+                    const prepared = await deps.prepareFollowerRestart(follower, envelope, current);
+                    if (!prepared || !current()) {
+                        return rejectTelegramBusRequest(envelope.requestId, "Restart handoff was not committed.");
+                    }
+                    deps.followerRegistry.remove(follower.instanceId);
+                    return {
+                        kind: "bus.ack",
+                        requestId: envelope.requestId,
+                        ok: true,
+                        result: {
+                            instanceId: follower.instanceId,
+                            registrationGeneration: envelope.registrationGeneration,
+                            profileKey: envelope.profileKey,
+                            sessionId: envelope.sessionId,
+                            leaderEpoch: envelope.leaderEpoch,
+                            telegramProfile: envelope.telegramProfile,
+                            deadlineAtMs: envelope.deadlineAtMs,
+                            target: envelope.target,
+                        },
+                    };
+                });
+            }
             case "follower.heartbeat": {
                 const current = resolveRegisteredTelegramBusFollower(deps.followerRegistry, envelope.requestId, envelope.instanceId, envelope.registrationGeneration);
                 if ("rejection" in current)
@@ -3086,6 +3194,7 @@ export function createTelegramBusLeaderRuntime(deps) {
             : undefined,
         commitFollowerRegistration: deps.commitFollowerRegistration,
         onFollowerDisconnected: deps.onFollowerDisconnected,
+        prepareFollowerRestart: deps.prepareFollowerRestart,
         renameFollowerThread: deps.renameFollowerThread,
         resetFollowerThreadName: deps.resetFollowerThreadName,
         publishFollowerSessionReplacement: deps.publishFollowerSessionReplacement,

@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { withWorkspaceRestoreFixture } from "./fixtures/workspace.ts";
+import { withWorkspaceRestoreFixture, withWorkspaceRelocationFixture } from "./fixtures/workspace.ts";
 import { withTelegramFileTransaction, createTelegramLockRuntime } from "../lib/locks.ts";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -26,6 +26,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
   TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
   TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
+  TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF,
   TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT,
   type TelegramBusFollowerView,
   type TelegramBusSelectedMenuDelivery,
@@ -37,6 +38,7 @@ import {
   createTelegramBusFollowerDisconnectHandler,
   createTelegramBusFollowerSessionReplacementAuthority,
   createTelegramBusFollowerTargetProvisioner,
+  createTelegramBusFollowerRestartPreparer,
   createTelegramBusInstanceLifecycleAnnouncement,
   createTelegramBusLeaderApiProxy,
   createTelegramBusSelectedMenuDeliveryHandler,
@@ -3501,6 +3503,232 @@ test("Explicit connect recovery refuses missing negotiated capability before pro
     registration: { instanceId: "follower", registrationGeneration: "recovery", protocol, connectedAtMs: Date.now() } });
   assert.equal(ack.kind === "bus.ack" && ack.ok, false);
   assert.equal(provisions, 0);
+});
+test("Restart handoff detaches only an exact current compatible follower before acknowledging", async () => {
+  const protocol = createTelegramBusProtocolIdentity({
+    runtimeBuild: "restart-handoff",
+    capabilities: [TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF],
+  });
+  const registry = createTelegramBusFollowerRegistry();
+  registry.register({
+    instanceId: "follower",
+    registrationGeneration: "generation-1",
+    profileKey: "cwd:/repo",
+    sessionId: "session-1",
+    target: { chatId: 7, threadId: 42 },
+    pid: process.pid,
+    processBirthId: "birth",
+    protocol,
+    connectedAtMs: 1,
+  });
+  const now = Date.now();
+  const request = {
+    kind: "follower.prepareRestart" as const,
+    requestId: "restart-1",
+    auth: "secret",
+    instanceId: "follower",
+    registrationGeneration: "generation-1",
+    profileKey: "cwd:/repo",
+    sessionId: "session-1",
+    leaderEpoch: "epoch-1",
+    telegramProfile: "work",
+    deadlineAtMs: now + 900,
+    target: { chatId: 7, threadId: 42 },
+  };
+  let detaches = 0;
+  const handle = createRawTelegramBusLeaderEnvelopeHandler({
+    followerRegistry: registry,
+    authSecret: "secret",
+    protocolIdentity: protocol,
+    getCurrentLeaderEpoch: () => "epoch-1",
+    getTelegramProfile: () => "work",
+    getNowMs: () => now,
+    prepareFollowerRestart(_follower, input, isCurrent) {
+      assert.deepEqual(input, request);
+      assert.equal(isCurrent(), true);
+      detaches++;
+      return Promise.resolve(true);
+    },
+    onFollowerDisconnected() {
+      assert.fail("Restart handoff must not use destructive manual disconnect.");
+    },
+  });
+  const ack = await handle(request);
+  assert.equal(ack.kind, "bus.ack");
+  if (ack.kind !== "bus.ack") return;
+  assert.equal(ack.ok, true);
+  assert.deepEqual(ack.result, {
+    instanceId: "follower",
+    registrationGeneration: "generation-1",
+    profileKey: "cwd:/repo",
+    sessionId: "session-1",
+    leaderEpoch: "epoch-1",
+    telegramProfile: "work",
+    deadlineAtMs: request.deadlineAtMs,
+    target: request.target,
+  });
+  assert.equal(detaches, 1);
+  assert.equal(registry.get("follower"), undefined);
+});
+test("Restart handoff rejects stale generation, foreign target, incompatible peer, and expired deadline", async () => {
+  for (const fault of ["auth", "generation", "target", "profile", "session", "bot-profile", "epoch", "capability", "deadline", "commit", "replacement"] as const) {
+    const protocol = createTelegramBusProtocolIdentity({
+      runtimeBuild: "restart-handoff",
+      capabilities: fault === "capability" ? [] : [TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF],
+    });
+    const registry = createTelegramBusFollowerRegistry();
+    registry.register({
+      instanceId: "follower",
+      registrationGeneration: "generation-1",
+      profileKey: "cwd:/repo",
+      sessionId: "session-1",
+      target: { chatId: 7, threadId: 42 },
+      pid: process.pid,
+      processBirthId: "birth",
+      protocol,
+      connectedAtMs: 1,
+    });
+    const now = Date.now();
+    const request = {
+      kind: "follower.prepareRestart" as const,
+      requestId: `restart-${fault}`,
+      auth: fault === "auth" ? "wrong-secret" : "secret",
+      instanceId: "follower",
+      registrationGeneration: fault === "generation" ? "old-generation" : "generation-1",
+      profileKey: fault === "profile" ? "cwd:/foreign" : "cwd:/repo",
+      sessionId: fault === "session" ? "foreign-session" : "session-1",
+      leaderEpoch: fault === "epoch" ? "old-epoch" : "epoch-1",
+      telegramProfile: fault === "bot-profile" ? "foreign-bot-profile" : "work",
+      deadlineAtMs: fault === "deadline" ? now - 1 : now + 900,
+      target: fault === "target" ? { chatId: 7, threadId: 43 } : { chatId: 7, threadId: 42 },
+    };
+    let detachAttempts = 0;
+    const handle = createRawTelegramBusLeaderEnvelopeHandler({
+      followerRegistry: registry,
+      authSecret: "secret",
+      protocolIdentity: protocol,
+      getCurrentLeaderEpoch: () => "epoch-1",
+      getTelegramProfile: () => "work",
+      getNowMs: () => now,
+      prepareFollowerRestart() {
+        detachAttempts++;
+        if (fault === "replacement") {
+          registry.register({
+            ...registry.get("follower")!,
+            registrationGeneration: "replacement-generation",
+            profileKey: "cwd:/replacement",
+          });
+        }
+        return Promise.resolve(fault !== "commit");
+      },
+    });
+    const ack = await handle(request);
+    assert.equal(ack.kind === "bus.ack" && ack.ok, false, fault);
+    assert.equal(detachAttempts, fault === "commit" || fault === "replacement" ? 1 : 0, fault);
+    assert.ok(registry.get("follower"), fault);
+    if (fault === "replacement")
+      assert.equal(registry.get("follower")?.registrationGeneration, "replacement-generation");
+  }
+});
+test("Restart preparer preserves the original binding and slot across repeated commits and fails closed", async () => {
+  await withWorkspaceRelocationFixture("follower", async (store) => {
+    const runWorkspaceOperation =
+      createTelegramWorkspaceOperationRuntime().run;
+    const prepare = createTelegramBusFollowerRestartPreparer({
+      store,
+      runWorkspaceOperation,
+    });
+    const target = { chatId: 7, threadId: 10 };
+    const follower = (instanceId: string, registrationGeneration: string) => ({
+      instanceId,
+      registrationGeneration,
+      profileKey: "manual:owner",
+      sessionId: "session",
+      target,
+      connectedAtMs: 1,
+      lastHeartbeatMs: 1,
+    });
+    const request = (instanceId: string, registrationGeneration: string) => ({
+      kind: "follower.prepareRestart" as const,
+      requestId: `restart-${registrationGeneration}`,
+      instanceId,
+      registrationGeneration,
+      profileKey: "manual:owner",
+      sessionId: "session",
+      leaderEpoch: "epoch",
+      telegramProfile: "default",
+      deadlineAtMs: 1000,
+      target,
+    });
+    const isCurrent = () => true;
+    const initialBinding = structuredClone(store.listWorkspaceBindings()[0]);
+    const stale = await prepare(
+      follower("old", "generation-1"),
+      request("old", "generation-2"),
+      isCurrent,
+    );
+    const foreign = await prepare(follower("old", "generation-1"), {
+      ...request("old", "generation-1"),
+      target: { chatId: 7, threadId: 11 },
+    }, isCurrent);
+    assert.equal(stale, false);
+    assert.equal(foreign, false);
+    assert.equal(store.getActiveByInstanceId("old")?.target.threadId, target.threadId);
+
+    const failingStore = { ...store, detachTargetOwner: async () => false };
+    const failedPrepare = createTelegramBusFollowerRestartPreparer({
+      store: failingStore,
+      runWorkspaceOperation,
+    });
+    assert.equal(
+      await failedPrepare(
+        follower("old", "generation-1"),
+        request("old", "generation-1"),
+        isCurrent,
+      ),
+      false,
+    );
+    assert.equal(store.getActiveByInstanceId("old")?.target.threadId, target.threadId);
+    assert.deepEqual(store.listWorkspaceBindings(), [initialBinding]);
+    assert.equal(store.listPendingCleanups().length, 0);
+
+    assert.equal(
+      await prepare(
+        follower("old", "generation-1"),
+        request("old", "generation-1"),
+        isCurrent,
+      ),
+      true,
+    );
+    assert.equal(store.getActiveByInstanceId("old")?.owner, undefined);
+    store.upsert({
+      profileKey: "manual:owner",
+      owner: { kind: "manual-follower", instanceId: "owner" },
+      instanceId: "successor",
+      target,
+      status: "active",
+      slot: "A",
+      threadName: "Atlas",
+      createdAtMs: 2,
+      updatedAtMs: 2,
+    });
+    assert.equal(
+      await prepare(
+        follower("successor", "generation-2"),
+        request("successor", "generation-2"),
+        isCurrent,
+      ),
+      true,
+    );
+    const binding = store.listWorkspaceBindings().find(
+      (entry) => entry.bindingKey === initialBinding.bindingKey,
+    );
+    assert.deepEqual(binding?.target, target);
+    assert.equal(binding?.sessionId, "session");
+    assert.equal(binding?.slot, "A");
+    assert.equal(binding?.manualThreadName, initialBinding.manualThreadName);
+    assert.equal(store.listPendingCleanups().length, 0);
+  });
 });
 
 test("Bus leader rejects incompatible protocol before follower provisioning", async () => {

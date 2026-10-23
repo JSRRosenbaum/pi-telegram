@@ -395,7 +395,7 @@ test("Bridge Queue startup and services fence reused-context replacement at ever
         clearModelMenuState() {}, getActiveTurnChatId: () => undefined, clearPreview: async () => {}, clearActiveTurn() {},
         clearAbort() {}, },
       follower: { registrationState: { getTarget: () => undefined, getSlot: () => undefined, getThreadName: () => undefined,
-        isRegistered: () => true }, registrationRuntime: { setContext: () => replaceAt("refresh"), registerWithLeader: async () => false },
+        isRegistered: () => true }, registrationRuntime: { stop() {}, setContext: () => replaceAt("refresh"), registerWithLeader: async () => false },
         instanceId: "follower", getLeaderState: () => ({ kind: "inactive" }), suspendPolling: async () => {},
         updateStatus() { events.push("follower-status"); }, recordRuntimeEvent() { events.push("follower-notice"); } },
       services: { resumeGroupedInput() { events.push("grouped"); }, suspendGroupedInput() {},
@@ -450,7 +450,7 @@ test("Bridge Queue teardown fences receipt-bearing Steer across reused-context r
         clearModelMenuState() { events.push("menus"); }, getActiveTurnChatId: () => undefined, clearPreview: async () => {},
         clearActiveTurn() { events.push("turn"); }, clearAbort() { events.push("abort"); } },
       follower: { registrationState: { getTarget: () => undefined, getSlot: () => undefined, getThreadName: () => undefined,
-        isRegistered: () => false }, registrationRuntime: { setContext() {}, registerWithLeader: async () => false },
+        isRegistered: () => false }, registrationRuntime: { stop() {}, setContext() {}, registerWithLeader: async () => false },
         instanceId: "leader", getLeaderState: () => ({ kind: "inactive" }), updateStatus() {}, recordRuntimeEvent() {},
         async suspendPolling() {
           events.push("polling"); await Promise.resolve();
@@ -484,7 +484,7 @@ test("Bridge Queue teardown fences receipt-bearing Steer across reused-context r
 });
 
 test("Quit preservation runs only after quiescence and before the exact session context closes", async () => {
-  for (const scenario of ["quit", "reload", "new", "resume", "fork", "late-delivery", "late-queue", "late-session", "worker-error", "prepare-error", "preservation-error"] as const) {
+  for (const scenario of ["quit", "reload", "new", "resume", "fork", "late-delivery", "late-queue", "late-session", "worker-error", "prepare-error", "preservation-error", "restart-ack", "restart-held", "restart-leader", "restart-late", "restart-suspend-late"] as const) {
     const contexts = createTelegramSessionContextStore<ExtensionContext>();
     const ctx = createLifecycleContext();
     contexts.set(ctx);
@@ -501,10 +501,13 @@ test("Quit preservation runs only after quiescence and before the exact session 
       },
       follower: {
         registrationState: { getTarget: () => undefined, isRegistered: () => false },
-        registrationRuntime: {}, instanceId: "leader", getLeaderState: () => ({ kind: "unlocked" }),
+        registrationRuntime: {
+          stop() { events.push("registration-stop"); },
+        },
+        isLeader: () => scenario === "restart-leader",
         suspendPolling: async () => {
           events.push("polling");
-          if (scenario === "late-queue") contexts.set(ctx);
+          if (scenario === "late-queue" || scenario === "restart-suspend-late") contexts.set(ctx);
         }, updateStatus() {},
         recordRuntimeEvent(_category: string, _error: unknown, details?: { phase?: string }) {
           events.push(String(details?.phase));
@@ -529,18 +532,46 @@ test("Quit preservation runs only after quiescence and before the exact session 
           current = isCurrent;
           return async () => {
             assert.equal(isCurrent(), true);
-            assert.deepEqual(events, ["prepare", "delivery", "polling", "worker"]);
+            assert.deepEqual(
+              events,
+              scenario === "restart-leader"
+                ? ["prepare", "polling"]
+                : ["prepare", "delivery", "polling", "worker"],
+            );
             events.push("preserve");
             if (scenario === "preservation-error") throw new Error("publication failed");
           };
         },
+        prepareFollowerRestart: async () => {
+          events.push("restart-handoff");
+          if (scenario === "restart-late") contexts.set(ctx);
+          return scenario === "restart-ack" || scenario === "restart-late" || scenario === "restart-suspend-late";
+        },
       },
     } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
-    const reason = ["reload", "new", "resume", "fork"].includes(scenario) ? scenario : "quit";
+    const reason = scenario.startsWith("restart-")
+      ? "restart"
+      : ["reload", "new", "resume", "fork"].includes(scenario) ? scenario : "quit";
     const shutdown = runtime.onSessionShutdown({ type: "session_shutdown", reason } as never, ctx);
     if (scenario === "worker-error") await assert.rejects(shutdown, /worker stop failed/);
     else await shutdown;
-    assert.equal(events.includes("preserve"), scenario === "quit" || scenario === "preservation-error", scenario);
+    if (scenario === "restart-late" || scenario === "restart-suspend-late") {
+      assert.deepEqual(events, scenario === "restart-late" ? ["restart-handoff"] : ["restart-handoff", "polling"]);
+      assert.equal(contexts.get(), ctx);
+      continue;
+    }
+    assert.equal(events.includes("preserve"), scenario === "quit" || scenario === "preservation-error" || scenario === "restart-leader", scenario);
+    if (scenario.startsWith("restart-")) {
+      assert.equal(events.includes("restart-handoff"), scenario !== "restart-leader", scenario);
+      if (scenario !== "restart-leader") {
+        assert.ok(events.indexOf("restart-handoff") < events.indexOf("delivery"), scenario);
+      }
+      assert.equal(events.includes("prepare"), scenario === "restart-leader", scenario);
+      assert.equal(events.includes("prepare-follower-restart"), scenario === "restart-held", scenario);
+    }
+      assert.equal(events.includes("registration-stop"), scenario === "restart-ack" || scenario === "restart-held", scenario);
+      if (scenario !== "restart-leader")
+        assert.ok(events.indexOf("registration-stop") < events.indexOf("delivery"), scenario);
     if (["reload", "new", "resume", "fork"].includes(scenario)) assert.equal(events.includes("prepare"), false);
     if (scenario === "prepare-error" || scenario === "preservation-error") {
       assert.ok(events.includes("preserve-thread-on-quit"));

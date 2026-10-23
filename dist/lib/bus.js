@@ -52,6 +52,7 @@ export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION = "durable-follo
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF = "queue-handoff-v1";
 /** Unspent Steer lane codec; independent from baseline receipt handoff support. */
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_STEER = "queue-steer-v1";
+export const TELEGRAM_BUS_CAPABILITY_RESTART_HANDOFF = "follower-restart-handoff-v1";
 export const TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY = "explicit-connect-recovery-v1";
 export const TELEGRAM_BUS_CAPABILITY_INPUT_CUSTODY_REFERENCE = "input-custody-reference-v1";
 export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME = "workspace-thread-rename-v1";
@@ -525,6 +526,41 @@ export function parseTelegramBusEnvelope(line) {
         case "follower.disconnect":
             envelope = parseFollowerPresenceEnvelope(value, requestId, kind);
             break;
+        case "follower.prepareRestart": {
+            const target = parseTarget(value.target);
+            if (typeof value.instanceId === "string" &&
+                value.instanceId.length > 0 &&
+                typeof value.registrationGeneration === "string" &&
+                value.registrationGeneration.length > 0 &&
+                typeof value.profileKey === "string" &&
+                value.profileKey.length > 0 &&
+                typeof value.sessionId === "string" &&
+                value.sessionId.length > 0 &&
+                typeof value.leaderEpoch === "string" &&
+                value.leaderEpoch.length > 0 &&
+                (value.telegramProfile === undefined ||
+                    (typeof value.telegramProfile === "string" &&
+                        value.telegramProfile.length > 0)) &&
+                typeof value.deadlineAtMs === "number" &&
+                Number.isFinite(value.deadlineAtMs) &&
+                target?.threadId !== undefined) {
+                envelope = {
+                    kind,
+                    requestId,
+                    instanceId: value.instanceId,
+                    registrationGeneration: value.registrationGeneration,
+                    profileKey: value.profileKey,
+                    sessionId: value.sessionId,
+                    leaderEpoch: value.leaderEpoch,
+                    ...(typeof value.telegramProfile === "string"
+                        ? { telegramProfile: value.telegramProfile }
+                        : {}),
+                    deadlineAtMs: value.deadlineAtMs,
+                    target: { chatId: target.chatId, threadId: target.threadId },
+                };
+            }
+            break;
+        }
         case "follower.setThreadDisplayMode":
             if (typeof value.instanceId === "string" &&
                 typeof value.registrationGeneration === "string" &&
