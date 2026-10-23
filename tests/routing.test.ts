@@ -6863,7 +6863,7 @@ for (const winner of ["cancellation", "selection"] as const) test(`Unbound defer
 
 for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "chooser", "profile", "source-profile", "session", "epoch",
   "command", "unsupported", "historical", "selected", "forward-unknown", "storage-failure", "storage-recovery", "edit-failure", "workspace-denied",
-  "voice", "photo", "document", "sticker", "voice-recovery"] as const) {
+  "voice", "photo", "document", "sticker", "voice-recovery", "orphan-protected"] as const) {
   test(`Owner cancellation travels from chooser through the native worker and journal (${scenario})`, async () => {
     await withTopicStore(async (threadStore, path) => {
       threadStore.upsert({ profileKey: "cwd:/repo", target: { chatId: 100, threadId: 42 }, status: "active",
@@ -6895,6 +6895,8 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
         configStore: { get: () => ({} as never), getAllowedUserId: () => owner,
           persistAllowedUserId: async () => true, persist: async () => undefined },
         getAdmissionJournalBinding: () => activeBinding, isContextActive: () => active, getCurrentLeaderEpoch: () => epoch,
+        // The strict journal census: an empty result proves no retained arrival still names the unbound tab.
+        inspectTemporaryThreadSources: () => scenario === "orphan-protected" ? [124] : [],
         foreignOwnedUpdateForwarder: { forwardMessage: async () => retryableForeignUpdateSettlement() },
         async runWorkspaceOperation(input, operation) {
           if (denyWorkspace && input.operationKind === "workspace.cancel-unbound-routing") throw new Error("fixture Workspace fence");
@@ -6984,7 +6986,7 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
           } else await click("reroutecancel:1");
         }
         const succeeds = ["cancel", "command", "restore-menu", "storage-failure", "storage-recovery", "edit-failure", "workspace-denied",
-          "voice", "photo", "document", "sticker", "voice-recovery"].includes(scenario);
+          "voice", "photo", "document", "sticker", "voice-recovery", "orphan-protected"].includes(scenario);
         if (succeeds) {
           assert.equal(journal.read().entries.some(entry => entry.updateId === 123), false);
           assert.equal(journal.read().operatorDispositions?.length, 1);
@@ -6997,7 +6999,9 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
           const retained = journal.inspectPendingRetention(sourceEntry);
           assert.ok(retained);
           assert.deepEqual(JSON.parse(await readFile(retained.retainedPath, "utf8")).entry.update, update);
-          assert.equal(apiCalls.includes("deleteForumTopic"), false, "An unbound tab and its private original stay");
+          // With nothing unspent left in the cancelled unbound tab it is deleted like a routing tab; the private original stays.
+          assert.equal(apiCalls.filter(method => method === "deleteForumTopic").length, scenario === "orphan-protected" ? 0 : 1,
+            "A cancelled unbound tab is deleted exactly once unless the journal census still names it");
           await click("reroute:1:42");
           await click("reroutecancel:1");
           assert.equal(telegramQueueStore.getQueuedItems().length, 0);
@@ -7013,6 +7017,61 @@ for (const scenario of ["cancel", "restore-menu", "owner", "chat", "thread", "ch
     });
   });
 }
+
+test("Cancelling one of several inputs in an unbound tab deletes the tab only with the last unspent input", async () => {
+  await withTopicStore(async (threadStore, path) => {
+    threadStore.upsert({ profileKey: "cwd:/repo", target: { chatId: 100, threadId: 42 }, status: "active",
+      createdAtMs: 1, updatedAtMs: 1, instanceId: "leader-a", slot: "A", threadName: "Axial" });
+    await threadStore.persist();
+    const options = { path: `${path}.inbox`, botIdentity: Journal.createTelegramUpdateJournalBotIdentity({ botToken: "123:orphan-cancel" }) };
+    const bindingKey = Journal.createTelegramUpdateJournalBindingKey(options);
+    const journal = Journal.createTelegramUpdateJournalStore(options);
+    const apiCalls: Array<{ method: string; threadId?: unknown }> = [];
+    let nextChooser = 200;
+    const events: string[] = [];
+    const { routeRuntime } = createRouteHarness({ threadStore,
+      configStore: { get: () => ({} as never), getAllowedUserId: () => 7,
+        persistAllowedUserId: async () => true, persist: async () => undefined },
+      getAdmissionJournalBinding: () => bindingKey, isContextActive: () => true, getCurrentLeaderEpoch: () => 1,
+      inspectTemporaryThreadSources: () => [],
+      async runWorkspaceOperation(_input, operation) { return operation(); },
+      async sendInteractiveMessage(_c, _t, _m, kb) { events.push("chooser:" + JSON.stringify(kb).match(/reroutecancel:[a-z0-9]+/)?.[0]); return nextChooser++; },
+      async editInteractiveMessage() { /* chooser surface */ },
+      async callApi(method, body) { apiCalls.push({ method, threadId: (body as { message_thread_id?: unknown } | undefined)?.message_thread_id }); return true as never; },
+      async deleteMessage() { /* chooser deletion */ },
+    });
+    const worker = Updates.createTelegramUpdateAdmissionWorkerRuntime<TestUpdate & Journal.TelegramJournaledUpdate, TestContext>({
+      journal, getJournalBindingKey: () => bindingKey, hasAuthority: () => true,
+      defaultHandle: (input, ctx) => routeRuntime.handleUpdate(input, ctx),
+    });
+    const message = (id: number, text: string) => ({ update_id: id, message: { message_id: id, message_thread_id: 99,
+      chat: { id: 100, type: "private" as const }, from: { id: 7, is_bot: false }, text } });
+    let nextUpdateId = 300;
+    const click = async (data: string, messageId: number) => {
+      journal.appendBatch([{ update_id: nextUpdateId++, callback_query: { id: `click-${nextUpdateId}`, from: { id: 7, is_bot: false }, data,
+        message: { message_id: messageId, message_thread_id: 99, chat: { id: 100, type: "private" } } } }]);
+      worker.signal();
+      await worker.waitForDrain();
+    };
+    try {
+      worker.start({ cwd: "/repo" });
+      await worker.waitForDrain();
+      journal.appendBatch([message(101, "first private input")]);
+      worker.signal();
+      await worker.waitForDrain();
+      journal.appendBatch([message(102, "second private input")]);
+      worker.signal();
+      await worker.waitForDrain();
+      await click("reroutecancel:1", 200);
+      assert.equal(apiCalls.some(call => call.method === "deleteForumTopic"), false, "A second unspent input still needs the tab");
+      await click("reroutecancel:2", 201);
+      const deletions = apiCalls.filter(call => call.method === "deleteForumTopic");
+      assert.equal(deletions.length, 1, JSON.stringify(apiCalls) + events.join("|"));
+      assert.equal(deletions[0]!.threadId, 99);
+      assert.equal(apiCalls.some(call => call.method === "deleteForumTopic" && call.threadId === 42), false, "A bound tab is never touched");
+    } finally { await worker.stop(); }
+  });
+});
 
 for (const scenario of ["success", "media", "page", "unsupported", "corrupt", "owner", "profile", "epoch", "session",
   "chooser", "thread", "stale", "navigation", "restart-control", "edit-failure", "lease-failure", "lease-drift", "bad-index"] as const) {

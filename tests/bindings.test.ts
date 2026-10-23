@@ -234,6 +234,53 @@ test("Generative App live-surface binding shuts down and clears session authorit
   assert.equal(binding.get(), undefined);
 });
 
+test("Generative App bound-button composition leaves unbound ordinary prompts to the prompt plane", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-telegram-binding-ordinary-"));
+  const events: unknown[] = [];
+  try {
+    const invoke = createTelegramGenerativeAppBoundButtonActionInvoker({
+      agentDir: join(root, "agent"),
+      assertExecutionCurrent: () => undefined,
+      getExecutionFence: () => undefined,
+      planOutput: Outbound.createTelegramOutboundReplyPlanner(
+        Outbound.createTelegramButtonActionStore(),
+      ),
+      sendMarkdownReply: async () => {
+        throw new Error("must not send");
+      },
+      recordRuntimeEvent: (...args) => {
+        events.push(args);
+      },
+    });
+    const query = { message: { chat: { id: 1 }, message_id: 2 } };
+    for (const prompt of [
+      "Check std::map usage",
+      "std::map",
+      "poker::fold trailing",
+      "Poker::fold",
+      "cargo test foo::bar({x})",
+      "tool::run()",
+      "ghost::fold",
+    ]) {
+      assert.equal(await invoke({ prompt, text: "Option" }, query), false, prompt);
+    }
+    assert.deepEqual(events, []);
+    await assert.rejects(
+      invoke(
+        {
+          prompt: "poker::fold trailing",
+          text: "Option",
+          binding: { generation: "g", app: "poker", revision: 0 },
+        },
+        query,
+      ),
+      /Malformed/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Generative App bound-button composition rejects a retained stale revision before delivery", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-telegram-binding-app-"));
   const agentDir = join(root, "agent");
