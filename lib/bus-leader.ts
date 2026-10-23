@@ -40,6 +40,7 @@ import {
   type TelegramBusProtocolIdentity,
   type TelegramBusSelectedMenuDelivery,
   type TelegramBusSocketPathSource,
+  TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE,
 } from "./bus.ts";
 import type { TelegramThreadDisplayMode } from "./config.ts";
 import type { TelegramAttachmentSource } from "./media.ts";
@@ -464,6 +465,9 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
           store: deps.topicTargetStore,
           getLeaderEpoch: deps.getCurrentLeaderEpoch,
           getExternalProtection: deps.captureWorkspaceExternalProtection,
+          onSlotReused: (bindingKey, isCurrent) => display
+            ? reconcileThreadDisplay(bindingKey, isCurrent).then(() => undefined)
+            : Promise.resolve(),
           recordEvent(message, details) {
             deps.recordRuntimeEvent("bus", message, details);
           },
@@ -513,6 +517,9 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
         getLeaderEpoch: () => deps.getCurrentLeaderEpoch?.(),
         captureLiveBindingKeys,
         captureBindingAuthority(binding) {
+          // Slotless retained bindings need display repair even without a live owner.
+          // The reconciler still fences the exact binding snapshot, profile, mode and epoch.
+          if (binding.slot === undefined) return () => true;
           const matches = (target: TelegramTarget | undefined) =>
             target?.chatId === binding.target.chatId &&
             target?.threadId === binding.target.threadId;
@@ -544,19 +551,22 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
         callApi: deps.callApi,
       })
     : undefined;
-  const reconcileThreadDisplayOperation = async () => {
-    const result = await display!.reconcile();
+  const reconcileThreadDisplayOperation = async (bindingKey?: string) => {
+    const result = await display!.reconcile(bindingKey);
     deps.onThreadDisplayChanged?.();
     return result;
   };
-  const reconcileThreadDisplay = () =>
+  const reconcileThreadDisplay = (bindingKey?: string, isCurrent: () => boolean = () => true) =>
     runWorkspaceOperation(
       {
         operationId: createTelegramWorkspaceAdmissionOperationId(),
         operationKind: "workspace.reconcile-display",
         scopes: [{ kind: "profile" }],
       },
-      reconcileThreadDisplayOperation,
+      () => {
+        if (!isCurrent()) throw new Error("Telegram Thread display update lost allocation authority.");
+        return reconcileThreadDisplayOperation(bindingKey);
+      },
     );
   let startupDisplayTimer: ReturnType<typeof setTimeout> | undefined;
   let startupDisplayGeneration = 0;
@@ -4181,7 +4191,7 @@ async function handleFollowerApiCall(
   ) {
     return rejectTelegramBusRequest(
       envelope.requestId,
-      "Telegram bus API call is not allowed for this follower.",
+      TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE,
     );
   }
   if (!deps.callApi) {

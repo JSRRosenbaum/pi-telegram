@@ -454,17 +454,32 @@ export default function (pi) {
             return WorkspaceRetirement.isCurrentTelegramWorkspaceBinding(threadStore, binding);
         },
     });
-    const inactiveThreadCleanupReviewRuntime = ThreadCleanupManager.createTelegramInactiveThreadCleanupReviewRuntime({
-        getProfileName() {
-            return configStore.getActiveProfileName() ?? "default";
+    const inactiveThreadCleanupRuntime = ThreadCleanupManager.createTelegramInactiveThreadCleanupRuntime({
+        store: threadStore,
+        captureAuthority() {
+            const ledger = workspaceAdmissionRuntime.resolve();
+            const leaderEpoch = getCurrentLeaderEpoch();
+            const operator = configStore.getAllowedUserId();
+            if (!ledger || leaderEpoch === undefined || operator === undefined)
+                return undefined;
+            const stamp = telegramTransportStampRuntime.getStamp();
+            const generation = telegramSessionContextStore.getGeneration();
+            return {
+                profileName: configStore.getActiveProfileName() ?? "default",
+                leaderEpoch, ledger,
+                isCurrent() {
+                    return getCurrentLeaderEpoch() === leaderEpoch &&
+                        telegramTransportStampRuntime.isActive(stamp) &&
+                        configStore.getAllowedUserId() === operator &&
+                        telegramSessionContextStore.getGeneration() === generation;
+                },
+            };
         },
-        listBindings: threadStore.listWorkspaceBindings,
         getProtection: captureWorkspaceExternalProtection,
-        listReservations: threadStore.listReservations,
-        listPendingProvisions: threadStore.listPendingProvisions,
-        listPendingCleanups: threadStore.listPendingCleanups,
-        getWorkStore() {
-            const profileName = configStore.getActiveProfileName() ?? "default";
+        getProcessLiveness: ProcessIdentity.getTelegramProcessLiveness,
+        runExclusive: telegramWorkspaceOperationRuntime.runExclusive,
+        getWorkStore(authority) {
+            const profileName = authority.profileName;
             const botToken = configStore.getBotToken();
             if (!botToken)
                 throw new Error("Telegram Thread cleanup review requires an active bot token.");
@@ -474,9 +489,16 @@ export default function (pi) {
                 tokenSha256: Journal.createTelegramUpdateJournalBotIdentity({
                     botToken,
                 }).tokenSha256,
+                admissionProfileKey: authority.ledger.getProfileKey(),
             });
         },
         runWorkspaceOperation: telegramWorkspaceOperationRuntime.run,
+        deleteThread(authorize) {
+            return directTelegramApiRuntime.deleteWorkspaceThread(authorize);
+        },
+        onError(error) {
+            recordRuntimeEvent("telegram", error, { phase: "manual-inactive-thread-cleanup" });
+        },
     });
     const updateAdmissionRuntimeBinding = Updates.createTelegramUpdateAdmissionRuntimeBinding({
         isFollowerRegistered: telegramBusFollowerRegistrationState.isRegistered,
@@ -940,7 +962,8 @@ export default function (pi) {
         sendInteractiveMessage,
         answerCallbackQuery,
         ...configControls,
-        reviewInactiveThreads: inactiveThreadCleanupReviewRuntime.review,
+        reviewInactiveThreads: inactiveThreadCleanupRuntime.review,
+        cleanInactiveThreads: inactiveThreadCleanupRuntime.clean,
         getThreadDisplayMode() {
             return threadStore.getBotState().threadMode === "enabled"
                 ? Config.resolveTelegramThreadDisplayMode(configStore.get())
@@ -1376,6 +1399,15 @@ export default function (pi) {
                 telegramJournalBindingRuntime.prepareActiveFollowerSuccession(function () {
                     return binding.hasAuthority?.() === true;
                 });
+            },
+            recoverRejectedRecipientTarget(error) {
+                const rejected = error instanceof TelegramApi.TelegramApiFollowerNotAllowedError
+                    ? error.requestTarget
+                    : undefined;
+                const current = telegramBusFollowerRegistrationState.getTarget();
+                return rejected && current?.threadId !== undefined
+                    ? { rejected, current: { chatId: current.chatId, threadId: current.threadId } }
+                    : undefined;
             },
             prepareUpdateForExecution(update) {
                 return BusFollower.prepareTelegramBusFollowerJournaledUpdateForExecution(update, textGroupRuntime.prepareForwardedMessage);

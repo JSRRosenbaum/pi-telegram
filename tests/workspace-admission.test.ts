@@ -109,6 +109,36 @@ function createStateLedger(input: Parameters<typeof createLedger>[0]): TelegramW
   return createLedger({ stateProfile: "default", profileKey: rootProfileKey, ...input });
 }
 
+test("A null letter is valid only for an explicit manual cleanup fence and never reserves another binding's slot", () => {
+  const temp = createTempPath();
+  try {
+    const ledger = createLedger({ path: temp.path });
+    const base = { operationId: "slotless-cleanup", bindingKey: "binding:old", target,
+      leaderEpoch: 1, slot: null, retirementRequestedAtMs: 10 };
+    assert.throws(() => ledger.acquireRetirementFence({ ...base, retirementIntentId: "pressure" } as never),
+      error => isAdmissionError(error, "invalid-input"));
+    assert.throws(() => ledger.acquireThreadCleanupFence({ ...base, slot: undefined, cleanupWorkSetId: "review", cleanupRequestedAtMs: 10 } as never),
+      error => isAdmissionError(error, "invalid-input"));
+    const acquired = ledger.acquireThreadCleanupFence({ operationId: base.operationId,
+      bindingKey: base.bindingKey, target, leaderEpoch: 1, slot: null,
+      cleanupWorkSetId: "review", cleanupRequestedAtMs: 10 });
+    assert.equal(acquired.kind, "acquired");
+    if (acquired.kind !== "acquired") throw new Error("Expected manual cleanup fence");
+    const cold = createLedger({ path: temp.path });
+    assert.equal(cold.read().fence?.destructiveKind, "manual-thread-cleanup");
+    assert.deepEqual(cold.listReservedSlots(), []);
+    assert.equal(cold.acquireAdmission({ operationId: "competing", operationKind: "test", scope: { kind: "profile" } }).kind, "blocked");
+    const issued = cold.issueThreadCleanupDeletionPermit(acquired.fence);
+    assert.equal(issued.kind, "issued");
+    if (issued.kind === "issued") assert.equal(issued.permit.slot, null);
+    assert.equal(cold.issueThreadCleanupDeletionPermit(issued.fence).kind, "already-issued");
+    const raw = JSON.parse(readFileSync(temp.path, "utf8"));
+    raw.fence.destructiveKind = "pressure-retirement";
+    writeFileSync(temp.path, JSON.stringify(raw));
+    assert.throws(() => cold.read(), error => isAdmissionError(error, "invalid-state"));
+  } finally { rmSync(temp.dir, { recursive: true, force: true }); }
+});
+
 test("Consolidated admission observes without creation and refuses malformed or foreign storage", () => {
   const temp = createTempPath();
   try {

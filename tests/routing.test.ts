@@ -4048,6 +4048,7 @@ import * as Runtime from "../lib/runtime.ts";
 import * as TextGroups from "../lib/text-groups.ts";
 import * as Threads from "../lib/threads.ts";
 import * as ThreadReconciler from "../lib/thread-reconciler.ts";
+import * as TelegramApi from "../lib/telegram-api.ts";
 import * as Updates from "../lib/updates.ts";
 import { createDefaultTelegramBridgeApiRuntime, createTelegramApiTargetActivityRuntime } from "../lib/telegram-api.ts";
 import { TELEGRAM_GUEST_TURN_NOTE } from "../lib/turns.ts";
@@ -7561,7 +7562,7 @@ for (const scenario of ["expiry", "half-hour", "restore-menu", "cancel", "group-
         }
         assert.equal(harness.telegramQueueStore.getQueuedItems().length, 0);
         assert.equal(completed.includes(123), false, "Expiry is not task completion");
-        if (scenario === "expiry") assert.deepEqual(edits.filter(text => text.includes("\u231b")), ["<b>\u231b Routing choice expired.</b>"]);
+        if (scenario === "expiry") assert.deepEqual(edits.filter(text => text.includes("\u231b")), ["<b>\u231b Routing expired; input was not delivered.</b>"]);
         assert.equal(apiCalls, initialApiCalls, "TTL never probes or deletes an unowned tab");
         if (scenario === "expiry") {
           assert.equal(Updates.getTelegramUpdateExecutionFence(carrier)?.isCurrent(), false);
@@ -8316,6 +8317,113 @@ for (const command of ["start", "help", "status", "model", "thinking", "queue", 
         assert.deepEqual(observations, [1], `The accepted destination command must not render before source cleanup: ${JSON.stringify(f.harness.events)}`);
         await f.click(f.routeOf(0));
         assert.deepEqual(observations, [1], "A repeated chooser cannot execute the accepted command twice");
+      } finally { await f.stop(); }
+    });
+  });
+}
+
+for (const mode of ["warm", "cold", "created-after-guard", "unreadable"] as const) {
+  test(`Pending Transit chooser vetoes actual unbound reconciliation (${mode})`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("cancel", frame);
+      const earlyGuard = Threads.createTelegramCleanupTargetProtection(frame.threads);
+      try {
+        await f.start();
+        const entry = f.store.listTemporaryThreads()[0]!;
+        assert.ok(entry.target);
+        assert.ok(f.cancelOf(0), "the native worker owns a waiting routing choice");
+        let store = frame.threads;
+        if (mode === "cold") {
+          store = Threads.createTelegramTopicTargetStore({ path: frame.path });
+          await store.load();
+        }
+        const guard = mode === "created-after-guard" ? earlyGuard : Threads.createTelegramCleanupTargetProtection(store);
+        if (mode === "unreadable") await writeFile(frame.path, "{broken", { mode: 0o600 });
+        const plan = ThreadReconciler.planThreadReconciliation({
+          nowMs: Date.now(), currentLeaderEpoch: entry.executor.leaderEpoch,
+          records: [], unboundMessages: [{ target: entry.target!, observedAtMs: Date.now(), messageId: 501 }],
+        });
+        assert.ok(plan.actions.some(action => action.kind === "close-delete-unbound-topic"), "the fixture reaches a real destructive plan, not an empty no-op");
+        const calls: string[] = [];
+        await ThreadReconciler.applyThreadReconciliationPlan(plan, {
+          getCurrentLeaderEpoch: () => entry.executor.leaderEpoch,
+          isCleanupTargetProtected: guard,
+          async callApi<TResponse>(method: string) { calls.push(method); return true as TResponse; },
+        });
+        assert.deepEqual(calls, [], "a pending source blocks both closing and deletion");
+        assert.equal(f.journal.read().entries.find(value => value.updateId === 123)?.state, "pending");
+        assert.equal(f.journal.inspectAbandonedPending(123), undefined);
+        if (mode !== "unreadable") assert.equal(f.store.listTemporaryThreads().length, 1);
+      } finally { await f.stop(); }
+    });
+  });
+}
+
+for (const mode of ["message-gone", "tab-gone", "unparsed-absence", "forged-absence", "foreign-absence", "closed-tab", "denied", "unknown-delete", "journal-changed"] as const) {
+  test(`Transit Cancel uses exact journal custody despite unavailable Telegram view (${mode})`, async () => {
+    await fixture(async frame => {
+      const f = createAllCommandFixture("cancel", frame);
+      let absentError: unknown;
+      if (["tab-gone", "unparsed-absence", "foreign-absence", "closed-tab", "denied"].includes(mode)) {
+        const savedFetch = globalThis.fetch;
+        globalThis.fetch = async () => new Response(JSON.stringify({ ok: false,
+          ...(mode === "unparsed-absence" ? {} : { error_code: mode === "denied" ? 403 : 400 }),
+          description: mode === "closed-tab" ? "Bad Request: topic closed" : "Bad Request: message thread not found" }),
+          { status: mode === "denied" ? 403 : 400 });
+        try {
+          await TelegramApi.createTelegramApiClient(() => "fixture").call("deleteForumTopic",
+            { chat_id: 7, message_thread_id: mode === "foreign-absence" ? 99 : 55 }, { maxAttempts: 1, retrySafety: "non-idempotent" });
+        } catch (error) { absentError = error; }
+        finally { globalThis.fetch = savedFetch; }
+        assert.ok(absentError, "the real client supplies a parsed method/target-bound rejection without network access");
+      }
+      try {
+        await f.start();
+        const original = f.journal.read().entries.find(entry => entry.updateId === 123)!;
+        const cancel = f.cancelOf(0);
+        const rawApi = f.harness.routingDeps.callApi!;
+        let attempts = 0, chooserDisposals = 0;
+        // The real deleteMessage adapter maps typed HTTP 400 already-absent evidence to success
+        // (covered in telegram-api.test.ts). Supply that port result here; the callback carries no view body/thread id.
+        f.harness.routingDeps.deleteMessage = async () => { chooserDisposals++; };
+        f.harness.routingDeps.editInteractiveMessage = async () => { throw new Error("chooser view is unavailable"); };
+        f.harness.routingDeps.callApi = async <TResponse>(method: string, body: Record<string, unknown>, options?: TelegramApi.TelegramApiCallOptions) => {
+          if (method === "deleteForumTopic") {
+            attempts++;
+            assert.equal(body.message_thread_id, 55);
+            assert.ok(f.journal.inspectAbandonedPending(123), "journal retention commits before any tab deletion");
+            if (absentError) throw absentError;
+            if (mode === "forged-absence") throw Object.assign(new Error("Bad Request: message thread not found"), { status: 400 });
+            if (mode === "unknown-delete") throw new Error("transport outcome unknown");
+          }
+          return rawApi<TResponse>(method, body, options);
+        };
+        if (mode === "journal-changed") f.journal.markQueued({
+          queueKind: "prompt", receiptId: "changed-custody", sourceUpdateIds: [123],
+          owner: { instanceId: "recipient", processId: process.pid, processBirthId: `${process.pid}:changed`, sessionGeneration: 1 },
+        });
+        f.journal.appendBatch([{ update_id: 199, callback_query: { id: "cached-cancel", from: { id: 7, is_bot: false }, data: cancel,
+          message: { message_id: 501, date: 0, chat: { id: 7, type: "private" } } } }]);
+        f.worker.signal(); await f.worker.waitForDrain(); await f.harness.routeRuntime.waitForRestoreSettlement();
+        if (mode === "journal-changed") {
+          assert.equal(f.journal.read().entries.find(entry => entry.updateId === 123)?.state, "queued");
+          assert.equal(f.journal.inspectAbandonedPending(123), undefined);
+          assert.equal(attempts, 0);
+          assert.equal(chooserDisposals, 0);
+          return;
+        }
+        const proof = f.journal.inspectAbandonedPending(123)!;
+        assert.ok(proof, JSON.stringify(f.harness.events));
+        assert.deepEqual(JSON.parse(readFileSync(proof.retainedPath, "utf8")).entry.update, original.update,
+          "the retained original comes from the native journal, not the missing display copy");
+        assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), false);
+        assert.equal(attempts, 1);
+        const retained = ["unparsed-absence", "forged-absence", "foreign-absence", "closed-tab", "denied", "unknown-delete"].includes(mode);
+        assert.equal(f.store.listTemporaryThreads().length, retained ? 1 : 0, JSON.stringify(f.harness.events));
+        assert.equal(f.harness.events.includes("status-menu"), false);
+        await f.click(cancel);
+        assert.equal(attempts, 1, "an old callback cannot repeat the tab deletion or the private retention");
+        assert.equal(f.journal.read().operatorDispositions?.filter(value => value.updateId === 123).length, 1);
       } finally { await f.stop(); }
     });
   });
@@ -14522,4 +14630,82 @@ test("Routing refuses Thinking menu callbacks while the active turn replies by v
   voice = false;
   await click("text");
   assert.ok(harness.events.includes("answer:This model has no reasoning controls"), harness.events.join("\n"));
+});
+
+test("Routing expiry reports undelivered input when the chooser message is gone", async (t) => {
+  for (const scenario of ["gone", "selected", "chooser-present", "no-target", "epoch-loss", "session-loss", "send-failure", "not-expired", "duplicate"] as const) {
+    await t.test(scenario, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pi-telegram-expiry-visibility-"));
+      const threads = Threads.createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+      await threads.load();
+      // The expired chooser's tab may be gone; only a current owned Thread is a legitimate fallback, never All.
+      if (scenario !== "no-target") {
+        threads.upsert({ profileKey: "cwd:/repo", instanceId: "leader", target: { chatId: 7, threadId: 44 },
+          status: "active", createdAtMs: 1, updatedAtMs: 1 });
+        await threads.persist();
+      }
+      const texts: string[] = [];
+      let epoch = "epoch", generation = 1, current = true, expirations = 0, edits = 0, apiCalls = 0;
+      const harness = createRouteHarness({
+        instanceId: "leader", threadStore: threads,
+        getAdmissionJournalBinding: () => "journal:expiry",
+        getSessionGeneration: () => generation,
+        getCurrentLeaderEpoch: () => epoch,
+        isContextActive: () => true,
+        async runWorkspaceOperation(_meta, run) { return run(); },
+        async sendTextReply(chatId, replyTo, text, options) {
+          options?.assertAuthority?.();
+          assert.equal(chatId, 7);
+          assert.equal(replyTo, 0, "the expired original is not a usable reply anchor");
+          assert.deepEqual(options?.target, { chatId: 7, threadId: 44 });
+          texts.push(text);
+          if (scenario === "send-failure") throw new Error("notice acknowledgement unavailable");
+          return 1;
+        },
+        async editInteractiveMessage(_chat, id, _text, _mode, _markup, options) {
+          options?.assertAuthority?.();
+          assert.equal(id, 500, "cold expiry uses the journal's saved chooser, not only a warm map");
+          edits++;
+          if (scenario === "epoch-loss") epoch = "replacement";
+          if (scenario === "session-loss") generation++;
+          if (scenario !== "chooser-present") throw new Error("message to edit not found");
+        },
+        async callApi<TResponse>() { apiCalls++; return true as TResponse; },
+        recordRuntimeEvent: () => undefined,
+      });
+      try {
+        const source = {
+          original: {
+            updateId: 100, admittedAtMs: 1, state: "pending",
+            update: { update_id: 100, message: { message_id: 100, chat: { id: 7, type: "private" },
+              from: { id: 7, is_bot: false }, text: "voice prompt" } },
+            routingInput: { operatorUserId: 7, publishedAtMs: 1, expiresAtMs: 2,
+              phase: scenario === "selected" ? "selected" : "waiting",
+              chooser: { chatId: 7, threadId: 42, messageId: 500 } },
+          },
+          journalBindingKey: "journal:expiry", isCurrent: () => current,
+          expire() { expirations++; current = false; return scenario === "not-expired" ? undefined : { kind: "expired" }; },
+        } as unknown as Parameters<typeof harness.routeRuntime.expireRoutingInput>[0];
+        await harness.routeRuntime.expireRoutingInput(source, { cwd: "/repo" }, new AbortController().signal);
+        if (scenario === "duplicate") {
+          current = true;
+          const sibling = { ...source, original: { ...source.original, updateId: 101 } };
+          await harness.routeRuntime.expireRoutingInput(sibling, { cwd: "/repo" }, new AbortController().signal);
+        }
+        const suppressed = ["chooser-present", "no-target", "epoch-loss", "session-loss", "not-expired"].includes(scenario);
+        assert.equal(texts.length, suppressed ? 0 : 1, JSON.stringify({ scenario, texts }));
+        if (scenario === "gone") {
+          assert.ok(texts.some(text => /not delivered|was not delivered/i.test(text)),
+            `expected a visible notice that the input was not delivered, got ${JSON.stringify(texts)}`);
+        }
+        if (scenario === "selected") {
+          assert.match(texts[0]!, /delivery.*unconfirmed/i);
+          assert.doesNotMatch(texts[0]!, /not delivered/i, "donor expiry cannot revoke or deny recipient acceptance");
+        }
+        assert.equal(expirations, scenario === "duplicate" ? 2 : 1);
+        assert.equal(edits, scenario === "not-expired" ? 0 : 1);
+        assert.equal(apiCalls, 0, "a missing chooser is not permission to delete or probe an unowned tab");
+      } finally { await rm(dir, { recursive: true, force: true }); }
+    });
+  }
 });

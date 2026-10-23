@@ -5149,6 +5149,7 @@ test("Leader assembly serializes follower provisioning through its shared Worksp
 test("Workspace rotation integrates leader and follower allocation without bypassing admission", async (t) => {
   for (const scenario of ["leader", "followers", "already-absent", "protected", "unknown-delete"] as const) {
     await t.test(scenario, async () => {
+      const protocol = createTelegramBusProtocolIdentity({ runtimeBuild: "test", capabilities: [...TEST_BUS_PROTOCOL_IDENTITY.capabilities, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE] });
       const dir = mkdtempSync(join(tmpdir(), "pi-telegram-rotation-"));
       const socketPath = join(dir, "bus.sock");
       const admission = createTelegramWorkspaceAdmissionLedger({
@@ -5164,6 +5165,7 @@ test("Workspace rotation integrates leader and follower allocation without bypas
           ...createTelegramWorkspaceBindingIdentity(`/old/${index}`, 0, "old-session")!,
           target: { chatId: 7, threadId: 100 + index }, slot: String.fromCharCode(65 + index),
           inactiveSinceMs: index === 1 ? 1 : index + 100, updatedAtMs: 200,
+          threadName: `Workspace${index}`, displayTitle: String.fromCharCode(65 + index),
           journalBindingKeys: [], journalBindingsComplete: true,
         });
       }
@@ -5173,11 +5175,12 @@ test("Workspace rotation integrates leader and follower allocation without bypas
       const effects: string[] = [];
       const runtime = createTelegramBusLeaderRuntimeAssembly({
         runtime: { socketPath, followerRegistry: createTelegramBusFollowerRegistry(),
-          protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY, startPolling() {}, stopPolling() {} },
+          protocolIdentity: protocol, startPolling() {}, stopPolling() {} },
         getAllowedUserId: () => allowedUserId, instanceId: "leader",
         getCwd: () => scenario === "leader" ? "/fresh-leader" : undefined,
         getSessionId: () => "fresh-session",
         topicTargetStore: store, getCurrentLeaderEpoch: () => 1,
+        ...(scenario === "protected" ? { getThreadDisplayMode: () => "letters" as const } : {}),
         getWorkspaceAdmission: () => admission, runWorkspaceOperation: operations.run,
         captureWorkspaceExternalProtection: () => ({ liveOwner: "clear",
           acceptedWork: scenario === "protected" ? "protected" : "clear", deliveryAuthority: "clear" }),
@@ -5195,7 +5198,11 @@ test("Workspace rotation integrates leader and follower allocation without bypas
             );
           },
         },
-        async callApi<TResponse>(method: string) {
+        async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+          if (method === "editForumTopic" && Number(body.message_thread_id) < 126) {
+            assert.ok(admission.read().leases.length > 0, "display repair uses fresh profile admission");
+            effects.push(`edit:${body.message_thread_id}:${body.name}`);
+          }
           if (method === "createForumTopic") {
             assert.equal(admission.read().fence, undefined);
             assert.ok(admission.read().leases.length > 0);
@@ -5211,7 +5218,7 @@ test("Workspace rotation integrates leader and follower allocation without bypas
         sendTelegramBusLocalEnvelope({ socketPath, envelope: {
           kind: restore ? "follower.restoreWorkspace" : "follower.register", requestId: `register:${instanceId}`,
           registration: { instanceId, cwd, sessionId, registrationGeneration: `${instanceId}:1`,
-            connectedAtMs: 1, protocol: TEST_BUS_PROTOCOL_IDENTITY },
+            connectedAtMs: 1, protocol },
         } });
       try {
         await runtime.startPolling("ctx");
@@ -5224,18 +5231,20 @@ test("Workspace rotation integrates leader and follower allocation without bypas
           assert.equal(restore?.kind === "bus.ack" && restore.ok, false);
           assert.deepEqual(effects, []);
           const reuse = await register("reuse", false, "/old/25", "old-session");
-          assert.equal(reuse?.kind === "bus.ack" && reuse.ok, true);
+          assert.equal(reuse?.kind === "bus.ack" && reuse.ok, true, JSON.stringify(reuse));
           assert.deepEqual(effects, []);
           const responses = await Promise.all([register("first"), register("second")]);
           if (scenario === "followers" || scenario === "already-absent" || scenario === "protected") {
             assert.ok(responses.every((response) => response?.kind === "bus.ack" && response.ok));
             // Fully protected capacity deletes nothing: the oldest letters are reassigned as metadata.
-            assert.deepEqual(effects, scenario === "protected" ? ["create", "create"] : ["delete:101", "create", "delete:100", "create"]);
+            assert.deepEqual(effects, scenario === "protected" ? ["edit:101:Workspace1", "create", "edit:100:Workspace0", "create"] : ["delete:101", "create", "delete:100", "create"]);
             assert.equal(store.getWorkspaceBinding("/fresh/first", "a", "fresh-session")?.slot, "B");
             assert.equal(store.getWorkspaceBinding("/fresh/second", "a", "fresh-session")?.slot, "A");
             if (scenario === "protected") {
               assert.equal(store.getWorkspaceBinding("/old/1", "a", "old-session")?.slot, undefined);
               assert.equal(store.getWorkspaceBinding("/old/0", "a", "old-session")?.slot, undefined);
+              assert.equal(store.getWorkspaceBinding("/old/1", "a", "old-session")?.displayTitle, "Workspace1");
+              assert.equal(store.getWorkspaceBinding("/old/0", "a", "old-session")?.displayTitle, "Workspace0");
               assert.equal(admission.read().fence, undefined);
             }
           } else {
@@ -6063,6 +6072,56 @@ test("Same-cwd followers keep sticky directory labels until manual rename overri
     assert.equal(registry.get("follower")?.threadName, "extensions_b");
     assert.equal(titles.at(-1), "extensions_b");
     assert.equal(store.getWorkspaceBinding(cwd)?.showSlotSuffix, true);
+  } finally {
+    await runtime.stopPolling();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Leader display repair recovers a cold slotless binding without granting it routing ownership", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-slotless-display-"));
+  const path = join(dir, "state.json");
+  const original = createTelegramTopicTargetStore({ path });
+  original.upsertWorkspaceBinding({
+    ...createTelegramWorkspaceBindingIdentity("/retained")!,
+    target: { chatId: 7, threadId: 42 }, threadName: "Anchor", displayTitle: "A", updatedAtMs: 1,
+  });
+  await original.persist();
+  const store = createTelegramTopicTargetStore({ path });
+  await store.load();
+  let reject = true;
+  let epoch: number | undefined = 1;
+  const calls: string[] = [];
+  const runtime = createTelegramBusLeaderRuntimeAssembly({
+    runtime: { socketPath: join(dir, "bus.sock"), followerRegistry: createTelegramBusFollowerRegistry(),
+      protocolIdentity: TEST_BUS_PROTOCOL_IDENTITY, startPolling() {}, stopPolling() {} },
+    instanceId: "leader", getAllowedUserId: () => undefined, getCurrentLeaderEpoch: () => epoch,
+    getThreadDisplayMode: () => "letters", topicTargetStore: store,
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      assert.equal(method, "editForumTopic");
+      assert.equal(body.message_thread_id, 42);
+      calls.push(String(body.name));
+      if (reject) throw new Error("title acknowledgement unavailable");
+      return true as TResponse;
+    },
+    callMultipart: async () => true, downloadFile: async () => undefined,
+    getSyncState: () => ({}), setSyncState() {}, setLeaderTarget() {}, recordRuntimeEvent() {},
+  });
+  try {
+    await assert.rejects(runtime.reconcileThreadDisplay!(), /acknowledgement unavailable/);
+    assert.equal(store.getWorkspaceBinding("/retained")?.displayTitle, "A");
+    reject = false;
+    epoch = undefined;
+    await assert.rejects(runtime.reconcileThreadDisplay!(), /authority/);
+    assert.deepEqual(calls, ["Anchor"]);
+    epoch = 1;
+    assert.deepEqual(await runtime.reconcileThreadDisplay!(), { changed: 1 });
+    assert.deepEqual(calls, ["Anchor", "Anchor"]);
+    const cold = createTelegramTopicTargetStore({ path });
+    await cold.load();
+    assert.equal(cold.getWorkspaceBinding("/retained")?.displayTitle, "Anchor");
+    assert.equal(cold.getWorkspaceBinding("/retained")?.slot, undefined);
+    assert.deepEqual(cold.list(), [], "display repair creates no live owner record");
   } finally {
     await runtime.stopPolling();
     rmSync(dir, { recursive: true, force: true });

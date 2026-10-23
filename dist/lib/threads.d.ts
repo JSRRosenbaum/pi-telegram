@@ -543,7 +543,7 @@ export interface TelegramTopicTargetStore {
         sessionId?: string;
         sessionKey?: string;
         instanceSlot: string;
-        slot: string;
+        slot: string | null;
         bindingKey: string;
         target: {
             chatId: number;

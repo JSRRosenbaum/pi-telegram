@@ -1052,6 +1052,8 @@ export function createTelegramInboundRouteRuntime(deps) {
     /** A frozen destination pauses All-command expiry until routing finishes or releases it. */
     const isPendingRerouteDestinationHeld = (pending) => pending.phase.kind !== "waiting" && pending.phase.kind !== "released";
     const pendingUnboundReroutes = new Map();
+    // Body-free, bounded warm deduplication: album members can expire through the same chooser.
+    const expiredRoutingViews = new Set();
     const implicitThreadCreations = new Map();
     const guidedUnboundTopicKeys = new Set();
     let nextUnboundRerouteId = 0;
@@ -1409,6 +1411,20 @@ export function createTelegramInboundRouteRuntime(deps) {
                         return result;
                     }
                     catch (error) {
+                        const missingTarget = TelegramApi.getTelegramApiErrorRequestTarget(error);
+                        if (method === "deleteForumTopic" && missingTarget && error instanceof Error &&
+                            TelegramApi.isTelegramApiRequestRejected(error, method) &&
+                            TelegramApi.isTelegramStaleTargetHttpError(error) &&
+                            ThreadReconciler.isTelegramTopicDeletedErrorMessage(error.message) &&
+                            missingTarget?.chatId === temporaryCleanup.target?.chatId &&
+                            missingTarget?.threadId === temporaryCleanup.target?.threadId &&
+                            missingTarget?.chatId === body.chat_id && missingTarget?.threadId === body.message_thread_id) {
+                            // Only the client's parsed exact-target HTTP 400 absence closes the one-shot grant.
+                            // Closed/denied/foreign/forged responses remain uncertain and never license another request.
+                            assertExecutionCurrent?.();
+                            temporaryDeleteConfirmed = true;
+                            return true;
+                        }
                         temporaryTransportUncertain = true;
                         throw error;
                     }
@@ -5524,7 +5540,8 @@ export function createTelegramInboundRouteRuntime(deps) {
         return formatTelegramRoutingInputPreview(message);
     };
     const expireRoutingInput = async (source, ctx, signal) => {
-        const operator = deps.configStore.getAllowedUserId(), epoch = deps.getCurrentLeaderEpoch?.();
+        const operator = deps.configStore.getAllowedUserId(), epoch = deps.getCurrentLeaderEpoch?.(), generation = deps.getSessionGeneration?.(), instanceId = deps.getCurrentInstanceId?.(), scope = deps.getAdmissionScope?.();
+        const sendTextReply = deps.sendTextReply, editInteractiveMessage = deps.editInteractiveMessage;
         const message = source.original.update.message;
         const runtimeCurrent = () => !signal.aborted &&
             operator !== undefined &&
@@ -5532,6 +5549,9 @@ export function createTelegramInboundRouteRuntime(deps) {
             deps.isContextActive?.(ctx) === true &&
             deps.configStore.getAllowedUserId() === operator &&
             deps.getCurrentLeaderEpoch?.() === epoch &&
+            deps.getSessionGeneration?.() === generation &&
+            deps.getCurrentInstanceId?.() === instanceId &&
+            deps.getAdmissionScope?.() === scope &&
             deps.getAdmissionJournalBinding?.() === source.journalBindingKey &&
             source.original.routingInput?.operatorUserId === operator &&
             message?.from?.id === operator &&
@@ -5559,27 +5579,73 @@ export function createTelegramInboundRouteRuntime(deps) {
                 return;
             // Expiry revokes the donor carrier; old controls and late ACKs cannot issue another delivery. No body is archived.
             let movedIntoTab = false;
+            let unissued = source.original.routingInput?.phase === "waiting" &&
+                (!temporary || temporary.forwardProtocol === "one-shot-v1") &&
+                ![...(temporary?.forwardedInputs ?? []), ...(temporary?.completedInputs ?? [])].some(input => input.journalBindingKey === source.journalBindingKey && input.updateIds.includes(source.original.updateId));
+            const views = new Map();
+            const chooser = source.original.routingInput?.chooser;
+            if (chooser)
+                views.set(`${chooser.chatId}:${chooser.messageId}`, { ...chooser });
             for (const [id, pending] of pendingUnboundReroutes) {
                 if (!Updates.collectTelegramAdmissionSourceUpdateIds(pending.messages).includes(source.original.updateId))
                     continue;
                 movedIntoTab ||= pending.allTabCopiesForwarded !== undefined;
+                unissued &&= isPendingRerouteUntouched(pending) || pending.phase.kind === "released";
+                if (pending.chooserMessageId !== undefined)
+                    views.set(`${pending.sourceTarget.chatId}:${pending.chooserMessageId}`, {
+                        ...pending.sourceTarget, messageId: pending.chooserMessageId,
+                    });
                 removePendingReroute(id);
-                if (signal.aborted ||
-                    deps.isContextActive?.(ctx) !== true ||
-                    deps.configStore.getAllowedUserId() !== operator ||
-                    deps.getCurrentLeaderEpoch?.() !== epoch ||
-                    deps.getAdmissionJournalBinding?.() !== source.journalBindingKey)
-                    continue;
-                if (deps.editInteractiveMessage &&
-                    pending.chooserMessageId !== undefined) {
+            }
+            const notice = unissued
+                ? "<b>⌛ Routing expired; input was not delivered.</b>"
+                : "<b>⌛ Routing expired; delivery is unconfirmed.</b>\nPreviously accepted work may continue.";
+            const noticeKey = `${source.journalBindingKey}:${source.original.routingInput?.expiresAtMs}:${chooser ? `${chooser.chatId}:${chooser.messageId}` : source.original.updateId}`;
+            if (runtimeCurrent() && !expiredRoutingViews.has(noticeKey)) {
+                if (expiredRoutingViews.size >= 100)
+                    expiredRoutingViews.delete(expiredRoutingViews.values().next().value);
+                expiredRoutingViews.add(noticeKey);
+                let visible = false;
+                const assertNoticeAuthority = () => {
+                    if (!runtimeCurrent())
+                        throw new Error("Routing expiry notice authority changed.");
+                };
+                for (const view of views.values()) {
+                    if (!runtimeCurrent() || !editInteractiveMessage || deps.editInteractiveMessage !== editInteractiveMessage)
+                        break;
+                    if (view.chatId !== message.chat.id || !Number.isSafeInteger(view.threadId) || view.threadId <= 0)
+                        continue;
                     try {
-                        await deps.editInteractiveMessage(pending.sourceTarget.chatId, pending.chooserMessageId, "<b>⌛ Routing choice expired.</b>", "html", { inline_keyboard: [] });
+                        await editInteractiveMessage(view.chatId, view.messageId, notice, "html", { inline_keyboard: [] }, {
+                            target: { chatId: view.chatId, threadId: view.threadId }, assertAuthority: assertNoticeAuthority,
+                        });
+                        visible = true;
                     }
                     catch (error) {
-                        deps.recordRuntimeEvent?.("routing", error, {
-                            phase: "routing-input-expiry-view",
-                        });
+                        deps.recordRuntimeEvent?.("routing", error, { phase: "routing-input-expiry-view" });
                     }
+                }
+                // A temporary tab is about to disappear; a cold/missing chooser also needs an independent owned destination.
+                const leader = instanceId ? deps.threadStore?.getActiveByInstanceId(instanceId) : undefined;
+                if ((!visible || temporary?.target) && runtimeCurrent() && leader &&
+                    leader.target.chatId === message.chat.id && Number.isSafeInteger(leader.target.threadId) && leader.target.threadId > 0) {
+                    const target = { chatId: leader.target.chatId, threadId: leader.target.threadId };
+                    try {
+                        const assertFallback = () => {
+                            assertNoticeAuthority();
+                            const active = deps.threadStore?.getActiveByInstanceId(instanceId);
+                            if (deps.sendTextReply !== sendTextReply || active?.target.chatId !== target.chatId || active.target.threadId !== target.threadId)
+                                throw new Error("Routing expiry notice destination changed.");
+                        };
+                        assertFallback();
+                        await sendTextReply(target.chatId, 0, notice, { parseMode: "HTML", target, assertAuthority: assertFallback });
+                    }
+                    catch (error) {
+                        deps.recordRuntimeEvent?.("routing", error, { phase: "routing-input-expiry-notice" });
+                    }
+                }
+                else if (!visible && runtimeCurrent()) {
+                    deps.recordRuntimeEvent?.("routing", "Routing expiry notice has no current owned Thread.", { phase: "routing-input-expiry-notice-unavailable" });
                 }
             }
             // The scheduled stage captures only context/epoch and a tab token. It reconstructs disposition from body-free proof,

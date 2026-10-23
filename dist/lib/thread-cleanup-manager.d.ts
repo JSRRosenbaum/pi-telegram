@@ -3,7 +3,11 @@
  * Zones: telegram threads, workspace lifecycle
  * Owns fail-closed cleanup eligibility projection without persistence or Bot API effects
  */
-import type { TelegramWorkspaceDeletionPermit, TelegramWorkspaceDestructiveFence, TelegramWorkspaceRetirementFence } from "./workspace-admission.ts";
+import type { TelegramWorkspaceDeletionPermit, TelegramWorkspaceDestructiveFence, TelegramWorkspaceRetirementFence, TelegramWorkspaceAdmissionLedger, TelegramWorkspaceAdmissionOwner } from "./workspace-admission.ts";
+import type { TelegramTopicTargetStore, TelegramWorkspaceThreadBinding } from "./threads.ts";
+import type { TelegramWorkspaceOperationRunner } from "./workspace-retirement.ts";
+import type { TelegramWorkspaceThreadDeletionTransport } from "./telegram-api.ts";
+import type { TelegramProcessLiveness } from "./process-identity.ts";
 export interface TelegramThreadCleanupBindingSnapshot {
     cwd: string;
     workspaceKey: string;
@@ -38,7 +42,8 @@ export interface TelegramThreadCleanupCandidate {
     sessionId?: string;
     sessionKey?: string;
     instanceSlot: string;
-    slot: string;
+    /** Null is explicit absence in reviewed work; it never denotes a reusable letter. */
+    slot: string | null;
     target: {
         chatId: number;
         threadId: number;
@@ -155,6 +160,8 @@ export declare function createTelegramThreadCleanupWorkStore(options: {
     runtimeDir?: string;
     profileName: string;
     tokenSha256: string;
+    /** Exact captured ledger identity; standalone fixtures may use the plain profile identity. */
+    admissionProfileKey?: string;
     maxWorkSets?: number;
     maxBytes?: number;
     getNowMs?: () => number;
@@ -185,6 +192,7 @@ export declare function executeTelegramInactiveThreadCleanup(input: {
 }>;
 export declare function createTelegramThreadCleanupPermitRuntime(deps: {
     ledger: {
+        getProfileKey(): string;
         read(): {
             fence?: TelegramWorkspaceDestructiveFence;
         };
@@ -192,7 +200,7 @@ export declare function createTelegramThreadCleanupPermitRuntime(deps: {
             operationId: string;
             cleanupWorkSetId: string;
             bindingKey: string;
-            slot: string;
+            slot: string | null;
             target: {
                 chatId: number;
                 threadId: number;
@@ -256,6 +264,34 @@ export interface TelegramInactiveThreadCleanupCoordinatorDeps<TBinding> {
     deleteWithPermit(permit: TelegramThreadCleanupDeletionPermit, candidate: TelegramThreadCleanupCandidate): Promise<void>;
     commitBinding(candidate: TelegramThreadCleanupCandidate, currentBinding?: TBinding): Promise<boolean>;
 }
+export interface TelegramInactiveThreadCleanupAuthority {
+    profileName: string;
+    leaderEpoch: number | string;
+    ledger: TelegramWorkspaceAdmissionLedger;
+    isCurrent(): boolean;
+}
+/** Review owns ordinary admission; confirmed cleanup uses the shared gate and its exclusive manual fence instead. */
+export declare function createTelegramInactiveThreadCleanupRuntime(deps: {
+    store: Pick<TelegramTopicTargetStore, "load" | "listWorkspaceBindings" | "listReservations" | "listPendingProvisions" | "listPendingCleanups" | "commitInactiveWorkspaceCleanup">;
+    captureAuthority(): TelegramInactiveThreadCleanupAuthority | undefined;
+    getWorkStore(authority: TelegramInactiveThreadCleanupAuthority): TelegramThreadCleanupWorkStore;
+    getProtection(binding: TelegramWorkspaceThreadBinding): {
+        liveOwner: TelegramThreadCleanupProtectionState;
+        acceptedWork: TelegramThreadCleanupProtectionState;
+        deliveryAuthority: TelegramThreadCleanupProtectionState;
+    };
+    getProcessLiveness(owner: TelegramWorkspaceAdmissionOwner): TelegramProcessLiveness;
+    runExclusive<T>(operation: () => Promise<T>): Promise<T>;
+    runWorkspaceOperation: TelegramWorkspaceOperationRunner;
+    deleteThread: TelegramWorkspaceThreadDeletionTransport;
+    onError?: (error: unknown) => void;
+}): {
+    review(): Promise<{
+        count: number;
+        operationId?: string;
+    }>;
+    clean(operationId: string): Promise<TelegramInactiveThreadCleanupResult>;
+};
 export declare function createTelegramInactiveThreadCleanupSettingsPort<TBinding>(deps: TelegramInactiveThreadCleanupCoordinatorDeps<TBinding>): (operationId: string) => Promise<TelegramInactiveThreadCleanupResult>;
 export interface TelegramInactiveThreadCleanupResult {
     deleted: number;

@@ -22,7 +22,14 @@ import type {
   TelegramWorkspaceDeletionPermit,
   TelegramWorkspaceDestructiveFence,
   TelegramWorkspaceRetirementFence,
+  TelegramWorkspaceAdmissionLedger,
+  TelegramWorkspaceAdmissionOwner,
 } from "./workspace-admission.ts";
+import { isTelegramWorkspaceRetirementFence } from "./workspace-admission.ts";
+import type { TelegramTopicTargetStore, TelegramWorkspaceThreadBinding } from "./threads.ts";
+import type { TelegramWorkspaceOperationRunner } from "./workspace-retirement.ts";
+import type { TelegramWorkspaceThreadDeletionTransport } from "./telegram-api.ts";
+import type { TelegramProcessLiveness } from "./process-identity.ts";
 
 export interface TelegramThreadCleanupBindingSnapshot {
   cwd: string;
@@ -56,7 +63,8 @@ export interface TelegramThreadCleanupCandidate {
   sessionId?: string;
   sessionKey?: string;
   instanceSlot: string;
-  slot: string;
+  /** Null is explicit absence in reviewed work; it never denotes a reusable letter. */
+  slot: string | null;
   target: { chatId: number; threadId: number };
   inactiveSinceMs: number;
   bindingUpdatedAtMs: number;
@@ -116,8 +124,7 @@ export function planTelegramInactiveThreadCleanup(input: {
       !binding.cwd ||
       !binding.workspaceKey ||
       !binding.instanceSlot ||
-      typeof slot !== "string" ||
-      !slot ||
+      (slot !== undefined && (typeof slot !== "string" || !/^[A-Z]$/u.test(slot))) ||
       !validSessionIdentity(binding) ||
       !validTarget(binding.target) ||
       bindingKeys.has(binding.bindingKey) ||
@@ -152,8 +159,6 @@ export function planTelegramInactiveThreadCleanup(input: {
     const inactiveSinceMs = binding.inactiveSinceMs;
     const slot = binding.slot;
     if (
-      typeof slot !== "string" ||
-      !slot ||
       !Number.isSafeInteger(inactiveSinceMs) ||
       inactiveSinceMs === undefined ||
       inactiveSinceMs < 0 ||
@@ -180,7 +185,7 @@ export function planTelegramInactiveThreadCleanup(input: {
         ? { sessionId: binding.sessionId, sessionKey: binding.sessionKey }
         : {}),
       instanceSlot: binding.instanceSlot,
-      slot,
+      slot: slot ?? null,
       target: { ...binding.target },
       inactiveSinceMs,
       bindingUpdatedAtMs: binding.updatedAtMs,
@@ -409,8 +414,7 @@ function validateWorkSet(
       !validSessionIdentity(raw) ||
       typeof raw.instanceSlot !== "string" ||
       !raw.instanceSlot ||
-      typeof raw.slot !== "string" ||
-      !raw.slot ||
+      (raw.slot !== null && (typeof raw.slot !== "string" || !/^[A-Z]$/u.test(raw.slot))) ||
       !isObject(raw.target) ||
       !onlyKeys(raw.target, ["chatId", "threadId"]) ||
       !validTarget(
@@ -509,7 +513,11 @@ function sameCandidates(
   left: readonly TelegramThreadCleanupCandidate[],
   right: readonly TelegramThreadCleanupCandidate[],
 ): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  const keys = ["profileName", "bindingKey", "cwd", "workspaceKey", "sessionId", "sessionKey", "instanceSlot", "slot", "inactiveSinceMs", "bindingUpdatedAtMs"] as const;
+  return left.length === right.length && left.every((candidate, index) => {
+    const other = right[index]!;
+    return keys.every(key => candidate[key] === other[key]) && targetKey(candidate.target) === targetKey(other.target);
+  });
 }
 
 function parseTelegramThreadCleanupWorkFile(
@@ -544,6 +552,8 @@ export function createTelegramThreadCleanupWorkStore(options: {
   runtimeDir?: string;
   profileName: string;
   tokenSha256: string;
+  /** Exact captured ledger identity; standalone fixtures may use the plain profile identity. */
+  admissionProfileKey?: string;
   maxWorkSets?: number;
   maxBytes?: number;
   getNowMs?: () => number;
@@ -680,12 +690,12 @@ export function createTelegramThreadCleanupWorkStore(options: {
           !entry ||
           entry.bindingUpdatedAtMs !== input.bindingUpdatedAtMs ||
           permit.destructiveKind !== "manual-thread-cleanup" ||
-          permit.profileKey !== entry.profileName ||
+          permit.profileKey !== (options.admissionProfileKey ?? entry.profileName) ||
           permit.bindingKey !== entry.bindingKey ||
           permit.slot !== entry.slot ||
           targetKey(permit.target) !== targetKey(entry.target) ||
           !permit.operationId ||
-          !permit.retirementIntentId ||
+          permit.retirementIntentId !== workSet.operationId ||
           !safeTime(permit.issuedAtMs)
         )
           throw new Error(
@@ -842,12 +852,13 @@ export async function executeTelegramInactiveThreadCleanup(input: {
 
 export function createTelegramThreadCleanupPermitRuntime(deps: {
   ledger: {
+    getProfileKey(): string;
     read(): { fence?: TelegramWorkspaceDestructiveFence };
     acquireThreadCleanupFence(input: {
       operationId: string;
       cleanupWorkSetId: string;
       bindingKey: string;
-      slot: string;
+      slot: string | null;
       target: { chatId: number; threadId: number };
       leaderEpoch: number | string;
       cleanupRequestedAtMs: number;
@@ -930,7 +941,7 @@ export function createTelegramThreadCleanupPermitRuntime(deps: {
     const fence = deps.ledger.read().fence;
     return fence?.operationId === operationId &&
       fence.destructiveKind === "manual-thread-cleanup" &&
-      fence.profileKey === candidate.profileName &&
+      fence.profileKey === deps.ledger.getProfileKey() &&
       fence.retirementIntentId === workSetId &&
       fence.bindingKey === candidate.bindingKey &&
       fence.slot === candidate.slot &&
@@ -1045,8 +1056,17 @@ export function createTelegramThreadCleanupPermitRuntime(deps: {
         : { kind: "already-issued" };
     },
     async settleDeleted(fence, commit) {
+      const assertAuthority = () => {
+        const owner = deps.getOwner();
+        if (deps.getLeaderEpoch() !== fence.leaderEpoch ||
+            owner.processId !== fence.owner.processId || owner.processBirthId !== fence.owner.processBirthId)
+          throw new Error("Telegram Thread cleanup settlement authority changed.");
+      };
+      assertAuthority();
       const ready = deps.ledger.confirmThreadCleanupAbsence(fence);
-      if (!(await commit())) return "commit-pending";
+      const committed = await commit();
+      assertAuthority();
+      if (!committed) return "commit-pending";
       deps.ledger.completeThreadCleanupFence(ready);
       return "completed";
     },
@@ -1067,6 +1087,138 @@ export interface TelegramInactiveThreadCleanupCoordinatorDeps<TBinding> {
     candidate: TelegramThreadCleanupCandidate,
     currentBinding?: TBinding,
   ): Promise<boolean>;
+}
+
+export interface TelegramInactiveThreadCleanupAuthority {
+  profileName: string;
+  leaderEpoch: number | string;
+  ledger: TelegramWorkspaceAdmissionLedger;
+  isCurrent(): boolean;
+}
+
+/** Review owns ordinary admission; confirmed cleanup uses the shared gate and its exclusive manual fence instead. */
+export function createTelegramInactiveThreadCleanupRuntime(deps: {
+  store: Pick<TelegramTopicTargetStore, "load" | "listWorkspaceBindings" | "listReservations" | "listPendingProvisions" | "listPendingCleanups" | "commitInactiveWorkspaceCleanup">;
+  captureAuthority(): TelegramInactiveThreadCleanupAuthority | undefined;
+  getWorkStore(authority: TelegramInactiveThreadCleanupAuthority): TelegramThreadCleanupWorkStore;
+  getProtection(binding: TelegramWorkspaceThreadBinding): {
+    liveOwner: TelegramThreadCleanupProtectionState;
+    acceptedWork: TelegramThreadCleanupProtectionState;
+    deliveryAuthority: TelegramThreadCleanupProtectionState;
+  };
+  getProcessLiveness(owner: TelegramWorkspaceAdmissionOwner): TelegramProcessLiveness;
+  runExclusive<T>(operation: () => Promise<T>): Promise<T>;
+  runWorkspaceOperation: TelegramWorkspaceOperationRunner;
+  deleteThread: TelegramWorkspaceThreadDeletionTransport;
+  onError?: (error: unknown) => void;
+}): {
+  review(): Promise<{ count: number; operationId?: string }>;
+  clean(operationId: string): Promise<TelegramInactiveThreadCleanupResult>;
+} {
+  const capture = () => {
+    const authority = deps.captureAuthority();
+    if (!authority || !authority.isCurrent())
+      throw new Error("Inactive Thread cleanup requires current leader authority.");
+    const ledgerKey = authority.ledger.getProfileKey();
+    const owner = authority.ledger.getOwner();
+    const assertCurrent = () => {
+      if (!authority.isCurrent() || authority.ledger.getProfileKey() !== ledgerKey)
+        throw new Error("Inactive Thread cleanup authority changed.");
+    };
+    const evidence = () => {
+      assertCurrent();
+      return captureTelegramInactiveThreadCleanupEvidence({
+        profileName: authority.profileName,
+        listBindings: deps.store.listWorkspaceBindings,
+        getProtection: deps.getProtection,
+        listReservations: deps.store.listReservations,
+        listPendingProvisions: deps.store.listPendingProvisions,
+        listPendingCleanups: deps.store.listPendingCleanups,
+      });
+    };
+    return { authority, owner, assertCurrent, evidence };
+  };
+  return {
+    async review() {
+      const scope = capture();
+      return createTelegramInactiveThreadCleanupReviewRuntime({
+        getProfileName: () => scope.authority.profileName,
+        listBindings: deps.store.listWorkspaceBindings,
+        getProtection: deps.getProtection,
+        listReservations: deps.store.listReservations,
+        listPendingProvisions: deps.store.listPendingProvisions,
+        listPendingCleanups: deps.store.listPendingCleanups,
+        getWorkStore() { scope.assertCurrent(); return deps.getWorkStore(scope.authority); },
+        runWorkspaceOperation(metadata, operation) {
+          return deps.runWorkspaceOperation(metadata, async () => {
+            scope.assertCurrent();
+            await deps.store.load();
+            scope.assertCurrent();
+            return operation();
+          });
+        },
+      }).review();
+    },
+    async clean(operationId) {
+      const scope = capture();
+      return deps.runExclusive(async () => {
+        scope.assertCurrent();
+        const { authority } = scope;
+        const work = deps.getWorkStore(authority);
+        const exactBinding = (candidate: TelegramThreadCleanupCandidate) => {
+          const fresh = planTelegramInactiveThreadCleanup(scope.evidence()).find(binding => binding.bindingKey === candidate.bindingKey);
+          if (!fresh || !sameCandidates([fresh], [candidate])) return undefined;
+          return deps.store.listWorkspaceBindings().find(binding => binding.bindingKey === fresh.bindingKey);
+        };
+        const loadExactBinding = async (candidate: TelegramThreadCleanupCandidate) => {
+          scope.assertCurrent();
+          await deps.store.load();
+          scope.assertCurrent();
+          return exactBinding(candidate);
+        };
+        const permitRuntime = createTelegramThreadCleanupPermitRuntime({
+          ledger: authority.ledger,
+          getLeaderEpoch: () => authority.isCurrent() ? authority.leaderEpoch : undefined,
+          getProfileName: () => authority.profileName,
+          getOwner: () => scope.owner,
+          canAdoptFence: fence => authority.isCurrent() && deps.getProcessLiveness(fence.owner) === "dead",
+          revalidateUnderFence: async candidate => !!(await loadExactBinding(candidate)),
+        });
+        return cleanReviewedInactiveThreads({
+          store: work, operationId, permitRuntime,
+          resolveFullBinding: loadExactBinding,
+          async deleteWithPermit(permit, candidate) {
+            try {
+              await deps.deleteThread(() => {
+                scope.assertCurrent();
+                const fence = authority.ledger.read().fence;
+                if (!fence || !isTelegramWorkspaceRetirementFence(fence) ||
+                    fence.destructiveKind !== "manual-thread-cleanup" || fence.phase !== "deletion-issued" ||
+                    fence.operationId !== permit.operationId || fence.retirementIntentId !== operationId ||
+                    fence.profileKey !== permit.profileKey || fence.bindingKey !== candidate.bindingKey ||
+                    fence.slot !== candidate.slot || fence.deletionIssuedAtMs !== permit.issuedAtMs ||
+                    fence.leaderEpoch !== authority.leaderEpoch || fence.owner.processId !== scope.owner.processId ||
+                    fence.owner.processBirthId !== scope.owner.processBirthId ||
+                    targetKey(fence.target) !== targetKey(permit.target) || !exactBinding(candidate))
+                  throw new Error("Inactive Thread cleanup deletion permit is stale.");
+                return { ...permit.target };
+              });
+              scope.assertCurrent();
+            } catch (error) {
+              deps.onError?.(error);
+              throw error;
+            }
+          },
+          async commitBinding(candidate) {
+            scope.assertCurrent();
+            await deps.store.load();
+            scope.assertCurrent();
+            return deps.store.commitInactiveWorkspaceCleanup(candidate, authority.isCurrent);
+          },
+        });
+      });
+    },
+  };
 }
 
 export function createTelegramInactiveThreadCleanupSettingsPort<TBinding>(
@@ -1105,9 +1257,13 @@ export async function cleanReviewedInactiveThreads<TBinding>(
         entry,
         input.operationId,
       );
-      if (ready)
-        await input.permitRuntime.settleDeleted(ready, async () => true);
-      deleted += 1;
+      if (ready) {
+        const settlement = await input.permitRuntime.settleDeleted(ready, async () => true);
+        if (settlement === "completed") deleted += 1;
+        else outcomeUnknown += 1;
+      } else if (input.permitRuntime.diagnoseRecovery(entry, input.operationId) !== "none") {
+        outcomeUnknown += 1;
+      } else deleted += 1;
       continue;
     }
     if (entry.state === "outcome-unknown") {

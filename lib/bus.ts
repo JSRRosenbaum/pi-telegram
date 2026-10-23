@@ -2873,6 +2873,9 @@ export function isTelegramBusEnvelopeAuthorized(
 }
 
 /** Negative acknowledgement carrying only a diagnostic message. */
+export const TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE =
+  "Telegram bus API call is not allowed for this follower.";
+
 export function rejectTelegramBusRequest(
   requestId: string,
   message: string,

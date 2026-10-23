@@ -874,7 +874,7 @@ export interface TelegramTopicTargetStore {
           sessionId?: string;
           sessionKey?: string;
           instanceSlot: string;
-          slot: string;
+          slot: string | null;
           bindingKey: string;
           target: { chatId: number; threadId: number };
           inactiveSinceMs: number;
@@ -3570,8 +3570,6 @@ export function createTelegramTopicTargetStore(
     >,
     nowMs: number,
     options: {
-      /** Slot equality only counts when the binding itself holds a slot. */
-      requireBindingSlot?: boolean;
       isRetirementExcluded?: (
         intent: TelegramWorkspaceRetirementIntent,
         index: number,
@@ -3579,7 +3577,7 @@ export function createTelegramTopicTargetStore(
     } = {},
   ): boolean => {
     const slotMatches = (slot: string | undefined): boolean =>
-      (!options.requireBindingSlot || !!binding.slot) && slot === binding.slot;
+      !!binding.slot && slot === binding.slot;
     const targetOrSlotMatches = (candidate: {
       target?: TelegramTarget;
       slot?: string;
@@ -7286,7 +7284,7 @@ export function createTelegramTopicTargetStore(
         (!cleanupSnapshot.cwd ||
           !cleanupSnapshot.workspaceKey ||
           !cleanupSnapshot.instanceSlot ||
-          !cleanupSnapshot.slot ||
+          !(cleanupSnapshot.slot === null || (typeof cleanupSnapshot.slot === "string" && /^[A-Z]$/u.test(cleanupSnapshot.slot))) ||
           !cleanupSnapshot.bindingKey ||
           ((cleanupSnapshot.sessionId !== undefined ||
             cleanupSnapshot.sessionKey !== undefined) &&
@@ -7301,7 +7299,7 @@ export function createTelegramTopicTargetStore(
         return false;
       if (
         !cleanupSnapshot &&
-        (!normalized?.slot || normalized.inactiveSinceMs === undefined)
+        (!normalized || normalized.inactiveSinceMs === undefined)
       )
         return false;
       const mapKey = getWorkspaceBindingMapKey(
@@ -7315,7 +7313,7 @@ export function createTelegramTopicTargetStore(
           binding.sessionId === cleanupSessionId &&
           binding.sessionKey === cleanupSessionKey &&
           binding.instanceSlot === cleanupSnapshot.instanceSlot &&
-          binding.slot === cleanupSnapshot.slot &&
+          (binding.slot ?? null) === cleanupSnapshot.slot &&
           binding.bindingKey === cleanupSnapshot.bindingKey &&
           targetMatches(binding.target, cleanupSnapshot.target) &&
           binding.inactiveSinceMs === cleanupSnapshot.inactiveSinceMs &&
@@ -7441,7 +7439,6 @@ export function createTelegramTopicTargetStore(
           binding,
           nowMs,
           {
-            requireBindingSlot: true,
             isRetirementExcluded: (intent) =>
               isDeepStrictEqual(intent, options?.expectedRetirement),
           },

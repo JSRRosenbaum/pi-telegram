@@ -49,7 +49,7 @@ export function buildAutomaticThreadCleanupSettingsText(enabled) {
         "<code>-</code> <code>on</code> (default): delete the bound thread and release Telegram authority on graceful quit.",
         "<code>-</code> <code>off</code>: preserve the tab as a restart hint; manual <code>/telegram-disconnect</code> still confirms and deletes it.",
         "",
-        "Review inactive tabs checks current owner and work evidence. Review never deletes tabs.",
+        "On the leader instance, Review inactive tabs checks current owner and work evidence, including tabs without a letter. Review never deletes tabs.",
     ].join("\n");
 }
 function buildInactiveThreadReviewText(count) {
@@ -58,7 +58,8 @@ function buildInactiveThreadReviewText(count) {
         "",
         `${count} proven inactive tab${count === 1 ? "" : "s"}.`,
         "No tabs were deleted.",
-        "Deletion requires a separate confirmed Clean action.",
+        "Clean inactive tabs deletes these Telegram tabs and all their messages. Pi session history and project files are not removed.",
+        "Clean rechecks owner and work protection; a changed or protected tab is skipped. Choose Back to leave without deleting anything.",
     ].join("\n");
 }
 export function buildInactiveThreadReviewReplyMarkup(operationId, canCleanInactiveThreads = false) {

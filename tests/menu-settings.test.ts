@@ -310,6 +310,7 @@ test("Activity settings expose quiet, thinking, tools, and verbose", () => {
 
 test("Settings callback action mutates live settings and retires stale proactive controls", async () => {
   const calls: string[] = [];
+  const bodies: string[] = [];
   const deps = {
     getVoiceReplyMode: () => "manual" as const,
     isVoiceReplyModeConfigured: () => true,
@@ -348,6 +349,7 @@ test("Settings callback action mutates live settings and retires stale proactive
         recovery: "authority-blocked" as const };
     },
     updateSettingsMessage: async (text: string) => {
+      bodies.push(text);
       calls.push(`update:${text.split("\n")[0]}`);
     },
     answerCallbackQuery: async (_id: string, text?: string) => {
@@ -413,6 +415,10 @@ test("Settings callback action mutates live settings and retires stale proactive
   );
   assert.equal(await handleTelegramSettingsMenuCallbackAction(
     "q8", "settings:review:inactive-threads", deps), true);
+  assert.equal(calls.some(call => call.startsWith("clean:")), false, "preview is not confirmation");
+  assert.match(bodies.at(-1)!, /deletes these Telegram tabs and all their messages/);
+  assert.match(bodies.at(-1)!, /Pi session history and project files are not removed/);
+  assert.match(bodies.at(-1)!, /Choose Back to leave without deleting anything/);
   assert.equal(await handleTelegramSettingsMenuCallbackAction("q9",
     `settings:clean:thread-cleanup:${"a".repeat(32)}`, deps), true);
   assert.equal(

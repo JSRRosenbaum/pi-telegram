@@ -325,5 +325,6 @@ export declare function createTelegramWorkspaceSlotRotation(input: TelegramWorks
     getLeaderEpoch: () => number | string | undefined;
     getExternalProtection: (binding: TelegramWorkspaceThreadBinding) => TelegramWorkspaceExternalProtectionEvidence;
     recordEvent: (message: string, details: Record<string, unknown>) => void;
+    onSlotReused?: (bindingKey: string, isCurrent: () => boolean) => Promise<void>;
 }): TelegramWorkspaceCapacityRunner;
 export {};

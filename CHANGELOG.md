@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+## 0.57.7: Routing Cleanup and Recipient Recovery
+
+- `Recipient recovery`: A forwarded input journaled for a follower whose Thread was re-created no longer retries forever against the old Thread. After the leader refuses that reply, the input re-runs once against the follower's current Thread; a second refusal or any other failure keeps the durable retry state, and nothing is dropped.
+- `Transit cleanup`: Cancel remains journal-first when its Telegram view is unavailable. A parsed exact-target deletion/absence response now finishes temporary-tab cleanup instead of retaining a stuck issued entry. Closed, denied, foreign, malformed and forged responses stay protected without retry. Native regressions also prove waiting-tab protection across cold reads and unavailable state, and refusal to cancel custody already handed to a queue.
+- `Routing expiry`: Expired inputs now receive an explicit undelivered/unconfirmed notice even when the chooser message is gone. Cold expiry uses the journal's saved chooser; a disappearing or unavailable view falls back only to the leader's current owned Thread, never All. Selected/issued work is not falsely called undelivered, accepted recipient work continues, and stale authority or failed notices cannot replay input or authorize deletion.
+- `Manual cleanup`: Leader Settings can review and separately confirm deletion of inactive Telegram tabs and their messages, including bindings without a letter. Pi history/project files and replacement letter holders stay untouched. Exact review, live-work protection, profile/session/leader fences and one-shot permits are rechecked; changed/protected tabs are skipped, unknown deletion never repeats and interrupted commits remain recoverable. Review and Back delete nothing.
+- `Thread titles`: Reassigning a letter immediately attempts to retitle the displaced Thread with its retained name, preserving manual titles and all history/work. Slotless bindings participate in later display reconciliation without acquiring routing ownership. Failed or unacknowledged edits keep prior title evidence, record a diagnostic and never undo reuse or delete the Thread.
+
 ## 0.57.6: Stability Hotfix
 
 - `Plain buttons`: A button without a Generative App binding stays an ordinary prompt unless it is a well-formed `app::method` for an installed app. Prompts containing `::` that fail that test (`std::map`, `cargo test a::b(c)`) no longer raise `Malformed Generative App bound action` or retry forever from the journal; bound buttons keep their fail-closed errors.

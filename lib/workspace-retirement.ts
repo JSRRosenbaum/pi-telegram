@@ -1764,6 +1764,8 @@ export async function runTelegramWorkspaceRetirementLifecycle(input: {
               owner,
               leaderEpoch: epoch,
             });
+      if (fence.slot === null)
+        return { kind: "retained", reason: "stale-intent" };
       input.admission.completeRetirementFence(fence);
       return {
         kind: "retired",
@@ -1892,6 +1894,7 @@ export function createTelegramWorkspaceSlotRotation(
       binding: TelegramWorkspaceThreadBinding,
     ) => TelegramWorkspaceExternalProtectionEvidence;
     recordEvent: (message: string, details: Record<string, unknown>) => void;
+    onSlotReused?: (bindingKey: string, isCurrent: () => boolean) => Promise<void>;
   },
 ): TelegramWorkspaceCapacityRunner {
   const requests = createTelegramWorkspaceOperationGate();
@@ -1983,6 +1986,22 @@ export function createTelegramWorkspaceSlotRotation(
             throw new Error("Telegram Workspace rotation lost leader authority.");
           if (reused) {
             if (reused.kind === "reused") {
+              // The store commit is final. Await display repair before the next allocation,
+              // but never roll back or repeat a published reuse after a transport failure.
+              try {
+                await input.onSlotReused?.(reused.bindingKey, isCurrent);
+              } catch (error) {
+                try {
+                  input.recordEvent("Telegram Workspace slot display update failed.", {
+                    slot: reused.slot,
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                } catch {
+                  /* A diagnostic failure grants no rollback or another display attempt. */
+                }
+              }
+              if (!isCurrent())
+                throw new Error("Telegram Workspace rotation lost leader authority.");
               try {
                 input.recordEvent("Telegram Workspace slot reused.", {
                   slot: reused.slot,

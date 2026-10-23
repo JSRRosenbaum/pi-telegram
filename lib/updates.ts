@@ -10495,6 +10495,7 @@ export interface TelegramUpdateAdmissionLifecycleAssemblyDeps<
     | "getRecipientBindingKey"
     | "hasAuthority"
     | "prepareUpdateForExecution"
+    | "recoverRejectedRecipientTarget"
   >;
   leader: {
     resolveBinding: () =>
@@ -10507,6 +10508,9 @@ export interface TelegramUpdateAdmissionLifecycleAssemblyDeps<
     isRegistered: () => boolean;
     getGeneration: () => string | undefined;
     prepareUpdateForExecution: (update: TUpdate) => TUpdate;
+    recoverRejectedRecipientTarget?: NonNullable<
+      TelegramUpdateAdmissionWorkerRuntimeDeps<TUpdate, TContext>["recoverRejectedRecipientTarget"]
+    >;
     /** Session succession before worker creation, under the exact generation-fenced binding. */
     prepareBinding?: (
       binding: TelegramUpdateAdmissionLifecycleJournalBinding & {
@@ -10531,6 +10535,13 @@ export type TelegramUpdateAdmissionWorkerRuntimeDeps<
     execution?: TelegramUpdateExecutionFence,
   ) => Promise<void>;
   prepareUpdateForExecution?: (update: TUpdate) => TUpdate;
+  /**
+   * Recipient-only recovery for a journaled message whose own Thread changed (for example after its Thread was re-created):
+   * classifies a leader refusal of a reply to the original Thread and returns that Thread plus the owner's current one.
+   */
+  recoverRejectedRecipientTarget?: (error: unknown) =>
+    | { rejected: { chatId: number; threadId: number }; current: TelegramTarget & { threadId: number } }
+    | undefined;
   registry?: TelegramUpdateHandlerRegistry;
 };
 
@@ -10657,12 +10668,14 @@ export function createTelegramUpdateAdmissionWorkerRuntime<
       const typedUpdate = update as TUpdate;
       const prepared = deps.prepareUpdateForExecution?.(typedUpdate) ?? typedUpdate;
       // Journal/source evidence remains the original; only the warm released handler projection changes destination.
-      const routed = target ? { ...prepared,
-        ...(prepared.message ? { message: prepared.message.message_thread_id === target.threadId ? { ...prepared.message }
-          : withoutTelegramTurnReplyAnchor({ ...prepared.message, message_thread_id: target.threadId, reply_to_message: undefined }) } : {}),
-        ...(prepared.edited_message ? { edited_message: prepared.edited_message.message_thread_id === target.threadId ? { ...prepared.edited_message }
-          : withoutTelegramTurnReplyAnchor({ ...prepared.edited_message, message_thread_id: target.threadId, reply_to_message: undefined }) } : {}),
-      } as TUpdate : prepared;
+      // Journal/source evidence remains the original; only the warm released handler projection changes destination.
+      const projectTo = (destination: TelegramTarget & { threadId: number }): TUpdate => ({ ...prepared,
+        ...(prepared.message ? { message: prepared.message.message_thread_id === destination.threadId ? { ...prepared.message }
+          : withoutTelegramTurnReplyAnchor({ ...prepared.message, message_thread_id: destination.threadId, reply_to_message: undefined }) } : {}),
+        ...(prepared.edited_message ? { edited_message: prepared.edited_message.message_thread_id === destination.threadId ? { ...prepared.edited_message }
+          : withoutTelegramTurnReplyAnchor({ ...prepared.edited_message, message_thread_id: destination.threadId, reply_to_message: undefined }) } : {}),
+      } as TUpdate);
+      const routed = target ? projectTo(target) : prepared;
       try {
         return await executeUpdate(
           routed,
@@ -10672,6 +10685,17 @@ export function createTelegramUpdateAdmissionWorkerRuntime<
       } catch (error) {
         if (await deps.settleTerminalExecutionFailure?.(error)) {
           return { kind: "complete" };
+        }
+        // The leader refused a reply to a Thread this recipient no longer owns (re-created after the input was journaled).
+        // Re-run once against its current Thread; any other failure, or a second refusal, keeps the ordinary retry state.
+        const recovery = !target ? deps.recoverRejectedRecipientTarget?.(error) : undefined;
+        const message = prepared.message ?? prepared.edited_message;
+        if (recovery && message && message.message_thread_id === recovery.rejected.threadId &&
+            message.chat?.id === recovery.rejected.chatId && recovery.current.chatId === recovery.rejected.chatId &&
+            recovery.current.threadId !== recovery.rejected.threadId) {
+          deps.recordRuntimeEvent?.("inbound-worker", error, { phase: "recipient-target-recovery", updateId: update.update_id,
+            chatId: recovery.current.chatId, staleThreadId: recovery.rejected.threadId, threadId: recovery.current.threadId });
+          return await executeUpdate(projectTo(recovery.current), ctx, signal);
         }
         throw error;
       }
@@ -10753,6 +10777,9 @@ export function createTelegramUpdateAdmissionLifecycleAssembly<
         spendHistoricalInput: undefined,
         onHeldSourcesPrepared: undefined,
         prepareUpdateForExecution: deps.follower.prepareUpdateForExecution,
+        ...(deps.follower.recoverRejectedRecipientTarget
+          ? { recoverRejectedRecipientTarget: deps.follower.recoverRejectedRecipientTarget }
+          : {}),
       });
     },
     recordRuntimeEvent: deps.recordRuntimeEvent,

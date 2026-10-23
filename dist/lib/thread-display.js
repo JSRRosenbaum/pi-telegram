@@ -123,9 +123,14 @@ export function resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBinding
         if (manualName) {
             labels.set(binding.bindingKey, boundedLabel(manualName));
         }
+        else if (!slot) {
+            // A displaced binding retains its generated identity, not the letter now owned elsewhere.
+            const name = binding.threadName ? labelText(binding.threadName) : undefined;
+            if (name)
+                labels.set(binding.bindingKey, boundedLabel(name));
+        }
         else if (mode === "letters") {
-            if (slot)
-                labels.set(binding.bindingKey, slot);
+            labels.set(binding.bindingKey, slot);
         }
         else if (mode === "names") {
             const name = binding.threadName ? labelText(binding.threadName) : slot;
@@ -142,8 +147,6 @@ export function resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBinding
                     bindings.filter((candidate) => candidate.cwd === binding.cwd)
                         .length > 1
                 : (liveDirectoryCounts.get(binding.cwd) ?? 0) > 1;
-            if (showSuffix && !slot)
-                continue;
             const suffix = !showSuffix
                 ? ""
                 : mode === "directory-title"
@@ -239,7 +242,7 @@ export function createTelegramThreadDisplaySettingsRuntime(deps) {
 /** Caller owns triggering and reporting; no timer or background retry is created. */
 export function createTelegramThreadDisplayReconciler(deps) {
     let tail = Promise.resolve();
-    const apply = async () => {
+    const apply = async (bindingKey) => {
         const epoch = deps.getLeaderEpoch();
         const profile = deps.getProfileKey();
         const mode = deps.getMode();
@@ -257,6 +260,8 @@ export function createTelegramThreadDisplayReconciler(deps) {
         const titles = resolveTelegramWorkspaceDisplayNames(bindings, mode, liveBindingKeys);
         let changed = 0;
         for (const binding of bindings) {
+            if (bindingKey !== undefined && binding.bindingKey !== bindingKey)
+                continue;
             const isBindingCurrent = deps.captureBindingAuthority(binding);
             if (!isBindingCurrent)
                 continue;
@@ -275,12 +280,14 @@ export function createTelegramThreadDisplayReconciler(deps) {
             assertBinding(binding);
             if ((binding.displayTitle ?? binding.threadName) === title)
                 continue;
-            await deps.callApi("editForumTopic", {
+            const acknowledged = await deps.callApi("editForumTopic", {
                 chat_id: binding.target.chatId,
                 message_thread_id: binding.target.threadId,
                 name: title,
             }, { maxAttempts: 1 });
             assertBinding(binding);
+            if (acknowledged !== true)
+                throw new Error("Telegram Thread display update was not acknowledged.");
             if (!deps.store.setWorkspaceDisplayTitle(binding, title)) {
                 throw new Error("Telegram Thread display binding changed before title commit.");
             }
@@ -296,8 +303,8 @@ export function createTelegramThreadDisplayReconciler(deps) {
         return { changed };
     };
     return {
-        reconcile() {
-            const run = tail.then(apply);
+        reconcile(bindingKey) {
+            const run = tail.then(() => apply(bindingKey));
             tail = run.catch(() => undefined);
             return run;
         },

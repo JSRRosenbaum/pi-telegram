@@ -187,7 +187,8 @@ interface TelegramWorkspaceRetirementFenceBase {
   retirementIntentId: string;
   profileKey: string;
   bindingKey: string;
-  slot: string;
+  /** Null is admitted only for explicit manual cleanup of a slotless binding. */
+  slot: string | null;
   target: TelegramTarget & { threadId: number };
   leaderEpoch: number | string;
   retirementRequestedAtMs: number;
@@ -228,7 +229,7 @@ export interface TelegramWorkspaceDeletionPermit {
   readonly retirementIntentId: string;
   readonly profileKey: string;
   readonly bindingKey: string;
-  readonly slot: string;
+  readonly slot: string | null;
   readonly target: TelegramTarget & { threadId: number };
   readonly leaderEpoch: number | string;
   readonly issuedAtMs: number;
@@ -376,7 +377,7 @@ export interface TelegramWorkspaceAdmissionLedger {
     operationId: string;
     cleanupWorkSetId: string;
     bindingKey: string;
-    slot: string;
+    slot: string | null;
     target: TelegramTarget & { threadId: number };
     leaderEpoch: number | string;
     cleanupRequestedAtMs: number;
@@ -538,8 +539,8 @@ function normalizeFence(
     !isBoundedText(value.retirementIntentId) ||
     value.profileKey !== profileKey ||
     !isBoundedText(value.bindingKey) ||
-    typeof value.slot !== "string" ||
-    !/^[A-Z]$/u.test(value.slot) ||
+    !((typeof value.slot === "string" && /^[A-Z]$/u.test(value.slot)) ||
+      (value.destructiveKind === "manual-thread-cleanup" && value.slot === null)) ||
     !target ||
     !isLeaderEpoch(value.leaderEpoch) ||
     !isSafeTimestamp(value.retirementRequestedAtMs) ||
@@ -1869,7 +1870,7 @@ export function createTelegramWorkspaceAdmissionLedger(
       operationId: string;
       retirementIntentId: string;
       bindingKey: string;
-      slot: string;
+      slot: string | null;
       target: TelegramTarget & { threadId: number };
       leaderEpoch: number | string;
       retirementRequestedAtMs: number;
@@ -2307,7 +2308,7 @@ export function createTelegramWorkspaceAdmissionLedger(
     }),
     listReservedSlots: () => {
       const fence = read().fence;
-      return fence && isTelegramWorkspaceRetirementFence(fence)
+      return fence && isTelegramWorkspaceRetirementFence(fence) && fence.slot !== null
         ? [fence.slot]
         : [];
     },

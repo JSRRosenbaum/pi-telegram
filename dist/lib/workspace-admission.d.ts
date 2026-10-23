@@ -61,7 +61,8 @@ interface TelegramWorkspaceRetirementFenceBase {
     retirementIntentId: string;
     profileKey: string;
     bindingKey: string;
-    slot: string;
+    /** Null is admitted only for explicit manual cleanup of a slotless binding. */
+    slot: string | null;
     target: TelegramTarget & {
         threadId: number;
     };
@@ -93,7 +94,7 @@ export interface TelegramWorkspaceDeletionPermit {
     readonly retirementIntentId: string;
     readonly profileKey: string;
     readonly bindingKey: string;
-    readonly slot: string;
+    readonly slot: string | null;
     readonly target: TelegramTarget & {
         threadId: number;
     };
@@ -205,7 +206,7 @@ export interface TelegramWorkspaceAdmissionLedger {
         operationId: string;
         cleanupWorkSetId: string;
         bindingKey: string;
-        slot: string;
+        slot: string | null;
         target: TelegramTarget & {
             threadId: number;
         };

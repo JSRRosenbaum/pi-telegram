@@ -505,6 +505,17 @@ export declare class TelegramApiStaleTargetError extends Error {
         threadId: number;
     });
 }
+/** The leader's exact refusal of a follower API call outside that follower's own Thread; carries only the requested target. */
+export declare class TelegramApiFollowerNotAllowedError extends Error {
+    readonly requestTarget: {
+        chatId: number;
+        threadId: number;
+    } | undefined;
+    constructor(message: string, requestTarget?: {
+        chatId: number;
+        threadId: number;
+    });
+}
 export declare function getTelegramApiErrorRequestTarget(error: unknown): {
     chatId: number;
     threadId: number;

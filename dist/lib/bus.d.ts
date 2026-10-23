@@ -744,6 +744,7 @@ export declare function createTelegramBusLiveRebindController(deps: {
 })) => Promise<TelegramBusLiveRebindSaveObservation | TelegramBusLiveRebindApplyObservation | TelegramBusLiveRebindSettlementObservation | TelegramBusLiveRebindWorkObservation | TelegramBusLiveRebindCommandObservation | undefined>;
 export declare function isTelegramBusEnvelopeAuthorized(envelope: TelegramBusEnvelope, secret: string | undefined): boolean;
 /** Negative acknowledgement carrying only a diagnostic message. */
+export declare const TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE = "Telegram bus API call is not allowed for this follower.";
 export declare function rejectTelegramBusRequest(requestId: string, message: string): Extract<TelegramBusEnvelope, {
     kind: "bus.ack";
 }>;

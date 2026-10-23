@@ -193,13 +193,21 @@ test("Directory labels are bounded without splitting surrogate pairs or losing s
   }
 });
 
-test("Missing slots and ambiguous names do not fabricate a routable display identity", () => {
+test("Slotless bindings use their retained name rather than an obsolete letter or suffix", () => {
+  for (const mode of ["letters", "names", "directories", "directory-snake", "directory-title"] as const) {
+    assert.equal(resolveTelegramWorkspaceDisplayNames([
+      { ...bindings[0], slot: undefined, showSlotSuffix: true },
+    ], mode).get("one"), "Anchor", mode);
+    assert.equal(resolveTelegramWorkspaceDisplayNames([
+      { ...bindings[0], slot: undefined, manualThreadName: "Custom" },
+    ], mode).get("one"), "Custom", mode);
+  }
+});
+
+test("Missing display identity and ambiguous names never fabricate a label", () => {
   assert.equal(resolveTelegramWorkspaceDisplayNames([
-    { ...bindings[0], slot: undefined },
+    { ...bindings[0], slot: undefined, threadName: undefined },
   ], "letters").size, 0);
-  assert.equal(resolveTelegramWorkspaceDisplayNames([
-    { ...bindings[0], slot: undefined, showSlotSuffix: true },
-  ], "directories").size, 0);
   assert.equal(resolveTelegramWorkspaceDisplayNames([
     bindings[0], { ...bindings[1], threadName: "Anchor" },
   ], "names").size, 0);
@@ -222,6 +230,7 @@ function harness(cwd = "/repo/extensions") {
     active: true,
     registrationGeneration: 1,
     persistFailure: false,
+    editResult: true as unknown,
     persists: 0,
     calls: [] as string[],
     onEdit: undefined as (() => Promise<void>) | undefined,
@@ -253,7 +262,7 @@ function harness(cwd = "/repo/extensions") {
       assert.equal(options?.maxAttempts, 1);
       state.calls.push(String(body.name));
       await state.onEdit?.();
-      return true as TResponse;
+      return state.editResult as TResponse;
     },
   });
   return { store, state, ...reconciler };
@@ -315,6 +324,16 @@ test("Rejected or unknown edits retain prior title evidence without claiming suc
   assert.equal(fixture.state.persists, 0);
 });
 
+test("Only a positive title acknowledgement can replace stored display evidence", async () => {
+  for (const result of [false, undefined, null, {}, "true"]) {
+    const fixture = harness();
+    fixture.state.editResult = result;
+    await assert.rejects(fixture.reconcile(), /not acknowledged/);
+    assert.equal(fixture.store.listWorkspaceBindings()[0].displayTitle, undefined);
+    assert.equal(fixture.state.persists, 0);
+  }
+});
+
 test("Failed persistence retries acknowledged metadata without another Telegram edit", async () => {
   const fixture = harness();
   fixture.state.persistFailure = true;
@@ -339,6 +358,18 @@ test("Concurrent reconciliation is serialized and uses the committed title", asy
   release();
   assert.deepEqual(await Promise.all([first, second]), [{ changed: 1 }, { changed: 0 }]);
   assert.deepEqual(fixture.state.calls, ["A"]);
+});
+
+test("A targeted slotless reconciliation does not edit unrelated live bindings", async () => {
+  const fixture = harness();
+  const original = fixture.store.listWorkspaceBindings()[0]!;
+  fixture.store.upsertWorkspaceBinding({ ...original, slot: undefined, displayTitle: "A" });
+  const other = createTelegramWorkspaceBindingIdentity("/repo/other")!;
+  fixture.store.upsertWorkspaceBinding({ ...other, target: { chatId: 7, threadId: 43 }, slot: "B", threadName: "Briar", displayTitle: "old", updatedAtMs: 1 });
+  assert.deepEqual(await fixture.reconcile(original.bindingKey), { changed: 1 });
+  assert.deepEqual(fixture.state.calls, ["Anchor"]);
+  assert.equal(fixture.store.listWorkspaceBindings().find(binding => binding.bindingKey === other.bindingKey)?.displayTitle, "old");
+  assert.deepEqual(await fixture.reconcile(original.bindingKey), { changed: 0 });
 });
 
 test("Thread display settings owner clears a retained manual override after mode application", async () => {

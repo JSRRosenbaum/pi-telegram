@@ -148,7 +148,7 @@ import { createTelegramQueueStore, createTelegramActiveTurnStore, type PendingTe
 import { createTelegramBridgeRuntime } from "../lib/runtime.ts";
 import { createTelegramActivityBridgeRuntime, createTelegramActivityPublicationRuntime } from "../lib/activity.ts";
 import { createTelegramDeliveryRuntime } from "../lib/delivery.ts";
-import { createTelegramApiTargetActivityRuntime } from "../lib/telegram-api.ts";
+import { createTelegramApiTargetActivityRuntime, TelegramApiFollowerNotAllowedError } from "../lib/telegram-api.ts";
 import { createTelegramConfigStore } from "../lib/config.ts";
 import { TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS, createTelegramLockRuntime, withTelegramFileTransaction } from "../lib/locks.ts";
 import { createTelegramUpdateJournalBotIdentity, createTelegramUpdateJournalStore,
@@ -4572,6 +4572,40 @@ test("Bus follower API caller preserves structured stale-target evidence", async
       chatId: 1,
       threadId: 2,
     });
+  } finally {
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus follower API caller types the leader's refusal of a foreign Thread with its requested target", async () => {
+  let requestCount = 0;
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-api-not-allowed-"));
+  const socketPath = join(dir, "bus.sock");
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: (envelope) => ({
+      kind: "bus.ack",
+      requestId: envelope.requestId,
+      ok: false,
+      message: "Telegram bus API call is not allowed for this follower.",
+    }),
+  });
+  const callApi = createTelegramBusFollowerApiCaller({
+    socketPath,
+    instanceId: "inst-a",
+    createRequestId: () => `inst-a:not-allowed:${++requestCount}`,
+    getRegistrationGeneration: () => "generation-a",
+  });
+  try {
+    await server.start();
+    const error = await callApi("call", ["sendMessage", { chat_id: 1, message_thread_id: 2, text: "hello" }])
+      .catch((failure: unknown) => failure);
+    assert.ok(error instanceof TelegramApiFollowerNotAllowedError);
+    assert.deepEqual(error.requestTarget, { chatId: 1, threadId: 2 });
+    const untargeted = await callApi("call", ["getMe", {}]).catch((failure: unknown) => failure);
+    assert.ok(untargeted instanceof TelegramApiFollowerNotAllowedError);
+    assert.equal(untargeted.requestTarget, undefined);
   } finally {
     await server.stop();
     rmSync(dir, { recursive: true, force: true });

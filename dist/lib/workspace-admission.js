@@ -194,8 +194,8 @@ function normalizeFence(value, profileKey) {
         !isBoundedText(value.retirementIntentId) ||
         value.profileKey !== profileKey ||
         !isBoundedText(value.bindingKey) ||
-        typeof value.slot !== "string" ||
-        !/^[A-Z]$/u.test(value.slot) ||
+        !((typeof value.slot === "string" && /^[A-Z]$/u.test(value.slot)) ||
+            (value.destructiveKind === "manual-thread-cleanup" && value.slot === null)) ||
         !target ||
         !isLeaderEpoch(value.leaderEpoch) ||
         !isSafeTimestamp(value.retirementRequestedAtMs) ||
@@ -1442,7 +1442,7 @@ export function createTelegramWorkspaceAdmissionLedger(options) {
         }),
         listReservedSlots: () => {
             const fence = read().fence;
-            return fence && isTelegramWorkspaceRetirementFence(fence)
+            return fence && isTelegramWorkspaceRetirementFence(fence) && fence.slot !== null
                 ? [fence.slot]
                 : [];
         },

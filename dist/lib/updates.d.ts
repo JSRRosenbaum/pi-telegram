@@ -1487,7 +1487,7 @@ export interface TelegramUpdateAdmissionLifecycleAssemblyDeps<TUpdate extends Te
     runtimeBinding: TelegramUpdateAdmissionRuntimeBinding<TContext>;
     inputCustodyBus?: TelegramInputCustodyBusBindingRuntime<TContext>;
     acquireSourceReference?: (role: "leader" | "follower", binding: TelegramUpdateAdmissionLifecycleJournalBinding) => () => void;
-    worker: Omit<TelegramUpdateAdmissionWorkerRuntimeDeps<TUpdate, TContext>, "journal" | "getJournalBindingKey" | "getRecipientBindingKey" | "hasAuthority" | "prepareUpdateForExecution">;
+    worker: Omit<TelegramUpdateAdmissionWorkerRuntimeDeps<TUpdate, TContext>, "journal" | "getJournalBindingKey" | "getRecipientBindingKey" | "hasAuthority" | "prepareUpdateForExecution" | "recoverRejectedRecipientTarget">;
     leader: {
         resolveBinding: () => TelegramUpdateAdmissionLifecycleJournalBinding | undefined;
         hasAuthority: (ctx: TContext) => boolean;
@@ -1497,6 +1497,7 @@ export interface TelegramUpdateAdmissionLifecycleAssemblyDeps<TUpdate extends Te
         isRegistered: () => boolean;
         getGeneration: () => string | undefined;
         prepareUpdateForExecution: (update: TUpdate) => TUpdate;
+        recoverRejectedRecipientTarget?: NonNullable<TelegramUpdateAdmissionWorkerRuntimeDeps<TUpdate, TContext>["recoverRejectedRecipientTarget"]>;
         /** Session succession before worker creation, under the exact generation-fenced binding. */
         prepareBinding?: (binding: TelegramUpdateAdmissionLifecycleJournalBinding & {
             hasAuthority?: () => boolean;
@@ -1508,6 +1509,19 @@ export type TelegramUpdateAdmissionWorkerRuntimeDeps<TUpdate extends TelegramJou
     inputCustody?: TelegramCustodyExecutionJournal;
     defaultHandle: (update: TUpdate, ctx: TContext, execution?: TelegramUpdateExecutionFence) => Promise<void>;
     prepareUpdateForExecution?: (update: TUpdate) => TUpdate;
+    /**
+     * Recipient-only recovery for a journaled message whose own Thread changed (for example after its Thread was re-created):
+     * classifies a leader refusal of a reply to the original Thread and returns that Thread plus the owner's current one.
+     */
+    recoverRejectedRecipientTarget?: (error: unknown) => {
+        rejected: {
+            chatId: number;
+            threadId: number;
+        };
+        current: TelegramTarget & {
+            threadId: number;
+        };
+    } | undefined;
     registry?: TelegramUpdateHandlerRegistry;
 };
 /** Compose source-bound routing and late grouped settlement under one worker. */

@@ -62,7 +62,7 @@ export declare function createTelegramThreadDisplaySettingsRuntime(deps: {
 };
 /** Caller owns triggering and reporting; no timer or background retry is created. */
 export declare function createTelegramThreadDisplayReconciler(deps: TelegramThreadDisplayReconcilerDeps): {
-    reconcile(): Promise<{
+    reconcile(bindingKey?: string): Promise<{
         changed: number;
     }>;
 };

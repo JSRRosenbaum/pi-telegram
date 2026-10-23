@@ -70,6 +70,7 @@ import {
   type TelegramBusSelectedMenuTextEffect,
   type TelegramBusSocketPathSource,
   type TelegramBusWorkspaceRestoreObservation,
+  TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE,
 } from "./bus.ts";
 import type {
   TelegramConfigStore,
@@ -96,6 +97,7 @@ import {
   assertTelegramApiCallAuthority,
   TelegramApiAuthorityError,
   TelegramApiCommitUnknownError,
+  TelegramApiFollowerNotAllowedError,
   TelegramApiStaleTargetError,
   type TelegramApiCallOptions,
 } from "./telegram-api.ts";
@@ -1984,6 +1986,20 @@ export function createTelegramBusFollowerApiCaller(
       throw new TelegramApiCommitUnknownError(
         response.error.method ?? method,
         new Error(message ?? "Telegram bus API call result is ambiguous."),
+      );
+    }
+    if (message === TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE) {
+      const body =
+        (method === "call" || method === "callMultipart") && isRecord(args[1])
+          ? args[1]
+          : undefined;
+      const chatId = Number(body?.chat_id);
+      const threadId = Number(body?.message_thread_id);
+      throw new TelegramApiFollowerNotAllowedError(
+        message,
+        Number.isSafeInteger(chatId) && Number.isSafeInteger(threadId)
+          ? { chatId, threadId }
+          : undefined,
       );
     }
     throw new Error(message ?? "Telegram bus API call failed.");

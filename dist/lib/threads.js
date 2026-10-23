@@ -1871,7 +1871,7 @@ export function createTelegramTopicTargetStore(options) {
     };
     /** Current records, claims, reservations, provisions, cleanups or other retirements still holding a binding's Thread or slot. */
     const isWorkspaceBindingLocallyProtected = (binding, nowMs, options = {}) => {
-        const slotMatches = (slot) => (!options.requireBindingSlot || !!binding.slot) && slot === binding.slot;
+        const slotMatches = (slot) => !!binding.slot && slot === binding.slot;
         const targetOrSlotMatches = (candidate) => (!!candidate.target && targetMatches(candidate.target, binding.target)) ||
             slotMatches(candidate.slot);
         return (Array.from(records.values()).some((record) => ThreadReconciler.isCurrentThreadRecord(record) &&
@@ -4572,7 +4572,7 @@ export function createTelegramTopicTargetStore(options) {
                 (!cleanupSnapshot.cwd ||
                     !cleanupSnapshot.workspaceKey ||
                     !cleanupSnapshot.instanceSlot ||
-                    !cleanupSnapshot.slot ||
+                    !(cleanupSnapshot.slot === null || (typeof cleanupSnapshot.slot === "string" && /^[A-Z]$/u.test(cleanupSnapshot.slot))) ||
                     !cleanupSnapshot.bindingKey ||
                     ((cleanupSnapshot.sessionId !== undefined ||
                         cleanupSnapshot.sessionKey !== undefined) &&
@@ -4585,7 +4585,7 @@ export function createTelegramTopicTargetStore(options) {
                     cleanupSnapshot.target.threadId <= 0))
                 return false;
             if (!cleanupSnapshot &&
-                (!normalized?.slot || normalized.inactiveSinceMs === undefined))
+                (!normalized || normalized.inactiveSinceMs === undefined))
                 return false;
             const mapKey = getWorkspaceBindingMapKey((cleanupSnapshot ?? normalized));
             const binding = workspaceBindings.get(mapKey);
@@ -4597,7 +4597,7 @@ export function createTelegramTopicTargetStore(options) {
                     binding.sessionId === cleanupSessionId &&
                     binding.sessionKey === cleanupSessionKey &&
                     binding.instanceSlot === cleanupSnapshot.instanceSlot &&
-                    binding.slot === cleanupSnapshot.slot &&
+                    (binding.slot ?? null) === cleanupSnapshot.slot &&
                     binding.bindingKey === cleanupSnapshot.bindingKey &&
                     targetMatches(binding.target, cleanupSnapshot.target) &&
                     binding.inactiveSinceMs === cleanupSnapshot.inactiveSinceMs &&
@@ -4714,7 +4714,6 @@ export function createTelegramTopicTargetStore(options) {
             const bindings = inSnapshot(() => Array.from(workspaceBindings.values()).filter((binding) => binding.slot).map((binding) => {
                 const slot = binding.slot.toLowerCase();
                 const locallyProtected = isWorkspaceBindingLocallyProtected(binding, nowMs, {
-                    requireBindingSlot: true,
                     isRetirementExcluded: (intent) => isDeepStrictEqual(intent, options?.expectedRetirement),
                 });
                 const externalProtection = getExternalProtection(cloneWorkspaceBinding(binding));

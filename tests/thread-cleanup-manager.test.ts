@@ -18,13 +18,15 @@ import {
   cleanReviewedInactiveThreads,
   commitTelegramInactiveThreadCleanup,
   createTelegramInactiveThreadCleanupReviewRuntime,
+  createTelegramInactiveThreadCleanupRuntime,
   createTelegramInactiveThreadCleanupSettingsPort,
   createTelegramThreadCleanupPermitRuntime,
   createTelegramThreadCleanupWorkStore,
   executeTelegramInactiveThreadCleanup,
   planTelegramInactiveThreadCleanup,
 } from "../lib/thread-cleanup-manager.ts";
-import { createTelegramWorkspaceAdmissionLedger } from "../lib/workspace-admission.ts";
+import { createTelegramWorkspaceAdmissionLedger, createTelegramWorkspaceAdmissionProfileKey } from "../lib/workspace-admission.ts";
+import { createTelegramTopicTargetStore, createTelegramWorkspaceBindingIdentity } from "../lib/threads.ts";
 import { resolveTelegramServiceJournalStorage, resolveTelegramTempDir } from "../lib/paths.ts";
 
 const binding = {
@@ -115,14 +117,234 @@ test("Cleanup planner admits only exact fully-clear inactive bindings", () => {
   assert.deepEqual(planTelegramInactiveThreadCleanup({
     profileName: "work", bindings: [{ ...binding, inactiveSinceMs: undefined }], protection: [clear],
   }), []);
-  assert.deepEqual(planTelegramInactiveThreadCleanup({
+  assert.equal(planTelegramInactiveThreadCleanup({
     profileName: "work", bindings: [{ ...binding, slot: undefined }], protection: [clear],
-  }), []);
+  })[0]?.slot, null, "a missing letter is explicit metadata, not missing cleanup identity");
   assert.deepEqual(planTelegramInactiveThreadCleanup({
     profileName: "work", bindings: [binding],
     protection: [{ ...clear, liveOwner: "unknown" }],
   }), []);
 });
+
+test("Slotless cleanup preserves inactivity and every independent protection boundary", () => {
+  const slotless = { ...binding, slot: undefined };
+  for (const field of ["liveOwner", "acceptedWork", "deliveryAuthority"] as const) {
+    for (const state of ["protected", "unknown"] as const) {
+      assert.deepEqual(planTelegramInactiveThreadCleanup({
+        profileName: "work", bindings: [slotless], protection: [{ ...clear, [field]: state }],
+      }), []);
+    }
+  }
+  assert.deepEqual(planTelegramInactiveThreadCleanup({
+    profileName: "work", bindings: [{ ...slotless, inactiveSinceMs: undefined }], protection: [clear],
+  }), []);
+  for (const key of ["reservedTargets", "provisioningTargets", "cleanupTargets"] as const) {
+    assert.deepEqual(planTelegramInactiveThreadCleanup({
+      profileName: "work", bindings: [slotless], protection: [clear], [key]: [slotless.target],
+    }), []);
+  }
+  for (const slot of ["", "aa", "a", "?", null]) {
+    assert.deepEqual(planTelegramInactiveThreadCleanup({
+      profileName: "work", bindings: [{ ...binding, slot } as never], protection: [clear],
+    }), [], `malformed stored slot ${slot} is not absence`);
+  }
+});
+
+for (const outcome of ["confirmed", "unknown"] as const) {
+  test(`Slotless cleanup retains exact target and one-shot evidence across cold recovery (${outcome})`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-cleanup-slotless-"));
+    try {
+      const options = { path: join(dir, "state.json"), getNowMs: () => 100 };
+      const threads = createTelegramTopicTargetStore(options);
+      const retained = { ...createTelegramWorkspaceBindingIdentity("/retained")!,
+        target: { chatId: 7, threadId: 42 }, threadName: "Anchor", inactiveSinceMs: 10, updatedAtMs: 20 };
+      const replacement = { ...createTelegramWorkspaceBindingIdentity("/replacement")!,
+        target: { chatId: 7, threadId: 43 }, threadName: "Briar", slot: "A", updatedAtMs: 20 };
+      threads.upsertWorkspaceBinding(retained);
+      threads.upsertWorkspaceBinding(replacement);
+      await threads.persist();
+      const candidate = planTelegramInactiveThreadCleanup({
+        profileName: "work", bindings: [retained], protection: [{ ...clear, bindingKey: retained.bindingKey, target: retained.target }],
+      })[0]!;
+      assert.equal(candidate.slot, null);
+      const workOptions = { path: join(dir, "work.json"), profileName: "work", tokenSha256: "a".repeat(64), getNowMs: () => 100 };
+      const work = createTelegramThreadCleanupWorkStore(workOptions);
+      const operationId = `thread-cleanup:${"d".repeat(32)}`;
+      work.prepare(operationId, [candidate]);
+      assert.throws(() => work.prepare("missing-slot", [{ ...candidate, slot: undefined } as never]), /schema/,
+        "reviewed absence must be explicit, not an omitted field");
+      assert.throws(() => work.recordDeletionIssued({ operationId, bindingKey: candidate.bindingKey,
+        bindingUpdatedAtMs: candidate.bindingUpdatedAtMs,
+        permit: { destructiveKind: "manual-thread-cleanup", operationId: "wrong-letter", retirementIntentId: operationId,
+          profileKey: "work", bindingKey: candidate.bindingKey, slot: "A", target: candidate.target, leaderEpoch: 1, issuedAtMs: 100 } }),
+        /stale or mismatched/, "the recycled letter cannot substitute for the slotless review");
+      const ledgerOptions = { path: join(dir, "ledger.json"), profileKey: "work", owner: cleanupOwner, getNowMs: () => 100 };
+      const ledger = createTelegramWorkspaceAdmissionLedger(ledgerOptions);
+      const permitRuntime = createTelegramThreadCleanupPermitRuntime({ ledger,
+        getLeaderEpoch: () => 1, getProfileName: () => "work", getOwner: () => cleanupOwner, canAdoptFence: () => false,
+        getNowMs: () => 100, async revalidateUnderFence() { return true; } });
+      let deletes = 0;
+      const deps = { store: work, operationId, permitRuntime,
+        async resolveFullBinding() { return threads.getWorkspaceBinding("/retained"); },
+        async deleteWithPermit(permit: { slot: string | null; target: { chatId: number; threadId: number } }) {
+          assert.equal(permit.slot, null);
+          assert.deepEqual(permit.target, retained.target);
+          deletes++;
+          if (outcome === "unknown") throw new Error("lost deletion acknowledgement");
+        },
+        commitBinding: () => threads.commitInactiveWorkspaceCleanup(candidate, () => true),
+      };
+      const first = await cleanReviewedInactiveThreads(deps);
+      assert.equal(deletes, 1);
+      const coldWork = createTelegramThreadCleanupWorkStore(workOptions);
+      const coldLedger = createTelegramWorkspaceAdmissionLedger(ledgerOptions);
+      assert.equal(coldWork.list()[0]?.entries[0]?.slot, null);
+      if (outcome === "confirmed") {
+        assert.equal(first.deleted, 1);
+        assert.equal(ledger.read().fence, undefined);
+        const cold = createTelegramTopicTargetStore(options);
+        await cold.load();
+        assert.equal(cold.getWorkspaceBinding("/retained"), undefined);
+        assert.deepEqual(cold.getWorkspaceBinding("/replacement"), replacement);
+      } else {
+        assert.equal(first.outcomeUnknown, 1);
+        assert.equal(coldLedger.read().fence?.phase, "deletion-issued");
+        assert.deepEqual(coldLedger.listReservedSlots(), [], "no fabricated letter reservation");
+        const result = await cleanReviewedInactiveThreads({ ...deps, store: coldWork });
+        assert.equal(result.outcomeUnknown, 1);
+        assert.ok(threads.getWorkspaceBinding("/retained"));
+      }
+      await cleanReviewedInactiveThreads({ ...deps, store: coldWork });
+      assert.equal(deletes, 1, "cold work cannot authorize a second deletion");
+      assert.equal(threads.getWorkspaceBinding("/replacement")?.slot, "A");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+async function withManualCleanupRuntime(run: (fixture: {
+  runtime: ReturnType<typeof createTelegramInactiveThreadCleanupRuntime>;
+  threads: ReturnType<typeof createTelegramTopicTargetStore>;
+  ledger: ReturnType<typeof createTelegramWorkspaceAdmissionLedger>;
+  state: { epoch: number; protection: "clear" | "protected"; duringFence: boolean; unknownDelete: boolean; lateEpoch: boolean; lateCommit: boolean; noLeader: boolean; loadDrift: boolean; failCommit: boolean; deletes: number; loads: number };
+  rebuild(): ReturnType<typeof createTelegramInactiveThreadCleanupRuntime>;
+}) => Promise<void>): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), "pi-manual-cleanup-runtime-"));
+  try {
+    const state = { epoch: 1, protection: "clear" as "clear" | "protected", duringFence: false,
+      unknownDelete: false, lateEpoch: false, lateCommit: false, noLeader: false, loadDrift: false, failCommit: false, deletes: 0, loads: 0 };
+    const threads = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 100 });
+    threads.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/retained")!,
+      target: { chatId: 7, threadId: 42 }, threadName: "Anchor", inactiveSinceMs: 10, updatedAtMs: 20 });
+    threads.upsertWorkspaceBinding({ ...createTelegramWorkspaceBindingIdentity("/replacement")!,
+      target: { chatId: 7, threadId: 43 }, slot: "A", threadName: "Briar", updatedAtMs: 20 });
+    threads.upsert({ profileKey: "cwd:/unrelated", owner: { kind: "leader", cwd: "/unrelated", instanceId: "unrelated" },
+      instanceId: "unrelated", target: { chatId: 7, threadId: 44 }, status: "active", createdAtMs: 20, updatedAtMs: 20 });
+    await threads.persist();
+    const ledgerOptions = { path: join(dir, "ledger.json"), stateProfile: "work",
+      profileKey: createTelegramWorkspaceAdmissionProfileKey({ profileName: "work", botToken: "fixture" }),
+      owner: cleanupOwner, getNowMs: () => 100 };
+    const ledger = createTelegramWorkspaceAdmissionLedger(ledgerOptions);
+    const rebuild = () => createTelegramInactiveThreadCleanupRuntime({
+      store: { ...threads, async load() { state.loads++; await threads.load(); if (state.loadDrift) state.epoch++; },
+        async commitInactiveWorkspaceCleanup(candidate, current) {
+          if (state.failCommit) throw new Error("commit interrupted");
+          const committed = await threads.commitInactiveWorkspaceCleanup(candidate, current);
+          if (state.lateCommit) state.epoch++;
+          return committed;
+        } },
+      captureAuthority() {
+        if (state.noLeader) return undefined;
+        const epoch = state.epoch;
+        return { profileName: "work", leaderEpoch: epoch, ledger,
+          isCurrent: () => state.epoch === epoch };
+      },
+      getWorkStore(authority) { return createTelegramThreadCleanupWorkStore({ path: join(dir, "work.json"),
+        profileName: "work", tokenSha256: createHash("sha256").update("fixture").digest("hex"),
+        admissionProfileKey: authority.ledger.getProfileKey(), getNowMs: () => 100 }); },
+      getProtection() { return { liveOwner: "clear", acceptedWork: state.duringFence && ledger.read().fence ? "protected" : state.protection, deliveryAuthority: "clear" }; },
+      getProcessLiveness: () => "alive",
+      async runExclusive(operation) { return operation(); },
+      async runWorkspaceOperation(input, operation) {
+        assert.deepEqual(input.scopes, [{ kind: "profile" }]);
+        const acquired = ledger.acquireAdmission({ ...input, scope: { kind: "profile" } });
+        if (acquired.kind !== "acquired") throw new Error("review admission blocked");
+        try { return await operation(); } finally { ledger.releaseAdmission(acquired.lease); }
+      },
+      async deleteThread(authorize) {
+        assert.deepEqual(authorize(), { chatId: 7, threadId: 42 });
+        assert.equal(ledger.read().fence?.phase, "deletion-issued");
+        assert.deepEqual(ledger.read().leases, [], "ordinary review admission ends before the manual fence");
+        state.deletes++;
+        if (state.lateEpoch) state.epoch++;
+        if (state.unknownDelete) throw new Error("delete acknowledgement lost");
+      },
+    });
+    await run({ runtime: rebuild(), threads, ledger, state, rebuild });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+}
+
+test("Manual Settings cleanup reviews without deleting and confirms only the exact slotless target", async () => {
+  await withManualCleanupRuntime(async ({ runtime, threads, state, ledger }) => {
+    const review = await runtime.review();
+    assert.equal(review.count, 1);
+    assert.equal(state.deletes, 0);
+    assert.deepEqual(ledger.read().leases, []);
+    const result = await runtime.clean(review.operationId!);
+    assert.equal(result.deleted, 1);
+    assert.equal(state.deletes, 1);
+    assert.equal(threads.getWorkspaceBinding("/retained"), undefined);
+    assert.equal(threads.getWorkspaceBinding("/replacement")?.slot, "A");
+    assert.equal(threads.list().length, 1, "unrelated slotless live owner is untouched");
+    await runtime.clean(review.operationId!);
+    assert.equal(state.deletes, 1);
+    assert.ok(state.loads >= 3, "review, candidate and fenced revalidation reload the canonical store");
+  });
+});
+
+test("Manual cleanup refuses absent leadership and authority loss during fresh loading", async () => {
+  for (const fault of ["noLeader", "loadDrift"] as const) {
+    await withManualCleanupRuntime(async ({ runtime, state, ledger }) => {
+      const review = await runtime.review();
+      state[fault] = true;
+      await assert.rejects(runtime.clean(review.operationId!), /authority/);
+      assert.equal(state.deletes, 0);
+      assert.equal(ledger.read().fence, undefined);
+    });
+  }
+});
+
+for (const fault of ["protected", "under-fence", "changed-binding", "unknown-delete", "late-epoch", "late-commit", "commit-interrupted"] as const) {
+  test(`Manual Settings cleanup preserves proof and refuses unsafe replay (${fault})`, async () => {
+    await withManualCleanupRuntime(async ({ runtime, threads, ledger, state, rebuild }) => {
+      const review = await runtime.review();
+      if (fault === "protected") state.protection = "protected";
+      if (fault === "under-fence") state.duringFence = true;
+      if (fault === "changed-binding") {
+        threads.upsertWorkspaceBinding({ ...threads.getWorkspaceBinding("/retained")!, slot: "B" });
+        await threads.persist();
+      }
+      if (fault === "unknown-delete") state.unknownDelete = true;
+      if (fault === "late-epoch") state.lateEpoch = true;
+      if (fault === "late-commit") state.lateCommit = true;
+      if (fault === "commit-interrupted") state.failCommit = true;
+      const first = await runtime.clean(review.operationId!);
+      if (["protected", "under-fence", "changed-binding"].includes(fault)) {
+        assert.equal(first.blocked, 1);
+        assert.equal(state.deletes, 0);
+        assert.equal(ledger.read().fence, undefined);
+      } else {
+        assert.equal(first.outcomeUnknown, 1);
+        assert.equal(state.deletes, 1);
+        assert.equal(!!threads.getWorkspaceBinding("/retained"), fault !== "late-commit");
+        state.failCommit = false;
+        const retried = await rebuild().clean(review.operationId!);
+        assert.equal(state.deletes, 1);
+        assert.equal(retried.deleted, fault === "commit-interrupted" ? 1 : 0);
+      }
+      assert.equal(threads.getWorkspaceBinding("/replacement")?.slot, "A");
+    });
+  });
+}
 
 test("Cleanup planner preserves exact session identity and rejects partial or mismatched identity", () => {
   const protection = [{ ...clear, bindingKey: sessionBinding.bindingKey }];

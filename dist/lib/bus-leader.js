@@ -6,7 +6,7 @@
  */
 import { isDeepStrictEqual } from "node:util";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.js";
-import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY, hasTelegramBusSteerQueueHandoffCapability, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, } from "./bus.js";
+import { createTelegramBusLocalServer, createUnauthorizedBusAck, rejectTelegramBusRequest, getTelegramBusEnvelopeTrafficClass, getTelegramBusFollowerSocketPath, getTelegramBusProtocolCompatibility, hasTelegramBusCapability, isTelegramBusEnvelopeAuthorized, parseTelegramBusEnvelope, sendTelegramBusLocalEnvelope, stripTelegramBusApiMetadata, TELEGRAM_BUS_CAPABILITY_DIRECTORY_DISPLAY_FORMAT, TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION, TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF, TELEGRAM_BUS_CAPABILITY_CONNECT_RECOVERY, hasTelegramBusSteerQueueHandoffCapability, TELEGRAM_BUS_CAPABILITY_SELECTED_MENU_DELIVERY, TELEGRAM_BUS_CAPABILITY_SESSION_REPLACEMENT_INTENT, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE, TELEGRAM_BUS_CAPABILITY_PRE_DISPATCH_REBIND, TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT, TELEGRAM_BUS_CAPABILITY_WORKSPACE_RESTORE, TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME, TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE, } from "./bus.js";
 import { escapeHtml } from "./rendering.js";
 import * as Sync from "./sync.js";
 import { parseTelegramIntegerId as asInteger, } from "./target.js";
@@ -136,6 +136,9 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
             store: deps.topicTargetStore,
             getLeaderEpoch: deps.getCurrentLeaderEpoch,
             getExternalProtection: deps.captureWorkspaceExternalProtection,
+            onSlotReused: (bindingKey, isCurrent) => display
+                ? reconcileThreadDisplay(bindingKey, isCurrent).then(() => undefined)
+                : Promise.resolve(),
             recordEvent(message, details) {
                 deps.recordRuntimeEvent("bus", message, details);
             },
@@ -174,6 +177,10 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
             getLeaderEpoch: () => deps.getCurrentLeaderEpoch?.(),
             captureLiveBindingKeys,
             captureBindingAuthority(binding) {
+                // Slotless retained bindings need display repair even without a live owner.
+                // The reconciler still fences the exact binding snapshot, profile, mode and epoch.
+                if (binding.slot === undefined)
+                    return () => true;
                 const matches = (target) => target?.chatId === binding.target.chatId &&
                     target?.threadId === binding.target.threadId;
                 const leader = deps.topicTargetStore.getActiveByInstanceId(deps.instanceId);
@@ -194,16 +201,20 @@ export function createTelegramBusLeaderRuntimeAssembly(deps) {
             callApi: deps.callApi,
         })
         : undefined;
-    const reconcileThreadDisplayOperation = async () => {
-        const result = await display.reconcile();
+    const reconcileThreadDisplayOperation = async (bindingKey) => {
+        const result = await display.reconcile(bindingKey);
         deps.onThreadDisplayChanged?.();
         return result;
     };
-    const reconcileThreadDisplay = () => runWorkspaceOperation({
+    const reconcileThreadDisplay = (bindingKey, isCurrent = () => true) => runWorkspaceOperation({
         operationId: createTelegramWorkspaceAdmissionOperationId(),
         operationKind: "workspace.reconcile-display",
         scopes: [{ kind: "profile" }],
-    }, reconcileThreadDisplayOperation);
+    }, () => {
+        if (!isCurrent())
+            throw new Error("Telegram Thread display update lost allocation authority.");
+        return reconcileThreadDisplayOperation(bindingKey);
+    });
     let startupDisplayTimer;
     let startupDisplayGeneration = 0;
     let startupDisplaySettled = true;
@@ -2759,7 +2770,7 @@ async function handleFollowerApiCall(envelope, deps) {
             method: envelope.method,
             args: envelope.args,
         })) {
-        return rejectTelegramBusRequest(envelope.requestId, "Telegram bus API call is not allowed for this follower.");
+        return rejectTelegramBusRequest(envelope.requestId, TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE);
     }
     if (!deps.callApi) {
         return rejectTelegramBusRequest(envelope.requestId, "Telegram bus leader does not expose API calling.");

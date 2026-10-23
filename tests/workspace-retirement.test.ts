@@ -2164,7 +2164,12 @@ async function withFullPool<T>(
     rotation: ReturnType<typeof createTelegramWorkspaceSlotRotation>;
     claim: () => string | undefined; reserved: { slots: string[] }; epoch: { value: number };
   }) => Promise<T>,
-  options: { inactive?: (index: number) => number | undefined; canPersist?: () => boolean } = {},
+  options: {
+    inactive?: (index: number) => number | undefined;
+    canPersist?: () => boolean;
+    onSlotReused?: (store: TelegramTopicTargetStore, bindingKey: string, path: string) => Promise<void>;
+    recordEvent?: (message: string, details: Record<string, unknown>) => void;
+  } = {},
 ): Promise<T> {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-slot-reuse-")));
   try {
@@ -2182,7 +2187,8 @@ async function withFullPool<T>(
     const rotation = createTelegramWorkspaceSlotRotation({
       store, getAdmission: () => admission, getLeaderEpoch: () => epoch.value,
       runExclusive: createTelegramWorkspaceOperationGate().runExclusive,
-      getExternalProtection: protectedEvidence, recordEvent() {},
+      getExternalProtection: protectedEvidence, recordEvent: options.recordEvent ?? (() => {}),
+      onSlotReused: options.onSlotReused ? (key) => options.onSlotReused!(store, key, join(dir, "state.json")) : undefined,
       async deleteThread() { deletions++; },
     });
     const claim = () => {
@@ -2211,6 +2217,38 @@ test("A full protected pool gives a fresh claim the least recently used letter w
     assert.equal(cold.getWorkspaceBinding("/repo/0")?.target.threadId, victim.target.threadId);
     assert.equal(cold.listWorkspaceBindings().length, 26, "no binding is removed");
   });
+});
+
+test("Published slot reuse awaits its display update before the letter is allocated again", async () => {
+  const effects: string[] = [];
+  await withFullPool(async ({ rotation, claim }) => {
+    assert.equal(await rotation(async () => {
+      const slot = claim();
+      effects.push(`allocate:${slot}`);
+      return slot;
+    }), "A");
+    assert.deepEqual(effects, ["retitle", "allocate:A"]);
+  }, { onSlotReused: async (store, key, path) => {
+    const binding = store.listWorkspaceBindings().find(binding => binding.bindingKey === key)!;
+    assert.equal(binding.slot, undefined);
+    const cold = createTelegramTopicTargetStore({ path });
+    await cold.load();
+    assert.equal(cold.listWorkspaceBindings().find(binding => binding.bindingKey === key)?.slot, undefined);
+    effects.push("retitle");
+  } });
+});
+
+test("A failed display update reports uncertainty without undoing or repeating published reuse", async () => {
+  let updates = 0;
+  const events: string[] = [];
+  await withFullPool(async ({ rotation, claim, store, deletions }) => {
+    assert.equal(await rotation(async () => claim()), "A");
+    assert.equal(updates, 1);
+    assert.equal(deletions(), 0);
+    assert.equal(store.getWorkspaceBinding("/repo/0")?.slot, undefined);
+    assert.ok(events.includes("Telegram Workspace slot display update failed."));
+  }, { onSlotReused: async () => { updates++; throw new Error("unknown edit acknowledgement"); },
+    recordEvent: message => { events.push(message); } });
 });
 
 test("Reuse picks the oldest detached binding rather than the alphabetically first", async () => {

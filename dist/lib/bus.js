@@ -1596,6 +1596,7 @@ export function isTelegramBusEnvelopeAuthorized(envelope, secret) {
     return auth.length === expected.length && timingSafeEqual(auth, expected);
 }
 /** Negative acknowledgement carrying only a diagnostic message. */
+export const TELEGRAM_BUS_FOLLOWER_API_NOT_ALLOWED_MESSAGE = "Telegram bus API call is not allowed for this follower.";
 export function rejectTelegramBusRequest(requestId, message) {
     return { kind: "bus.ack", requestId, ok: false, message };
 }

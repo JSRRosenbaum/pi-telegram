@@ -2710,6 +2710,44 @@ test("Admission worker settles an exactly classified terminal delivery failure",
   await worker.stop();
 });
 
+test("Recipient recovery re-runs a refused reply once against the owner's current Thread", async () => {
+  const stale = { chatId: 7, threadId: 99 }, current = { chatId: 7, threadId: 55 };
+  for (const scenario of ["recovered", "second-refusal", "other-error", "no-recovery"] as const) {
+    const storage = createTestUpdateWorkerJournal([{ update_id: 77, message: { message_id: 5, message_thread_id: 99,
+      chat: { id: 7 }, reply_to_message: { message_id: 4 }, text: "/start" } } as never]);
+    const handled: Array<{ threadId: unknown; reply: unknown }> = [];
+    const recoveries: unknown[] = [];
+    const worker = createTelegramUpdateAdmissionWorkerRuntime({
+      journal: storage.journal,
+      hasAuthority: () => true,
+      recordRuntimeEvent: (_category, _error, details) => { recoveries.push(details); },
+      ...(scenario === "no-recovery" ? {} : {
+        recoverRejectedRecipientTarget: (error: unknown) =>
+          (error as { requestTarget?: unknown }).requestTarget ? { rejected: stale, current } : undefined,
+      }),
+      defaultHandle: async (update) => {
+        const message = update.message as { message_thread_id?: number; reply_to_message?: unknown };
+        handled.push({ threadId: message.message_thread_id, reply: message.reply_to_message });
+        if (scenario === "other-error") throw new Error("transient");
+        if (message.message_thread_id !== 55 || scenario === "second-refusal")
+          throw Object.assign(new Error("Telegram bus API call is not allowed for this follower."), { requestTarget: stale });
+      },
+    });
+    worker.start("ctx");
+    await worker.waitForDrain();
+    if (scenario === "recovered") {
+      assert.deepEqual(handled, [{ threadId: 99, reply: { message_id: 4 } }, { threadId: 55, reply: undefined }]);
+      assert.deepEqual(storage.getUpdateIds(), []);
+      assert.equal(recoveries.length, 1);
+    } else {
+      assert.equal(handled.length, scenario === "second-refusal" ? 2 : 1, scenario);
+      assert.deepEqual(storage.getUpdateIds(), [77], "A failed recovery keeps the durable retry state");
+      assert.equal(storage.getEntries()[0]?.state, "retry-wait");
+    }
+    await worker.stop();
+  }
+});
+
 test("Admission worker preserves retry authority when terminal settlement is rejected", async () => {
   const storage = createTestUpdateWorkerJournal([{ update_id: 76 }]);
   const worker = createTelegramUpdateAdmissionWorkerRuntime({

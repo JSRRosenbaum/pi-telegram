@@ -2,30 +2,22 @@
 
 _This file owns unresolved project work only. Completed behavior belongs in `CHANGELOG.md`; durable contracts belong in `AGENTS.md` and `/docs`._
 
-## Slot reuse follow-up
+## Disposable Thread live acceptance
 
-- [ ] Retitle the displaced Thread when its letter is reassigned, so two tabs never show the same letter between display reconciliations. Keep it a display-only change: no Telegram deletion, no binding or journal mutation.
-- [ ] Bound the growth of slotless bindings: each reuse leaves the displaced binding and its Thread behind, and neither capacity retirement nor restore ever releases them. Offer the existing manual inactive-Workspace cleanup for them without making deletion automatic.
+- [ ] After separate operator authorization, use disposable Telegram tabs to check leader Settings review/Back, one confirmed cleanup of an inactive slotless binding, preservation of its replacement letter holder, and visible outcome/recovery copy. Native filesystem and injected-transport tests do not prove live Telegram/client or native Windows acceptance. Never use production history as the disposable fixture.
+- [ ] On separately authorized disposable routing tabs, verify pending-choice protection, Cancel after the view becomes unavailable, expiry notice in the owned leader Thread and no duplicate deletion after an unknown outcome. Local native journal/API-decoder fixtures are not live client acceptance.
 
-## 0.57.4 publication
+## Prompt-cache live confirmation
 
-The prompt-cache hotfix shipped alone as 0.57.4; metadata-only slot reuse follows as 0.57.5. Preserve contributor history, Pi >=1.0.0 compatibility and the distinction between native transcript evidence and unrun live provider/Telegram checks. Never rewrite `main`, published tags or consumed release history. Transit Thread lifecycle remains deferred.
+The prompt-cache report remains open for the reporter's offered live Anthropic capture after the published fix. Native request/transcript checks do not replace cache-hit or signed-thinking measurements.
 
-- [ ] Report verified results, limitations, installation instructions and thanks to the reporter and contributors; close the report only after publication verification, then remove this coordination outcome and synchronize the operator checkout while preserving its pre-existing routing test.
-
-## Transit Thread lifecycle
-
-An All input's temporary routing Thread must outlive its pending choice and leave no residue.
-
-- [ ] A Thread with a pending Reroute/Restore choice is never deleted by unbound-topic reconciliation; only its own Reroute, cancel or expiry removes it.
-- [ ] Cancel resolves from the durable journal, so it still works after the tab or chooser message is gone.
-- [ ] Expiry reports a visible "prompt not delivered" result instead of silently discarding the input as `routing-expiry`.
+- [ ] Review the reporter's resume and mid-session tool-change results (versions, cache read/write counts and new thinking-drop events). Close the report if the live evidence confirms the fix, or narrow any residual failure into actionable follow-up. Do not reconstruct or claim recovery of previously lost thinking blocks.
 
 ## Stuck forwarded command after Thread re-creation
 
 Evidence (2026-10-23 07:11–07:16): a `/start` sent in a former leader tab moved into a follower's journal as a raw original. After that follower's Thread was re-created by the restore probe, every execution attempt failed with `Telegram bus API call is not allowed for this follower` and retried every 60 s indefinitely, because the reply targeted a Thread the follower no longer owned. Terminal settlement alone is unsafe: the same rejection can be a benign race during a live-rebind pre-dispatch.
 
-- [ ] Reproduce with a native fixture (follower Thread re-created while a Restore-moved command is journaled). Then retarget the reply to the recipient's current Thread or settle the input only after proving no rebind is in flight, with a visible notice. Never discard accepted input silently.
+- [ ] Live acceptance: a forwarded command whose follower Thread was re-created is answered in the current Thread (disposable tabs only).
 - [ ] Find why the temporary tab's selected `/start` stayed unresolved until expiry, and why that Restore moved custody without applying the rebind.
 - [ ] Route an input that arrives in a tab bound to nothing through a fresh temporary routing tab (the All flow) instead of publishing the chooser in the orphan, deleting the orphan with it once nothing unspent remains. Needs its own durable-metadata design.
 - [ ] Live acceptance on disposable tabs only: Cancel on an orphan tab deletes it; a second unspent input keeps it until the last Cancel; a plain `std::map` option button is delivered as an ordinary prompt.

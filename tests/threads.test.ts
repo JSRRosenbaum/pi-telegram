@@ -2768,6 +2768,25 @@ test("Inactive Workspace cleanup commit removes only one exact unprotected bindi
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("Slotless cleanup commits require explicit absence, exact identity and current authority", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-slotless-commit-"));
+  try {
+    const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+    const binding = { ...createTelegramWorkspaceBindingIdentity("/cleanup")!,
+      target: { chatId: 7, threadId: 41 }, threadName: "Anchor", inactiveSinceMs: 10, updatedAtMs: 20 };
+    store.upsertWorkspaceBinding(binding);
+    await store.persist();
+    const snapshot = { ...binding, slot: null, bindingUpdatedAtMs: binding.updatedAtMs };
+    assert.equal(await store.commitInactiveWorkspaceCleanup({ ...snapshot, slot: undefined } as never, () => true), false);
+    assert.equal(await store.commitInactiveWorkspaceCleanup(snapshot, () => false), false);
+    assert.equal(await store.commitInactiveWorkspaceCleanup({ ...snapshot, target: { chatId: 7, threadId: 42 } }, () => true), false);
+    store.upsertWorkspaceBinding({ ...binding, slot: "B" });
+    assert.equal(await store.commitInactiveWorkspaceCleanup(snapshot, () => true), false, "a reacquired letter invalidates the slotless review");
+    store.upsertWorkspaceBinding(binding);
+    assert.equal(await store.commitInactiveWorkspaceCleanup(snapshot, () => true), true);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("Inactive Workspace cleanup cannot cross same-cwd session identity", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-session-cleanup-"));
   const path = join(dir, "state.json");
