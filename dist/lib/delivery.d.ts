@@ -44,6 +44,8 @@ export type TelegramDeliveryResult<T> = {
 export interface SendTelegramViewOptions {
     scope: TelegramDeliveryScope;
     replyToMessageId?: number;
+    /** Open Telegram's reply composer for this newly sent view; incompatible with inline buttons. */
+    requestReply?: boolean;
 }
 export type TelegramDeliveryChatAction = "typing" | "upload_document" | "upload_photo" | "record_voice";
 /** @internal */
@@ -72,6 +74,7 @@ export interface TelegramDeliveryRenderedChunk {
 export interface TelegramDeliveryTransportOptions {
     replyToMessageId?: number;
     replyMarkup?: TelegramInlineKeyboardMarkup | null;
+    requestReply?: boolean;
 }
 /** @internal */
 export interface TelegramDeliveryRuntimeDeps extends TelegramDeliveryTargetResolverDeps {

@@ -4094,17 +4094,66 @@ for (const liveSource of [false, true]) test(`Source serialization gates every s
     once(() => store.discardQueued({ ...discardReceipt, expectedOwner: discardedOwner }));
     const deadReceipt = { ...receipt, receiptId: "dead", sourceUpdateIds: [3] };
     const deadOwner = once(() => store.markQueued({ ...deadReceipt, owner: queueOwnerIdentity })).queueOwner!;
-    once(() => store.recoverDeadQueueOwner({ ...deadReceipt, deadOwner, recoveryOwner: queueOwnerIdentity }));
+    const heldQueue = store.read();
+    const recovery = once(() => store.recoverDeadQueueOwner({ ...deadReceipt, deadOwner, recoveryOwner: queueOwnerIdentity }));
+    assert.equal(recovery.status, "owner-dead-retained");
+    assert.deepEqual(recovery.recoveredUpdateIds, []);
+    assert.deepEqual(store.read(), heldQueue, "Death proof changes neither queued custody nor the polling cursor");
     const failed = once(() => store.markExecutionFailure({ updateId: 4, expectedAttemptCount: 0,
       failedAtMs: 1100, failureClass: "synthetic", summary: "synthetic", disposition: "failed", terminalReason: "synthetic" }));
     once(() => store.applyOperatorDisposition({ updateId: 4, failureId: failed.entry.terminalFailureId!, action: "discard" }));
     once(() => store.removeCompleted([5, 6]));
-    assert.deepEqual(unserialized(() => store.read()).entries, []);
+    assert.deepEqual(unserialized(() => store.read()).entries, [heldQueue.entries.find(entry => entry.updateId === 3)!],
+      "Unrelated successful settlements cannot consume the retained dead-owner receipt");
     failPublication = true;
     assert.throws(() => once(() => store.appendBatch([{ update_id: 7 }])) , (error) => isJournalError(error, "io"));
     failPublication = false;
     assert.deepEqual(once(() => store.appendBatch([{ update_id: 7 }])).addedUpdateIds, [7]);
     assert.equal(existsSync(configPath), false, "Lock-only operations do not create config authority");
+  });
+});
+
+test("Retained dead-owner custody survives compaction and replacement without settlement authority", async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const options = { path, profileName: "work", botIdentity: identity,
+      sourceAccess: { directory: dir, limits: sourceLimits },
+      withSourceSerialization: createTelegramJournalSourceSerialization(() => join(dir, "journals.transaction")),
+      getQueueProcessLiveness: () => "dead" as const };
+    const original = createTelegramUpdateJournalStore({ ...options, queueRuntimeIdentity: queueOwnerIdentity });
+    const updates = [1, 2].map(update_id => ({ update_id, message: { text: `accepted original ${update_id}` } }));
+    original.appendBatch(updates, 2);
+    const receipt = { queueKind: "prompt" as const, receiptId: "held", sourceUpdateIds: [1, 2] };
+    const owner = original.markQueued({ ...receipt, owner: queueOwnerIdentity }).queueOwner!;
+    const before = original.read();
+    const bytes = await readFile(path, "utf8");
+    const replacementOwner = { ...queueOwnerIdentity, instanceId: "replacement",
+      processId: process.pid + 1, processBirthId: "replacement-birth", sessionGeneration: 2 };
+    const replacement = createTelegramUpdateJournalStore({ ...options, queueRuntimeIdentity: replacementOwner });
+    const recovered = replacement.recoverDeadQueueOwner({ ...receipt, deadOwner: owner, recoveryOwner: replacementOwner });
+    assert.equal(recovered.status, "owner-dead-retained");
+    assert.deepEqual(recovered.recoveredUpdateIds, []);
+    assert.deepEqual(replacement.read(), before);
+    assert.equal(await readFile(path, "utf8"), bytes, "Owner death is not a source or cursor publication");
+    assert.throws(() => replacement.removeCompleted(receipt.sourceUpdateIds), error => isJournalError(error, "conflict"));
+    assert.throws(() => replacement.completeQueued([{ ...receipt, queueOwner: owner }]), error => isJournalError(error, "conflict"));
+    assert.throws(() => replacement.discardQueued({ ...receipt, expectedOwner: owner }), error => isJournalError(error, "conflict"));
+    assert.throws(() => original.completeQueued([{ ...receipt, queueOwner: { ...owner, acquisitionId: "stale" } }]),
+      error => isJournalError(error, "conflict"));
+    assert.deepEqual(replacement.read(), before, "Copied or stale owners grant no terminal settlement");
+    for (let cursor = 3; cursor <= TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_COUNT + 3; cursor++) {
+      replacement.appendBatch([], cursor);
+    }
+    const compacted = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(compacted.entries, before.entries, "Snapshot compaction preserves every source and exact owner");
+    const restarted = createTelegramUpdateJournalStore({ ...options, queueRuntimeIdentity: replacementOwner });
+    const afterRestart = restarted.read();
+    assert.deepEqual(afterRestart.entries, before.entries);
+    assert.equal(afterRestart.acceptedThroughUpdateId, TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_COUNT + 3);
+    assert.ok(afterRestart.entries.every(entry => entry.state === "queued"), "Restart never makes held source pending or executable");
+    assert.deepEqual(restarted.recoverDeadQueueOwner({ ...receipt, deadOwner: owner, recoveryOwner: replacementOwner }).recoveredUpdateIds, []);
+    assert.deepEqual(restarted.read(), afterRestart, "Repeated recovery after restart leaves custody and offset unchanged");
+    assert.throws(() => restarted.completeQueued([{ ...receipt, queueOwner: owner }]), error => isJournalError(error, "conflict"));
+    assert.deepEqual(restarted.read(), afterRestart);
   });
 });
 
@@ -8043,7 +8092,7 @@ test("Update journal explicit queue discard fences stale or foreign owners", asy
   });
 });
 
-test("Update journal dead-owner cleanup requires exact negative liveness proof", async () => {
+test("Update journal retains unknown execution outcomes even after exact owner death proof", async () => {
   await withJournalTempDir(async ({ path }) => {
     let ownerLiveness: "alive" | "dead" | "unverifiable" = "alive";
     const store = createStore(path, {
@@ -8115,20 +8164,20 @@ test("Update journal dead-owner cleanup requires exact negative liveness proof",
       deadOwner,
       recoveryOwner,
     });
-    assert.equal(recovered.status, "recovered");
-    assert.deepEqual(recovered.recoveredUpdateIds, [9]);
-    assert.deepEqual(store.read().entries, []);
-    assert.throws(
-      () =>
-        store.recoverDeadQueueOwner({
-          queueKind: "prompt",
-          receiptId: "dead-owner-receipt",
-          sourceUpdateIds: [9],
-          deadOwner,
-          recoveryOwner,
-        }),
-      (error) => isJournalError(error, "conflict"),
-    );
+    assert.equal(recovered.status, "owner-dead-retained");
+    assert.deepEqual(recovered.recoveredUpdateIds, []);
+    assert.deepEqual(store.read().entries[0]?.queueOwner, deadOwner);
+    assert.equal(store.read().entries[0]?.state, "queued");
+    assert.equal(store.read().entries[0]?.updateId, 9);
+    const repeated = store.recoverDeadQueueOwner({
+      queueKind: "prompt",
+      receiptId: "dead-owner-receipt",
+      sourceUpdateIds: [9],
+      deadOwner,
+      recoveryOwner,
+    });
+    assert.equal(repeated.status, "owner-dead-retained");
+    assert.deepEqual(repeated.recoveredUpdateIds, []);
   });
 
   await withJournalTempDir(async ({ path }) => {

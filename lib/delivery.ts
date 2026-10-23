@@ -83,6 +83,8 @@ export type TelegramDeliveryResult<T> =
 export interface SendTelegramViewOptions {
   scope: TelegramDeliveryScope;
   replyToMessageId?: number;
+  /** Open Telegram's reply composer for this newly sent view; incompatible with inline buttons. */
+  requestReply?: boolean;
 }
 
 export type TelegramDeliveryChatAction =
@@ -128,6 +130,7 @@ export interface TelegramDeliveryRenderedChunk {
 export interface TelegramDeliveryTransportOptions {
   replyToMessageId?: number;
   replyMarkup?: TelegramInlineKeyboardMarkup | null;
+  requestReply?: boolean;
 }
 
 /** @internal */
@@ -478,11 +481,13 @@ function getChunkTransportOptions(
   chunkCount: number,
   replyToMessageId?: number,
   editing = false,
+  requestReply = false,
 ): TelegramDeliveryTransportOptions {
   const isFirst = index === 0;
   const isLast = index === chunkCount - 1;
   return {
     ...(isFirst && replyToMessageId !== undefined ? { replyToMessageId } : {}),
+    ...(isLast && requestReply ? { requestReply: true } : {}),
     ...(isLast
       ? { replyMarkup: view.replyMarkup ?? (editing ? null : undefined) }
       : editing
@@ -595,6 +600,9 @@ export function createTelegramDeliveryRuntime(
       active = false;
     },
     async sendView(view, options) {
+      if (options.requestReply && view.replyMarkup) {
+        return failure("invalid-view", "Reply prompts cannot also contain inline buttons.");
+      }
       if (!active) return inactive();
       const resolved = resolveTelegramDeliveryTarget(options.scope, deps);
       if (!resolved.ok) return failure(resolved.reason, resolved.message);
@@ -615,6 +623,8 @@ export function createTelegramDeliveryRuntime(
                 index,
                 rendered.value.length,
                 options.replyToMessageId,
+                false,
+                options.requestReply === true,
               ),
             );
             messageIds.push(messageId);
@@ -806,9 +816,11 @@ export function createTelegramBridgeDeliveryRuntime(
               : {}),
             ...getTelegramTargetThreadParams(target),
             ...(replyParameters ? { reply_parameters: replyParameters } : {}),
-            ...(options.replyMarkup
-              ? { reply_markup: options.replyMarkup }
-              : {}),
+            ...(options.requestReply
+              ? { reply_markup: { force_reply: true } }
+              : options.replyMarkup
+                ? { reply_markup: options.replyMarkup }
+                : {}),
           };
           return deps.api.sendMessage(body);
         },

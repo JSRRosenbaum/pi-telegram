@@ -8570,7 +8570,7 @@ for (const ownerState of ["dead", "dead-ambiguous", "alive-ambiguous", "alive", 
         },
       });
       const ambiguous = ownerState.endsWith("-ambiguous");
-      const canRecover = ownerState === "dead" || ownerState === "dead-ambiguous";
+      const deadOwner = ownerState === "dead" || ownerState === "dead-ambiguous";
       const unresolvedProvision: Threads.TelegramThreadPendingProvision = {
         id: "unrelated-create", owner: "manual-follower", instanceId: "unrelated-instance",
         status: "ambiguous", startedAtMs: 1, slot: "X", threadName: "Xenon",
@@ -8608,17 +8608,17 @@ for (const ownerState of ["dead", "dead-ambiguous", "alive-ambiguous", "alive", 
         await f.click(f.routeOf(0));
         await f.harness.routeRuntime.waitForRestoreSettlement();
         assert.equal(f.journal.read().entries.some(entry => entry.updateId === 123), false, "The original command completed");
-        assert.equal(f.deletions().length, canRecover ? 1 : 0, f.diagnose());
-        assert.equal(recovered, canRecover ? 2 : 0);
-        assert.deepEqual(menuObservations, [canRecover ? 1 : 0], "The live menu runs after the cleanup attempt");
+        assert.equal(f.deletions().length, 0, f.diagnose());
+        assert.equal(recovered, 0, "Confirmed process death does not establish that accepted work had no effect");
+        assert.deepEqual(menuObservations, [0], "The live menu runs without claiming temporary cleanup");
         if (ambiguous) {
           await frame.threads.load();
           assert.deepEqual(frame.threads.listPendingProvisions(), [unresolvedProvision], "The unrelated uncertain creation is never reset or deleted");
         }
-        if (canRecover) {
-          assert.deepEqual(old.read().entries, []);
-          assert.equal(f.store.listTemporaryThreads().length, 0);
-          assert.ok(livenessCalls >= 2, "Preflight and journal CAS each prove death");
+        if (deadOwner) {
+          assert.deepEqual(old.read().entries, original, "Dead-owner queue source and exact owner remain held");
+          assert.equal(f.store.listTemporaryThreads().length, 1, "Routing cannot retire the tab protected by held queue source");
+          assert.ok(livenessCalls >= 1, "Recovery may inspect liveness but cannot consume retained queue authority");
         } else if (ownerState === "corrupt") {
           assert.equal(await readFile(historical, "utf8"), "malformed", "Strict recovery must never repair or reset");
         } else assert.deepEqual(old.read().entries, original, "Protected receipt remains unchanged");

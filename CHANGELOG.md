@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- `Sections API`: Added proactive callback-data lookup for a current section registration; producers retain request lifetime and validation while callbacks use ordinary section routing.
+- `Queue recovery`: Proven-dead queue owners now retain exact outcome-unknown receipts without replay or deletion, protecting Workspace capacity; historical journal namespaces are not migrated.
+- `Delivery API`: `sendTelegramView(..., { requestReply: true })` opens Telegram's reply composer on the final chunk, allowing companions to collect exact-handle text answers without a transient-toast-only interaction. Inline-button conflicts fail before sending.
+- `Leader session continuity`: Lifecycle assembly now captures leader handoffs, and fresh exact-process handoffs re-key the Workspace binding before allocation. Native `/new`, fork and reload retain the same Thread; quit/resume clear transient handoffs. Expired, wrong-process and wrong-profile handoffs cannot adopt another session's binding.
+- `Reply ownership`: A cancelled or suppressed run cannot reuse an assistant answer from before its latest user request.
+
 ## 0.57.3: Session Thread Continuity
 
 - `Session handoff`: A session replaced inside one Pi process now reuses its preserved Thread on every registration path, not only connect recovery. The successor re-keys onto the same tab and slot with the new session id, so `/new` no longer provisions a second tab and leaves the previous one without an owner.

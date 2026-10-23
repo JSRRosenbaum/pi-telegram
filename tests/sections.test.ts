@@ -6,6 +6,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  createAndBindTelegramSectionRegistry,
+  getTelegramSectionCallbackData,
+  registerTelegramSection,
   createTelegramExtensionSectionRegistry,
   getTelegramExtensionSettingsRows,
   getTelegramSectionMainMenuRows,
@@ -714,4 +717,43 @@ test("buildTelegramSettingsMenuReplyMarkup injects extension settings rows", asy
   );
   assert.ok(rows[6][0].callback_data?.startsWith("section:"));
   assert.ok(rows[7][0].callback_data?.startsWith("section:"));
+});
+
+test("Proactive section actions retain callback routing and expire with their registration", async () => {
+  const registry = createAndBindTelegramSectionRegistry();
+  const answers: string[] = [];
+  let invocations = 0;
+  const off = registerTelegramSection(stubSection("@test/proactive", "Question", {
+    handleCallback: async (ctx) => {
+      if (ctx.action !== "answer" || ctx.payload !== "request-1:yes") return "pass";
+      invocations += 1;
+      await ctx.answerCallback("Answer recorded");
+      return "handled";
+    },
+  }));
+  try {
+    const data = getTelegramSectionCallbackData("@test/proactive", "answer", "request-1:yes");
+    assert.ok(data);
+    const callback = parseTelegramSectionCallback(data);
+    assert.ok(callback);
+    assert.equal(await handleTelegramSectionCallback(
+      registry, callback.token, callback.action, callback.payload,
+      123, 456, "issued-query", stubDeps({
+        answerCallbackQuery: async (id, text) => { answers.push(`${id}:${text ?? ""}`); },
+      }),
+    ), true);
+    assert.equal(invocations, 1);
+    assert.deepEqual(answers, ["issued-query:Answer recorded"]);
+    assert.throws(() => getTelegramSectionCallbackData("@test/proactive", "answer", "x".repeat(64)));
+    off();
+    assert.equal(getTelegramSectionCallbackData("@test/proactive", "answer", "request-1:yes"), undefined);
+    await handleTelegramSectionCallback(
+      registry, callback.token, callback.action, callback.payload,
+      123, 456, "stale-query", stubDeps(),
+    );
+    assert.equal(invocations, 1);
+  } finally {
+    off();
+    registry.clear();
+  }
 });

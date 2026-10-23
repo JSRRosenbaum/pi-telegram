@@ -190,7 +190,33 @@ section:<token>:<action>:<payload>
 
 Example: `section:0:counter:5`
 
-The token is an implementation detail. Section authors **never** write `section:` strings manually. Use `ctx.callbackData(action, payload?)` which fills in the correct token and rejects callback data above Telegram's 64-byte limit.
+The token is an implementation detail. Section authors **never** write `section:` strings manually. Use `ctx.callbackData(action, payload?)` inside a section context, or `getTelegramSectionCallbackData(sectionId, action, payload?)` for a producer-owned proactive view. Both fill in the current section token and reject callback data above Telegram's 64-byte limit.
+
+### Producer-owned proactive callbacks
+
+Import the accessor through the same public membrane:
+
+```ts
+import { getTelegramSectionCallbackData } from "@llblab/pi-telegram/sections";
+
+const callbackData = getTelegramSectionCallbackData(
+  "@scope/my-extension",
+  "answer",
+  "request-key",
+);
+```
+
+The return type is `string | undefined`. Each call resolves the section's current registration; no active registry, no matching id, or a disposed section returns `undefined`. Omit the control or retain the producer's normal local interaction when unavailable. A returned string proves only that a registration was found, not that Telegram is connected, a target is authorized, or a message was delivered.
+
+The producer owns the section disposer and pending requests for its actual lifetime. Unregister on teardown, invalidate pending views on cancellation/replacement, and resolve callback data anew when issuing a view rather than retaining a section context or token across lifetimes. Tokens are registry-local and may be reused after registry replacement; the accessor adds no request-generation, expiry, authorization, or one-shot fence. The handler must validate its own compact request/view key, current generation, expected action and target, expiry/cancellation, and unsettled state before effects, then acknowledge the click.
+
+Routing constraints:
+
+- Callback data is not escaped. Keep producer action names free of `:`; payload text may contain `:` and is passed as the remaining suffix. The full UTF-8 string, including prefix and token, must fit 64 bytes or the helper throws.
+- Reserve `open` and `settings` for platform navigation. `open` requires stored menu state for that message; `settings` opens the registered settings surface rather than invoking the producer's ordinary action handler.
+- Dispatch requires a callback message with numeric chat and message IDs; inline-message-only callbacks are not a supported section route. Ordinary sender, session, and target routing still applies. The accessor does not register a second receiver or enable arbitrary channel/business/inline callback delivery.
+- Ordinary actions invoke the main handler, then the settings handler if the main returns `"pass"`. A final `"pass"` is acknowledged silently and consumed; `section:` is an owned namespace and never falls back to an inference prompt.
+
 
 ### Routing order
 
@@ -207,7 +233,7 @@ The token is an implementation detail. Section authors **never** write `section:
 ### Handler return values
 
 - `"handled"`: callback consumed, stop routing, `answerCallbackQuery` already called
-- `"pass"`: section declines; fallback to settings handler (if exists), then to caller
+- `"pass"`: try the settings handler if present; if no handler accepts, the platform silently acknowledges and consumes the section callback
 
 ### Fallback chain in `handleCallback`
 

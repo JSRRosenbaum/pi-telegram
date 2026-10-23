@@ -59,6 +59,19 @@ export function registerTelegramSection(section) {
     return registry.register(section);
 }
 /**
+ * Address an active section from a producer-owned proactive view.
+ * The section still owns callback validation, acknowledgement and lifecycle;
+ * callers must bind actions to their own issued view and request generation.
+ * Returns undefined when that section is unavailable or has been disposed.
+ */
+export function getTelegramSectionCallbackData(sectionId, action, payload) {
+    const registry = globalThis[SECTION_REGISTRY_KEY];
+    const section = registry?.getSections().find((entry) => entry.id === sectionId);
+    return section
+        ? buildTelegramSectionCallbackData(section.token, action, payload)
+        : undefined;
+}
+/**
  * Get current section diagnostics. Returns empty array when registry is absent.
  * @internal
  */

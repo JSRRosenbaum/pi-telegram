@@ -117,6 +117,13 @@ export declare function createAndBindTelegramSectionRegistry(): TelegramSectionR
  */
 export declare function registerTelegramSection(section: TelegramSectionRegistration): () => void;
 /**
+ * Address an active section from a producer-owned proactive view.
+ * The section still owns callback validation, acknowledgement and lifecycle;
+ * callers must bind actions to their own issued view and request generation.
+ * Returns undefined when that section is unavailable or has been disposed.
+ */
+export declare function getTelegramSectionCallbackData(sectionId: string, action: string, payload?: string): string | undefined;
+/**
  * Get current section diagnostics. Returns empty array when registry is absent.
  * @internal
  */

@@ -10260,11 +10260,22 @@ export function createTelegramUpdateAdmissionLifecycleRuntime<TContext>(
           recoveryOwner,
         });
         foreignQueueOwnerLiveness =
-          result.status === "recovered"
+          result.status === "recovered" || result.status === "owner-dead-retained"
             ? "dead"
             : result.status === "owner-alive"
               ? "alive"
               : "unverifiable";
+        if (result.status === "owner-dead-retained") {
+          try {
+            deps.recordRuntimeEvent?.(
+              "inbound-worker",
+              "Retained queued work from a confirmed-dead process; its execution outcome is unknown.",
+              { phase: "dead-queue-owner-retained", receiptId, retainedUpdateCount: receipt.sourceUpdateIds.length },
+            );
+          } catch {
+            // The journal remains protective even when diagnostics fail.
+          }
+        }
         if (result.status !== "recovered") continue;
         try {
           deps.recordRuntimeEvent?.(

@@ -507,6 +507,34 @@ test("Bridge delivery runtime owns rendering and bus-aware transport adaptation"
   ]);
 });
 
+test("Reply prompts open the composer only on the final delivered chunk and reject inline-button conflicts", async () => {
+  const sent: Array<Record<string, unknown>> = [];
+  const runtime = createTelegramBridgeDeliveryRuntime({
+    generation: "reply-prompt",
+    getTargetPolicyView: () => ({ canDeliver: true, ownsDirect: true, allowedChatId: 42, leaderTarget: target }),
+    getActiveTurnTarget: () => target,
+    api: {
+      async sendMessage(body) { sent.push(body); return { message_id: 100 + sent.length }; },
+      async editMessageText() { return "edited"; }, async deleteMessage() {}, async sendChatAction() { return true; },
+    },
+    recordOwnership() {},
+  });
+  const result = await runtime.sendView({ text: "answer ".repeat(800) }, { scope: { kind: "active-turn" }, requestReply: true });
+  assert.equal(result.ok, true);
+  assert.ok(sent.length > 1, "Exercise a genuinely split reply prompt");
+  for (const body of sent.slice(0, -1)) assert.equal(body.reply_markup, undefined);
+  assert.deepEqual(sent.at(-1)?.reply_markup, { force_reply: true });
+  assert.equal(sent.at(-1)?.message_thread_id, 7);
+  const before = sent.length;
+  const conflict = await runtime.sendView(
+    { text: "invalid mixed controls", replyMarkup: { inline_keyboard: [[{ text: "Choice", callback_data: "choice" }]] } },
+    { scope: { kind: "active-turn" }, requestReply: true },
+  );
+  assert.equal(conflict.ok, false);
+  if (!conflict.ok) assert.equal(conflict.reason, "invalid-view");
+  assert.equal(sent.length, before);
+});
+
 test("Bridge delivery runtime rejects work after transport generation replacement", async () => {
   let transportActive = true;
   let apiCalls = 0;

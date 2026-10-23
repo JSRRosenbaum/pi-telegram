@@ -134,6 +134,7 @@ When a multi-chunk `send` or growing `edit` fails after materializing part of th
 export interface SendTelegramViewOptions {
   scope: TelegramDeliveryScope;
   replyToMessageId?: number;
+  requestReply?: boolean;
 }
 
 export function sendTelegramView(
@@ -157,6 +158,14 @@ export function sendTelegramChatAction(
 ```
 
 `replyToMessageId` applies only to the first chunk and must belong to the resolved chat. The initial contract exposes only actions already used by bridge-owned activity and delivery paths; it is not a generic Bot API action string.
+
+`requestReply: true` opens Telegram's reply composer for the newly sent view using
+ForceReply. For a split view, only the final message requests a reply; all returned
+message IDs remain in the logical handle. A reply prompt cannot also have inline
+buttons (`invalid-view`, with no send). This option is send-only: editing a view
+does not reopen the composer. Producers correlate answers against the returned
+handle and exact chat/Thread, expire stale requests, and never treat an unrelated
+chat message as an answer.
 
 ## Runtime Binding
 

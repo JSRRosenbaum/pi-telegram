@@ -17,7 +17,10 @@ Preferred public imports:
 
 ```ts
 import telegram from "@llblab/pi-telegram";
-import { registerTelegramSection } from "@llblab/pi-telegram/sections";
+import {
+  getTelegramSectionCallbackData,
+  registerTelegramSection,
+} from "@llblab/pi-telegram/sections";
 import { registerTelegramStatusLineProvider } from "@llblab/pi-telegram/status";
 import { registerTelegramUpdateHandler } from "@llblab/pi-telegram/updates";
 import { registerTelegramCommand } from "@llblab/pi-telegram/commands";
@@ -311,6 +314,9 @@ Contract:
 
 - `id` is unique per active registry. Duplicate ids are rejected.
 - `ctx.callbackData(action, payload?)` builds compact `section:` callbacks and validates Telegram's 64-byte limit.
+- `getTelegramSectionCallbackData(sectionId, action, payload?)` returns `string | undefined` for producer-owned proactive views outside a section render/callback. It looks up the section's current registration on every call; an absent registry or missing/disposed section returns `undefined`. A registered section uses the same encoding and 64-byte rejection as `ctx.callbackData()`. This lookup does not prove connection, delivery, target authority, or producer-request liveness.
+- Producers keep registration and pending interactions within their own lifetime, unregister on teardown, and bind callbacks to the exact issued view, request generation, target, expiry/cancellation, and one-shot settlement. Tokens are not durable identities; do not cache them across replacement or assume an old button cannot reach a later registration.
+- Both helpers use ordinary message-backed section routing, not a new callback transport. Use producer actions without `:`; `open` and `settings` are reserved navigation actions. Main callbacks run before the optional settings fallback; a final `"pass"` is silently acknowledged and consumed, not forwarded to inference. See [proactive section callbacks](./sections.md#producer-owned-proactive-callbacks) for routing constraints.
 - `ctx.edit()` auto-prepends the correct Back/Main-menu row. `ctx.open()` sends a standalone chat message without auto-navigation.
 - Section dynamic-label, render, and callback errors are isolated, surfaced as callback popups where applicable, and reflected by `getTelegramSectionDiagnostics()` until the matching surface succeeds.
 

@@ -897,7 +897,7 @@ test("Explicit lifecycle prepares and executes one pressure retirement", async (
   }
 });
 
-test("Pressure rotation reclaims exact queued custody only after native dead-owner proof", async (t) => {
+test("Pressure rotation retains queued custody after native dead-owner proof", async (t) => {
   if (process.platform === "win32") {
     t.skip("Strict no-follow journal-family inspection is unavailable on Windows.");
     return;
@@ -970,6 +970,7 @@ test("Pressure rotation reclaims exact queued custody only after native dead-own
     assert.deepEqual(getProtection(store.getWorkspaceBinding("/repo/0")!), {
       liveOwner: "clear", acceptedWork: "protected", deliveryAuthority: "clear",
     });
+    const queuedSourceBefore = JSON.stringify(follower.readForProtection().entries);
     let deletions = 0;
     let effects = 0;
     const reclamations: unknown[] = [];
@@ -989,18 +990,28 @@ test("Pressure rotation reclaims exact queued custody only after native dead-own
       },
       async deleteThread(authorize) { authorize(); deletions++; },
     });
-    const slot = await rotation(async () => {
+    const attempt = () => rotation(async () => {
       const claimed = store.claimWorkspaceIdentity("/fresh", "fresh");
       if (!claimed) throw new TelegramWorkspaceSlotUnavailableError();
       effects++;
       return claimed.slot;
     });
-    assert.equal(slot, "A", JSON.stringify(reclamations));
-    assert.equal(deletions, 1);
-    assert.equal(effects, 1, "The failed allocation must not execute its effect before reclamation");
-    assert.deepEqual(reclamations, [{ kind: "recovered", receipts: 1, updateIds: [1] }]);
-    assert.deepEqual(follower.journal.read().entries, []);
-    assert.equal(store.listWorkspaceBindings().length, 25);
+    await assert.rejects(attempt());
+    assert.deepEqual(reclamations, [{ kind: "blocked", reason: "outcome-unknown" }]);
+    assert.equal(deletions, 0, "dead-owner proof cannot authorize thread retirement");
+    assert.equal(effects, 0, "allocation effects cannot run without a reusable slot");
+    assert.equal(JSON.stringify(follower.readForProtection().entries), queuedSourceBefore,
+      "the complete exact journal source and owner are unchanged");
+    await assert.rejects(attempt());
+    assert.deepEqual(reclamations, [
+      { kind: "blocked", reason: "outcome-unknown" },
+      { kind: "blocked", reason: "outcome-unknown" },
+    ]);
+    assert.equal(deletions, 0, "retry does not retire the held target");
+    assert.equal(effects, 0, "retry does not reuse capacity while authority is held");
+    assert.equal(JSON.stringify(follower.readForProtection().entries), queuedSourceBefore,
+      "retry preserves complete queued source and exact owner");
+    assert.equal(store.listWorkspaceBindings().length, 26);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1032,6 +1043,7 @@ for (const scenario of ["queued", "pending", "delivery-protected", "corrupt", "e
       });
       if (scenario === "corrupt") await writeFile(paths[2]!, "{broken");
       const oldImage = await readFile(paths[1]!);
+      const journalSourceBefore = scenario === "corrupt" ? undefined : JSON.stringify(journals[2]!.read().entries);
       const references = createTelegramUpdateJournalReferenceRegistry();
       const bindings = createTelegramUpdateJournalBindingRuntime({
         base: { getProfileName: () => "work", getBotToken: () => token, getBotId: () => 7,
@@ -1101,19 +1113,19 @@ for (const scenario of ["queued", "pending", "delivery-protected", "corrupt", "e
         if (!claim) throw new TelegramWorkspaceSlotUnavailableError();
         allocations++; return claim.slot;
       });
-      if (scenario === "queued" || scenario === "no-pressure") assert.equal(await attempt(), scenario === "queued" ? "A" : "Z");
-      else await assert.rejects(attempt(), scenario === "epoch-loss" ? /lost leader authority/ : /rotation blocked/);
+      if (scenario === "no-pressure") assert.equal(await attempt(), "Z");
+      else await assert.rejects(attempt());
       assert.equal(prunes, scenario === "no-pressure" ? 0 : 1); assert.equal(captures, prunes);
-      assert.equal(deletions, scenario === "queued" ? 1 : 0);
-      assert.equal(allocations, scenario === "queued" || scenario === "no-pressure" ? 1 : 0);
+      assert.equal(deletions, 0);
+      assert.equal(allocations, scenario === "no-pressure" ? 1 : 0);
       assert.equal(reclaimed, scenario === "queued" || scenario === "pending" ? 1 : 0);
       const cold = createTelegramTopicTargetStore({ path: join(dir, "state.json") }); await cold.load();
-      if (scenario === "queued") assert.equal(cold.getWorkspaceBinding("/repo/0"), undefined);
-      else assert.deepEqual(cold.getWorkspaceBinding("/repo/0")?.journalSources,
+      assert.deepEqual(cold.getWorkspaceBinding("/repo/0")?.journalSources,
         scenario === "corrupt" || scenario === "no-pressure" ? addresses : scenario === "delivery-protected" ? undefined : [addresses[1]]);
       assert.deepEqual(await readFile(paths[1]!), oldImage, "the dropped metadata address's physical source remains untouched");
-      if (scenario !== "corrupt") assert.deepEqual(journals[2]!.read().entries.map(entry => entry.updateId),
-        scenario === "queued" || scenario === "delivery-protected" ? [] : [44]);
+      if (journalSourceBefore !== undefined)
+        assert.equal(JSON.stringify(journals[2]!.read().entries), journalSourceBefore,
+          "exact queued/pending source, body, receipt and owner remain unchanged");
       else assert.equal(await readFile(paths[2]!, "utf8"), "{broken", "namespace protection never repairs corruption");
       assert.deepEqual(references.list(), []); assert.deepEqual(admission.read().leases, []);
     } finally { await rm(dir, { recursive: true, force: true }); }
@@ -1159,7 +1171,7 @@ test("One occupancy snapshot reads binding-independent journal evidence once; se
   assert.equal(inspections, 3, "direct probes outside a snapshot are never cached");
 });
 
-test("Dead-owner reclamation refuses replacement and partial custody, then resumes interrupted exact groups", async (t) => {
+test("Dead-owner reclamation refuses replacement and partial custody, retaining queued work", async (t) => {
   const binding: TelegramWorkspaceThreadBinding = {
     ...createTelegramWorkspaceBindingIdentity("/repo/dead-owner")!,
     target: { chatId: 7, threadId: 42 }, slot: "A", inactiveSinceMs: 1, updatedAtMs: 2,
@@ -1179,7 +1191,6 @@ test("Dead-owner reclamation refuses replacement and partial custody, then resum
     initialEntries: TelegramUpdateJournalEntry[];
     getLiveOwner?: (call: number) => "clear" | "protected" | "unknown";
     liveness?: "alive" | "dead" | "unverifiable";
-    recover?: (call: number) => "recovered" | "owner-alive" | "owner-unverifiable" | "throw";
   }) => {
     let entries = [...input.initialEntries];
     let protectionCalls = 0;
@@ -1190,14 +1201,8 @@ test("Dead-owner reclamation refuses replacement and partial custody, then resum
       journal: { recoverDeadQueueOwner(recovery: Parameters<ReturnType<
         typeof createTelegramUpdateJournalStore>["recoverDeadQueueOwner"]>[0]) {
         recoveryCalls++;
-        const outcome = input.recover?.(recoveryCalls) ?? "recovered";
-        if (outcome === "throw") throw new Error("interrupted publication");
-        if (outcome !== "recovered") return { status: outcome, previousOwner: owner,
+        return { status: "owner-dead-retained" as const, previousOwner: recovery.deadOwner,
           recoveredUpdateIds: [] as [], entryCount: entries.length, serializedBytes: 1 };
-        entries = entries.filter((candidate) =>
-          !recovery.sourceUpdateIds.includes(candidate.updateId));
-        return { status: "recovered" as const, previousOwner: owner,
-          recoveredUpdateIds: [...recovery.sourceUpdateIds], entryCount: entries.length, serializedBytes: 1 };
       } },
     };
     const getExternalProtection = (): TelegramWorkspaceExternalProtectionEvidence => {
@@ -1253,20 +1258,29 @@ test("Dead-owner reclamation refuses replacement and partial custody, then resum
       assert.deepEqual(harness.entries.map(candidate => candidate.updateId), [1]);
     });
   }
-  await t.test("interrupted mutation and exact retry", async () => {
+  await t.test("retained dead-owner result keeps exact queued source across attempts", async () => {
     const harness = createHarness({ initialEntries: [
       entry(1, 42, "dead-receipt"), entry(2, 43, "unrelated-receipt"),
-    ], recover: call => call === 1 ? "throw" : "recovered" });
+    ] });
+    const queuedCustody = () => harness.entries.map(candidate => ({
+      id: candidate.updateId,
+      state: candidate.state,
+      owner: candidate.queueOwner,
+      receipt: candidate.queueReceiptId,
+      source: candidate.update,
+    }));
+    const before = queuedCustody();
     assert.deepEqual(await harness.reclaim(binding, () => true),
-      { kind: "blocked", reason: "mutation-refused" });
-    assert.deepEqual(harness.entries.map(candidate => candidate.updateId), [1, 2]);
+      { kind: "blocked", reason: "outcome-unknown" });
+    assert.deepEqual(queuedCustody(), before);
     assert.deepEqual(await harness.reclaim(binding, () => true),
-      { kind: "recovered", receipts: 1, updateIds: [1] });
-    assert.deepEqual(harness.entries.map(candidate => candidate.updateId), [2]);
+      { kind: "blocked", reason: "outcome-unknown" });
+    assert.deepEqual(queuedCustody(), before, "retry does not erase or replay held authority");
+    assert.equal(harness.recoveryCalls, 2);
   });
 });
 
-for (const scenario of ["dead", "unavailable", "corrupt", "pending", "alive", "authority-loss", "partial-publication"] as const) {
+for (const scenario of ["dead", "unavailable", "corrupt", "pending", "alive", "authority-loss"] as const) {
   test(`Session-qualified dead-owner reclamation resolves exact native journal families (${scenario})`, { skip: process.platform === "win32" }, async () => {
     const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-session-dead-owner-")));
     const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "7:session-pressure" });
@@ -1276,7 +1290,7 @@ for (const scenario of ["dead", "unavailable", "corrupt", "pending", "alive", "a
     const binding: TelegramWorkspaceThreadBinding = { ...createTelegramWorkspaceBindingIdentity("/repo/session-pressure", 0, "session-new")!,
       target: { chatId: 7, threadId: 42 }, slot: "A", inactiveSinceMs: 1, updatedAtMs: 2,
       journalBindingsComplete: true, journalSources };
-    let current = true, interrupt = false;
+    let current = true;
     const mutations: number[] = [], resolved: string[] = [];
     try {
       const sources = journalSources.map(({ sessionId }, index) => {
@@ -1290,12 +1304,7 @@ for (const scenario of ["dead", "unavailable", "corrupt", "pending", "alive", "a
         if (scenario !== "pending" || index === 0) writer.markQueued({ queueKind: "prompt", receiptId: "same-receipt-name",
           sourceUpdateIds: [index + 1], owner });
         const journal = createTelegramUpdateJournalStore({ path, profileName: "work", botIdentity,
-          queueRuntimeIdentity: recoveryOwner, getQueueProcessLiveness: () => "dead",
-          onPublicationBoundary(point) {
-            if (index === 1 && interrupt && point === "after-write-before-rename") {
-              interrupt = false; throw new Error("fixture session publication interrupted");
-            }
-          } });
+          queueRuntimeIdentity: recoveryOwner, getQueueProcessLiveness: () => "dead" });
         return { path, recoveryKey: createTelegramUpdateJournalBindingKey({ path, profileName: "work", botIdentity }),
           readForProtection() {
             const evidence = inspectTelegramUpdateJournalFamily({ directory: dirname(path), path, profile: "work", botIdentity,
@@ -1310,7 +1319,6 @@ for (const scenario of ["dead", "unavailable", "corrupt", "pending", "alive", "a
       assert.notEqual(sources[0]!.recoveryKey, sources[1]!.recoveryKey);
       if (scenario === "corrupt") await writeFile(sources[1]!.path, "{broken");
       const before = await Promise.all(sources.map(source => readFile(source.path, "utf8")));
-      interrupt = scenario === "partial-publication";
       const reclaim = createTelegramWorkspaceDeadOwnerQueueReclaimer({
         getExternalProtection() {
           let acceptedWork: TelegramWorkspaceExternalProtectionEvidence["acceptedWork"];
@@ -1336,15 +1344,10 @@ for (const scenario of ["dead", "unavailable", "corrupt", "pending", "alive", "a
       const outcome = await reclaim(binding, () => current);
       assert.deepEqual(resolved, ["session-old", "session-new"]);
       if (scenario === "dead") {
-        assert.deepEqual(outcome, { kind: "recovered", receipts: 2, updateIds: [1, 2] });
-        assert.deepEqual(mutations, [0, 1]);
-        assert.deepEqual(sources.map(source => source.readForProtection().entries), [[], []]);
-      } else if (scenario === "partial-publication") {
-        assert.deepEqual(outcome, { kind: "blocked", reason: "mutation-refused" });
-        assert.deepEqual(sources.map(source => source.readForProtection().entries.map(entry => entry.updateId)), [[], [2]],
-          "partial terminal disposal is not rolled back or replayed");
-        assert.deepEqual(await reclaim(binding, () => current), { kind: "recovered", receipts: 1, updateIds: [2] });
-        assert.deepEqual(mutations, [0, 1, 1], "retry visits only the still-owned receipt");
+        assert.deepEqual(outcome, { kind: "blocked", reason: "outcome-unknown" });
+        assert.deepEqual(mutations, [0], "retained first custody prevents touching a later session source");
+        assert.deepEqual(await Promise.all(sources.map(source => readFile(source.path, "utf8"))), before,
+          "dead-owner evidence does not delete, rewrite, or replay queued source");
       } else {
         const reason = scenario === "pending" ? "unsupported-custody" : scenario === "alive" ? "owner-alive"
           : scenario === "authority-loss" ? "authority-changed" : "incomplete-source";
@@ -1357,72 +1360,6 @@ for (const scenario of ["dead", "unavailable", "corrupt", "pending", "alive", "a
   });
 }
 
-test("Dead-owner pressure reclamation retries an interrupted native journal publication without replay", async (t) => {
-  if (process.platform === "win32") {
-    t.skip("Strict no-follow journal-family inspection is unavailable on Windows.");
-    return;
-  }
-  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-telegram-dead-owner-publication-")));
-  try {
-    const path = join(dir, "inbox.json");
-    const botIdentity = createTelegramUpdateJournalBotIdentity({ botToken: "7:publication" });
-    const deadOwner = { instanceId: "dead", processId: 444,
-      processBirthId: "444:start:dead", sessionGeneration: 1 };
-    const recoveryOwner = { instanceId: "leader", processId: 555,
-      processBirthId: "555:start:leader", sessionGeneration: 2 };
-    const writer = createTelegramUpdateJournalStore({ path, profileName: "default", botIdentity,
-      queueRuntimeIdentity: deadOwner, getQueueProcessLiveness: () => "dead" });
-    writer.appendBatch([{ update_id: 1, message: { message_id: 1, message_thread_id: 42,
-      chat: { id: 7, type: "private" }, from: { id: 7, is_bot: false }, text: "once" } }], 1);
-    writer.markQueued({ queueKind: "prompt", receiptId: "receipt", sourceUpdateIds: [1], owner: deadOwner });
-    let interrupt = true;
-    let effects = 0;
-    const journal = createTelegramUpdateJournalStore({ path, profileName: "default", botIdentity,
-      queueRuntimeIdentity: recoveryOwner, getQueueProcessLiveness: () => "dead",
-      onPublicationBoundary(boundary) {
-        if (interrupt && boundary === "after-write-before-rename") {
-          interrupt = false;
-          throw new Error("interrupted publication");
-        }
-      } });
-    const inspect = () => {
-      const evidence = inspectTelegramUpdateJournalFamily({ directory: dir, path,
-        profile: "default", botIdentity,
-        limits: { maxFiles: 128, maxBytes: 1_000_000, maxEntries: 128, maxWork: 10_000 } });
-      if (evidence.kind !== "present") throw new Error("fixture journal disappeared");
-      return { entries: evidence.file.entries };
-    };
-    const source = { recoveryKey: path, journal, readForProtection: inspect };
-    const binding: TelegramWorkspaceThreadBinding = {
-      ...createTelegramWorkspaceBindingIdentity("/repo/publication")!,
-      target: { chatId: 7, threadId: 42 }, slot: "A", inactiveSinceMs: 1, updatedAtMs: 2,
-      journalBindingsComplete: true,
-    };
-    const getExternalProtection = (): TelegramWorkspaceExternalProtectionEvidence => ({
-      liveOwner: "clear",
-      acceptedWork: inspect().entries.length ? "protected" : "clear",
-      deliveryAuthority: "clear",
-    });
-    const reclaim = createTelegramWorkspaceDeadOwnerQueueReclaimer({
-      getExternalProtection, getActiveTurnTarget: () => undefined, getQueuedItems: () => [],
-      resolveLeaderJournal: () => source, createFollowerJournalResolver: () => () => undefined,
-      getRecoveryOwner: () => recoveryOwner, getQueueOwnerLiveness: () => "dead",
-      isBindingCurrent: () => true,
-    });
-    const invoke = async () => {
-      const result = await reclaim(binding, () => true);
-      if (result.kind === "recovered") effects += result.updateIds.length;
-      return result;
-    };
-    assert.deepEqual(await invoke(), { kind: "blocked", reason: "mutation-refused" });
-    assert.deepEqual(inspect().entries.map(entry => entry.updateId), [1]);
-    assert.deepEqual(await invoke(), { kind: "recovered", receipts: 1, updateIds: [1] });
-    assert.equal(effects, 1);
-    assert.deepEqual(inspect().entries, []);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
 
 test("Slot rotation cancels proven Telegram rejection but retains ambiguous deletion without replay", async (t) => {
   for (const outcome of ["rejected", "malformed", "forged", "server", "network", "false"] as const) {

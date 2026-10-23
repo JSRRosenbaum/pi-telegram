@@ -35,6 +35,7 @@ import {
 import {
   createTelegramTopicTargetStore,
   createTelegramWorkspaceBindingIdentity,
+  setTelegramLeaderSessionHandoff,
 } from "../lib/threads.ts";
 import {
   createTelegramWorkspaceOperationRuntime,
@@ -710,6 +711,61 @@ test("Leader Workspace recovery publishes the canonical retained slot for the ex
     assert.equal(store.allocateSlot("manual:follower"), "Y");
   } finally {
     await rm(dir, { force: true, recursive: true });
+  }
+});
+
+test("Only a fresh exact-process leader handoff rekeys the retained session Thread", async () => {
+  for (const scenario of ["valid", "expired", "other-process", "other-profile", "missing"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), "pi-telegram-leader-session-handoff-"));
+    const store = createTelegramTopicTargetStore({ path: join(dir, "state.json") });
+    const instanceId = `${process.pid}:1`;
+    const target = { chatId: 7, threadId: 41 };
+    let creates = 0;
+    try {
+      const source = { ...createTelegramWorkspaceBindingIdentity("/repo", 0, "old-session")!,
+        target, threadName: "Xylem", slot: "X", updatedAtMs: 1,
+        journalBindingKeys: ["retained-custody"], journalBindingsComplete: true as const };
+      store.upsertWorkspaceBinding(source);
+      store.upsert({ profileKey: "cwd:/repo",
+        owner: { kind: "leader", cwd: "/repo", instanceId }, target,
+        status: "active", createdAtMs: 1, updatedAtMs: 1,
+        instanceId, threadName: "Xylem", slot: "X" });
+      await store.persist();
+      setTelegramLeaderSessionHandoff(scenario === "missing" ? undefined : {
+        pid: scenario === "other-process" ? process.pid + 1 : process.pid,
+        instanceId, target, profileKey: scenario === "other-profile" ? "profile:other:cwd:/repo" : "cwd:/repo",
+        createdAtMs: Date.now() - (scenario === "expired" ? 60_000 : 0),
+      });
+      const result = await ensureTelegramLeaderThreadBinding({
+        getAllowedUserId: () => 7, instanceId, cwd: "/repo", sessionId: "new-session",
+        topicTargetStore: store, recordEvent() {}, async probeWorkspaceBinding() {},
+        async callApi<TResponse>(method: string) {
+          assert.equal(method, "createForumTopic");
+          creates++;
+          return { message_thread_id: 42 } as TResponse;
+        },
+      });
+      const successor = store.getWorkspaceBinding("/repo", "a", "new-session");
+      if (scenario === "valid") {
+        assert.equal(creates, 0);
+        assert.equal(result?.reused, true);
+        assert.deepEqual(result?.target, target);
+        assert.equal(result?.slot, "X");
+        assert.deepEqual(successor?.target, target);
+        assert.deepEqual(successor?.journalBindingKeys, source.journalBindingKeys);
+        assert.equal(store.getWorkspaceBinding("/repo", "a", "old-session"), undefined);
+      } else {
+        assert.equal(creates, 1, scenario);
+        assert.equal(result?.target.threadId, 42, scenario);
+        const retained = store.getWorkspaceBinding("/repo", "a", "old-session");
+        assert.equal(retained?.bindingKey, source.bindingKey, scenario);
+        assert.deepEqual(retained?.target, target, scenario);
+        assert.deepEqual(retained?.journalBindingKeys, source.journalBindingKeys, scenario);
+      }
+    } finally {
+      setTelegramLeaderSessionHandoff(undefined);
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
 

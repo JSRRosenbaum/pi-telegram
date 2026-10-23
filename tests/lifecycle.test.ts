@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as Queue from "../lib/queue.ts";
 import { createTelegramQueueBindingRuntime } from "../lib/bindings.ts";
+import { getTelegramLeaderSessionHandoff, setTelegramLeaderSessionHandoff } from "../lib/threads.ts";
 
 import {
   appendTelegramLifecycleHooks,
@@ -321,6 +322,59 @@ test("Resume connection claims before queue startup and replaces ordinary auto-r
     } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
     await runtime.onSessionStart({ type: "session_start", reason: "resume" }, createLifecycleContext());
     assert.deepEqual(events, ["claim-intent", "config", "delivery", resumeIntent ? "resume-connect" : "auto-restore"]);
+  }
+});
+
+test("Leader session replacement retains its exact Thread before polling stops", async () => {
+  const target = { chatId: 42, threadId: 73 };
+  for (const reason of ["new", "fork", "reload", "resume", "quit"] as const) {
+    setTelegramLeaderSessionHandoff(undefined);
+    const contexts = createTelegramSessionContextStore<ExtensionContext>();
+    const ctx = createLifecycleContext();
+    contexts.set(ctx);
+    let owns = true;
+    let captured: ReturnType<typeof getTelegramLeaderSessionHandoff>;
+    const runtime = createTelegramBridgeSessionLifecycleAssembly({
+      contextStore: contexts,
+      queue: {
+        getCurrentModel: () => undefined, loadConfig: async () => {}, setQueuedItems() {},
+        setCurrentModel() {}, setPendingModelSwitch() {}, syncCounters() {}, syncFlags() {},
+        bindDeferredDispatchContext() {}, prepareTempDir: async () => {}, updateStatus() {},
+        unbindDeferredDispatchContext() {}, discardQueuedItems() {}, clearModelMenuState() {},
+        getActiveTurnChatId: () => undefined, clearPreview: async () => {}, clearActiveTurn() {}, clearAbort() {},
+      },
+      follower: {
+        registrationState: { getTarget: () => undefined, isRegistered: () => false },
+        registrationRuntime: {}, instanceId: "leader", getLeaderState: () => ({ kind: "unlocked" }),
+        isLeader: () => owns,
+        getLeaderBinding: () => ({ target, slot: "B", threadName: "Retained" }),
+        getActiveContext: () => ctx, getActiveProfileName: () => "default",
+        suspendPolling: async () => {
+          captured = getTelegramLeaderSessionHandoff();
+          owns = false;
+        },
+        updateStatus() {}, recordRuntimeEvent() {},
+      },
+      services: {
+        resumeGroupedInput() {}, suspendGroupedInput() {},
+        delivery: { onSessionStart: async () => {}, onSessionShutdown: async () => {} },
+        polling: { onSessionStart: async () => {} },
+        inboundWorker: { onSessionShutdown: async () => {} },
+        capabilityMonitor: { start() {}, stop() {} }, queueWatchdog: { start() {}, stop() {} },
+      },
+    } as unknown as Parameters<typeof createTelegramBridgeSessionLifecycleAssembly>[0]);
+    try {
+      await runtime.onSessionShutdown({ type: "session_shutdown", reason }, ctx);
+      if (reason === "resume" || reason === "quit") assert.equal(captured, undefined);
+      else {
+        assert.deepEqual(captured?.target, target, reason);
+        assert.equal(captured?.instanceId, "leader");
+        assert.equal(captured?.slot, "B");
+        assert.equal(captured?.threadName, "Retained");
+      }
+    } finally {
+      setTelegramLeaderSessionHandoff(undefined);
+    }
   }
 });
 

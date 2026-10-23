@@ -845,6 +845,7 @@ export type TelegramWorkspaceDeadQueueReclamation =
         | "unsupported-custody"
         | "owner-alive"
         | "owner-unverifiable"
+        | "outcome-unknown"
         | "mutation-refused"
         | "protection-retained";
     };
@@ -1093,6 +1094,9 @@ export function createTelegramWorkspaceDeadOwnerQueueReclaimer(deps: {
       }
       if (result.status === "owner-unverifiable") {
         return { kind: "blocked", reason: "owner-unverifiable" };
+      }
+      if (result.status === "owner-dead-retained") {
+        return { kind: "blocked", reason: "outcome-unknown" };
       }
       recoveredIds.push(...result.recoveredUpdateIds);
     }

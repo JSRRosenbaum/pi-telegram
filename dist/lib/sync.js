@@ -6,7 +6,7 @@
 import { getTelegramTargetKey } from "./target.js";
 import { getTelegramApiErrorRequestTarget, isTelegramStaleTargetHttpError, } from "./telegram-api.js";
 import * as ThreadReconciler from "./thread-reconciler.js";
-import { commitTelegramWorkspaceProvisionBinding, createTelegramCleanupTargetProtection, getTelegramTargetFromApiBody, getTelegramThreadOwnerKey, isSameTelegramProcessInstance, isTelegramTopicTargetStaleError, provisionOwnBusTopic, resetTelegramConnectionProvisioning, } from "./threads.js";
+import { commitTelegramWorkspaceProvisionBinding, createTelegramCleanupTargetProtection, getTelegramLeaderSessionHandoff, getTelegramTargetFromApiBody, getTelegramThreadOwnerKey, isSameTelegramProcessInstance, isTelegramLeaderSessionHandoffFresh, isTelegramTopicTargetStaleError, provisionOwnBusTopic, resetTelegramConnectionProvisioning, } from "./threads.js";
 import { createTelegramWorkspaceAdmissionOperationId, runWithTelegramWorkspaceAdmissionsAsync, } from "./workspace-admission.js";
 import { normalizeTelegramWorkspacePath } from "./workspace-identity.js";
 import { TelegramWorkspaceSlotUnavailableError } from "./workspace-slots.js";
@@ -473,6 +473,22 @@ export async function ensureTelegramLeaderThreadBinding(deps) {
         });
     }
     const legacyLeaderRecord = deps.topicTargetStore.getByProfileKey(leaderProfileKey);
+    const handoff = getTelegramLeaderSessionHandoff();
+    if (!deps.forceFreshUnnamed &&
+        normalizedLeaderCwd &&
+        deps.sessionId &&
+        isTelegramLeaderSessionHandoffFresh(handoff) &&
+        handoff.profileKey === leaderProfileKey &&
+        isSameTelegramProcessInstance(handoff.instanceId, deps.instanceId) &&
+        legacyLeaderRecord?.instanceId === handoff.instanceId &&
+        legacyLeaderRecord.status === "active" &&
+        getTelegramTargetKey(legacyLeaderRecord.target) === getTelegramTargetKey(handoff.target)) {
+        const source = deps.topicTargetStore.getWorkspaceBindingByTarget(handoff.target);
+        if (source?.cwd === normalizedLeaderCwd && source.sessionId && source.sessionId !== deps.sessionId) {
+            if (!deps.topicTargetStore.adoptWorkspaceThreadBindingForSession(normalizedLeaderCwd, source.sessionId, deps.sessionId, handoff.target))
+                throw new Error("Telegram leader session handoff binding is unavailable.");
+        }
+    }
     let capacityUnavailable = false;
     const workspaceIdentity = normalizedLeaderCwd
         ? deps.topicTargetStore.claimWorkspaceIdentity(normalizedLeaderCwd, deps.instanceId, legacyLeaderRecord?.instanceId, {

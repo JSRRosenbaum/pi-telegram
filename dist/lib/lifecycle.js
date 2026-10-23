@@ -269,6 +269,10 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
         registrationState: deps.follower.registrationState,
         instanceId: deps.follower.instanceId,
         suspendPolling: deps.follower.suspendPolling,
+        isLeader: deps.follower.isLeader,
+        getLeaderBinding: deps.follower.getLeaderBinding,
+        getActiveContext: deps.follower.getActiveContext,
+        getActiveProfileName: deps.follower.getActiveProfileName,
         recordRuntimeEvent: deps.follower.recordRuntimeEvent,
     });
     // A reused context can be current for a successor; inner awaits need this invocation's generation too.
@@ -313,7 +317,7 @@ export function createTelegramBridgeSessionLifecycleAssembly(deps) {
             if (!isCurrent())
                 return;
             deps.services.connection?.onSessionShutdown(event, ctx);
-            const preserveTarget = event.reason !== "resume";
+            const preserveTarget = event.reason === "new" || event.reason === "fork" || event.reason === "reload";
             let preserveThread;
             if (event.reason === "quit") {
                 try {

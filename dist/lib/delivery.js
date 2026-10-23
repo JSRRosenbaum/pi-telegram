@@ -208,11 +208,12 @@ function createTelegramDeliveryTargetQueue(captureDrain) {
         hasPendingTarget: (target) => queues.has(targetKey(target)),
     };
 }
-function getChunkTransportOptions(view, index, chunkCount, replyToMessageId, editing = false) {
+function getChunkTransportOptions(view, index, chunkCount, replyToMessageId, editing = false, requestReply = false) {
     const isFirst = index === 0;
     const isLast = index === chunkCount - 1;
     return {
         ...(isFirst && replyToMessageId !== undefined ? { replyToMessageId } : {}),
+        ...(isLast && requestReply ? { requestReply: true } : {}),
         ...(isLast
             ? { replyMarkup: view.replyMarkup ?? (editing ? null : undefined) }
             : editing
@@ -282,6 +283,9 @@ export function createTelegramDeliveryRuntime(deps) {
             active = false;
         },
         async sendView(view, options) {
+            if (options.requestReply && view.replyMarkup) {
+                return failure("invalid-view", "Reply prompts cannot also contain inline buttons.");
+            }
             if (!active)
                 return inactive();
             const resolved = resolveTelegramDeliveryTarget(options.scope, deps);
@@ -299,7 +303,7 @@ export function createTelegramDeliveryRuntime(deps) {
                     for (const [index, chunk] of rendered.value.entries()) {
                         if (!active)
                             return inactive();
-                        const messageId = await deps.sendChunk(target, chunk, getChunkTransportOptions(view, index, rendered.value.length, options.replyToMessageId));
+                        const messageId = await deps.sendChunk(target, chunk, getChunkTransportOptions(view, index, rendered.value.length, options.replyToMessageId, false, options.requestReply === true));
                         messageIds.push(messageId);
                         if (!active)
                             return inactive();
@@ -465,9 +469,11 @@ export function createTelegramBridgeDeliveryRuntime(deps) {
                         : {}),
                     ...getTelegramTargetThreadParams(target),
                     ...(replyParameters ? { reply_parameters: replyParameters } : {}),
-                    ...(options.replyMarkup
-                        ? { reply_markup: options.replyMarkup }
-                        : {}),
+                    ...(options.requestReply
+                        ? { reply_markup: { force_reply: true } }
+                        : options.replyMarkup
+                            ? { reply_markup: options.replyMarkup }
+                            : {}),
                 };
                 return deps.api.sendMessage(body);
             });

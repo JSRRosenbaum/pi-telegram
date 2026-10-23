@@ -297,7 +297,7 @@ export interface TelegramUpdateJournalDeadQueueOwnerRecoveryInput {
     recoveryOwner: TelegramUpdateJournalQueueOwnerIdentity;
 }
 export type TelegramUpdateJournalDeadQueueOwnerRecoveryResult = {
-    status: "owner-alive" | "owner-unverifiable";
+    status: "owner-alive" | "owner-unverifiable" | "owner-dead-retained";
     previousOwner: TelegramUpdateJournalQueueOwner;
     recoveredUpdateIds: [];
     entryCount: number;
