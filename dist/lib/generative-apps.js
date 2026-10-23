@@ -86,6 +86,15 @@ export function resolveGenerativeAppDir(agentDir, app) {
     assertAppName(app);
     return join(getAppsRoot(agentDir), app);
 }
+export async function isGenerativeAppInstalled(agentDir, app) {
+    try {
+        await stat(resolveGenerativeAppModulePath(agentDir, app));
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
 export function resolveGenerativeAppModulePath(agentDir, app) {
     return join(resolveGenerativeAppDir(agentDir, app), `${app}.mjs`);
 }

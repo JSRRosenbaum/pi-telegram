@@ -239,7 +239,23 @@ export function createTelegramGenerativeAppBoundButtonActionInvoker(deps) {
         let boundAction;
         let handedOff;
         try {
-            boundAction = GenerativeApps.parseGenerativeAppBoundAction(action.prompt);
+            // Only buttons emitted by a Generative App carry a binding. An unbound button is ordinary model text
+            // (`std::map`, `a::b(c)`): malformed or uninstalled-app prompts fall through to the normal prompt plane.
+            if (!action.binding) {
+                try {
+                    boundAction = GenerativeApps.parseGenerativeAppBoundAction(action.prompt);
+                }
+                catch {
+                    return false;
+                }
+                if (boundAction &&
+                    !(await GenerativeApps.isGenerativeAppInstalled(deps.agentDir, boundAction.app))) {
+                    boundAction = undefined;
+                }
+            }
+            else {
+                boundAction = GenerativeApps.parseGenerativeAppBoundAction(action.prompt);
+            }
             if (!boundAction)
                 return false;
             deps.assertExecutionCurrent(query);

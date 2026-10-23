@@ -159,6 +159,7 @@ export interface TelegramBindToolRegistrationDeps extends GenerativeAppRuntimeOp
     recordRuntimeEvent?: (category: string, error: unknown, details?: Record<string, unknown>) => void;
 }
 export declare function resolveGenerativeAppDir(agentDir: string, app: string): string;
+export declare function isGenerativeAppInstalled(agentDir: string, app: string): Promise<boolean>;
 export declare function resolveGenerativeAppModulePath(agentDir: string, app: string): string;
 export declare function invokeGenerativeApp(options: GenerativeAppRuntimeOptions & {
     argument?: unknown;

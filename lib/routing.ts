@@ -8434,7 +8434,12 @@ export function createTelegramInboundRouteRuntime<
               )
                 continue;
               try {
-                await retireCancellationChooser(id, pending, isCurrent);
+                if (await retireCancellationChooser(id, pending, isCurrent))
+                  await deleteCancelledOrphanTab(
+                    pending,
+                    pending.abandonment!,
+                    isCurrent,
+                  );
               } catch (error) {
                 deps.recordRuntimeEvent?.("routing", error, {
                   phase: "recovered-chooser-cleanup",
@@ -8462,6 +8467,60 @@ export function createTelegramInboundRouteRuntime<
       if (view) view.running = false;
     }
     return true;
+  };
+  /**
+   * A cancelled input in an unbound (non-temporary) tab leaves nothing to route: once no chooser, queue, live owner,
+   * Workspace/Restore record or retained journal arrival still names the tab, it is deleted like a routing tab. Any
+   * missing proof or failure keeps the tab; this never retries and never blocks the Cancel outcome.
+   */
+  const deleteCancelledOrphanTab = async (
+    pending: PendingUnboundReroute,
+    cancellation: NonNullable<PendingUnboundReroute["abandonment"]>,
+    isAuthorityCurrent: () => boolean,
+  ): Promise<void> => {
+    const { chatId, threadId } = pending.sourceTarget;
+    if (
+      threadId === undefined ||
+      pending.temporaryThread ||
+      isTemporaryTabTarget({ chatId, threadId }) ||
+      hasPendingRerouteForTarget({ chatId, threadId }) ||
+      !deps.inspectTemporaryThreadSources
+    )
+      return;
+    const target = { chatId, threadId };
+    try {
+      const own = {
+        journalBindingKey: cancellation.journalBindingKey,
+        updateIds: Updates.collectTelegramAdmissionSourceUpdateIds(
+          pending.messages,
+        ),
+      };
+      const assertCurrent = (): void => {
+        if (!isAuthorityCurrent())
+          throw new Error("Unbound tab cleanup authority changed.");
+      };
+      assertCurrent();
+      if (
+        deps.inspectTemporaryThreadSources(
+          target,
+          [cancellation.journalBindingKey],
+          [own],
+        )?.length !== 0
+      )
+        return;
+      assertCurrent();
+      await closeReroutedUnboundTopic(
+        target,
+        pending.chooserMessageId,
+        assertCurrent,
+      );
+    } catch (error) {
+      deps.recordRuntimeEvent?.("routing", error, {
+        phase: "unbound-cancel-tab-cleanup",
+        chatId: target.chatId,
+        threadId: target.threadId,
+      });
+    }
   };
   const handleUnboundRerouteCancelCallback = async (
     query: TCallbackQuery,
@@ -8580,6 +8639,7 @@ export function createTelegramInboundRouteRuntime<
         await Promise.all([
           deps.answerCallbackQuery(query.id, "Routing cancelled"),
           deleteAllTabCopies(pending!),
+          deleteCancelledOrphanTab(pending!, cancellation!, isAuthorityCurrent),
         ]);
     } catch (error) {
       deps.recordRuntimeEvent?.("routing", error, {

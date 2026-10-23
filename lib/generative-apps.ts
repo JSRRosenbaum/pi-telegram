@@ -288,6 +288,18 @@ export function resolveGenerativeAppDir(agentDir: string, app: string): string {
   return join(getAppsRoot(agentDir), app);
 }
 
+export async function isGenerativeAppInstalled(
+  agentDir: string,
+  app: string,
+): Promise<boolean> {
+  try {
+    await stat(resolveGenerativeAppModulePath(agentDir, app));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function resolveGenerativeAppModulePath(
   agentDir: string,
   app: string,

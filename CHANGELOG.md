@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+## 0.57.6: Stability Hotfix
+
+- `Plain buttons`: A button without a Generative App binding stays an ordinary prompt unless it is a well-formed `app::method` for an installed app. Prompts containing `::` that fail that test (`std::map`, `cargo test a::b(c)`) no longer raise `Malformed Generative App bound action` or retry forever from the journal; bound buttons keep their fail-closed errors.
+- `Unbound Cancel`: Cancelling the last unspent input in a tab that is bound to nothing now deletes that tab, like a routing tab, once no other chooser, queue, live owner, Restore record or retained journal arrival still names it. Missing proof or any failure keeps the tab with a diagnostic; the private original stays retained.
+
 ## 0.57.5: Workspace Slot Reuse
 
 - `Slot reuse`: A full A–Z pool no longer refuses a new connection when every Thread is active or protected. After pressure retirement finds no candidate, the least recently used letter is reassigned as metadata: detached bindings first, live owners last. The previous holder keeps its Thread, history, journals and accepted work and only loses its letter label. Restore-only startup and background recovery never reassign a letter.
